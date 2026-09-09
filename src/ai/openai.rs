@@ -342,7 +342,6 @@ impl OpenAiCompatClient {
         };
 
         if res.status().is_success() {
-            let status = res.status();
             let body_text = res.text().await.map_err(|e| {
                 let err_str = redact_secret(&e.to_string());
                 tracing::error!("Failed to read OpenAI response body: {}", err_str);
@@ -358,10 +357,31 @@ impl OpenAiCompatClient {
                     return Ok(response);
                 }
                 Err(e) => {
-                    tracing::error!("Failed to decode OpenAI response: {}", e);
-                    return Err(OpenAiCompatError::ApiError(
-                        status,
-                        format!("Parse error: {}", e),
+                    // Log what actually came back. "missing field `choices`"
+                    // names the field but not the payload, and an endpoint that
+                    // answers 200 with something else is the case worth seeing.
+                    let body = redact_secret(&body_text).trim().to_owned();
+                    let snippet: String = body.chars().take(BODY_SNIPPET_LIMIT).collect();
+                    let elided = if body.chars().count() > BODY_SNIPPET_LIMIT {
+                        " [truncated]"
+                    } else {
+                        ""
+                    };
+                    tracing::error!(
+                        "Failed to decode OpenAI response: {e}; body was: {snippet}{elided}"
+                    );
+
+                    // A 2xx body we cannot decode says nothing about the status
+                    // code, so classifying it by that code is wrong: it lands on
+                    // Fatal, which skips the session's own bounded retry and
+                    // fails the review, restarting it from the first stage. Retry
+                    // the one call instead.
+                    let detail = gateway_error_message(&body_text)
+                        .map(|m| format!("endpoint returned an error body: {m}"))
+                        .unwrap_or_else(|| format!("Parse error: {e}"));
+                    return Err(OpenAiCompatError::TransientError(
+                        Duration::from_secs(30),
+                        detail,
                     ));
                 }
             }
@@ -409,6 +429,25 @@ impl OpenAiCompatClient {
             _ => Err(OpenAiCompatError::ApiError(status, error_text))?,
         }
     }
+}
+
+/// How much of an undecodable response body reaches the log.
+const BODY_SNIPPET_LIMIT: usize = 2000;
+
+/// Pulls the message out of an error envelope returned in place of a normal
+/// completion.
+///
+/// Several OpenAI-compatible gateways answer 200 with `{"error": ...}` rather
+/// than a status code, so the decode failure is the first sign anything is
+/// wrong. Reporting what the endpoint objected to beats reporting which field
+/// serde could not find.
+fn gateway_error_message(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let error = value.get("error")?;
+    if let Some(message) = error.get("message").and_then(|m| m.as_str()) {
+        return Some(message.to_string());
+    }
+    error.as_str().map(|s| s.to_string())
 }
 
 fn translate_ai_request(
@@ -694,6 +733,59 @@ mod tests {
         let retry_after = Duration::from_secs(11);
         let err = OpenAiCompatError::TransientError(retry_after, "busy".to_string());
 
+        assert_eq!(
+            err.ai_error_class(),
+            AiErrorClass::Transient { retry_after }
+        );
+    }
+
+    #[test]
+    fn test_gateway_error_message_is_extracted_from_an_error_envelope() {
+        let body = r#"{"error": {"message": "upstream model unavailable", "code": 502}}"#;
+        assert_eq!(
+            gateway_error_message(body).as_deref(),
+            Some("upstream model unavailable")
+        );
+    }
+
+    #[test]
+    fn test_gateway_error_message_handles_a_bare_string_error() {
+        let body = r#"{"error": "quota exhausted"}"#;
+        assert_eq!(
+            gateway_error_message(body).as_deref(),
+            Some("quota exhausted")
+        );
+    }
+
+    #[test]
+    fn test_gateway_error_message_is_none_for_a_normal_response() {
+        let body = r#"{"choices": [], "usage": {}}"#;
+        assert_eq!(gateway_error_message(body), None);
+    }
+
+    /// A 200 whose body will not decode must not be classified by its status
+    /// code. classify_status_code(200) is None, which falls through to Fatal,
+    /// and Fatal skips the session's bounded retry and restarts the review from
+    /// its first stage over a single bad response.
+    #[test]
+    fn test_an_undecodable_success_body_is_transient_not_fatal() {
+        // What the old code produced for this case.
+        let as_api_error = OpenAiCompatError::ApiError(
+            reqwest::StatusCode::OK,
+            "Parse error: missing field `choices`".to_string(),
+        );
+        assert_eq!(
+            as_api_error.ai_error_class(),
+            AiErrorClass::Fatal,
+            "a 200 ApiError still classifies Fatal, which is why it is no longer used here"
+        );
+
+        // What it produces now.
+        let retry_after = Duration::from_secs(30);
+        let err = OpenAiCompatError::TransientError(
+            retry_after,
+            "endpoint returned an error body: upstream model unavailable".to_string(),
+        );
         assert_eq!(
             err.ai_error_class(),
             AiErrorClass::Transient { retry_after }
