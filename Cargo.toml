@@ -57,8 +57,8 @@ server = [
     "dep:bytes",
     "dep:lettre",
     "dep:mail-parser",
-    "dep:rustls-native-certs",
-    "dep:tokio-rustls",
+    "dep:native-tls",
+    "dep:tokio-native-tls",
     "dep:tokio-util",
 ]
 cache = ["dep:libsql"]
@@ -80,13 +80,12 @@ google-cloud-auth = { version = "1.10", optional = true }
 fastrand = "2.4.1"
 flate2 = { version = "1.1.9", optional = true }
 futures = "0.3.31"
-lettre = { version = "0.11.7", default-features = false, features = ["builder", "hostname", "pool", "smtp-transport", "tokio1", "tokio1-rustls-tls"], optional = true }
-libsql = { version = "0.9.29", optional = true }
+lettre = { version = "0.11.7", default-features = false, features = ["builder", "hostname", "pool", "smtp-transport", "tokio1", "tokio1-native-tls"], optional = true }
+libsql = { version = "0.9.29", default-features = false, features = ["core", "replication", "remote", "sync"], optional = true }
 mail-parser = { version = "0.11.3", optional = true }
 regex = "1.12.2"
-reqwest = { version = "0.13.1", features = ["json", "query"] }
+reqwest = { version = "0.13.1", default-features = false, features = ["json", "query", "native-tls"] }
 rustix = { version = "1.1.4", features = ["termios"] }
-rustls-native-certs = { version = "0.8.4", optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.11.0"
@@ -95,7 +94,8 @@ termcolor = "1.4.1"
 terminfo = "0.9.0"
 thiserror = "2.0.17"
 tokio = { version = "1.52.3", features = ["full"] }
-tokio-rustls = { version = "0.26.4", optional = true }
+native-tls = { version = "0.2.18", optional = true }
+tokio-native-tls = { version = "0.3.1", optional = true }
 tokio-util = { version = "0.7.17", features = ["codec", "io"], optional = true }
 toml = "1.0"
 tower-http = { version = "0.7.0", features = ["cors", "fs", "trace"], optional = true }
