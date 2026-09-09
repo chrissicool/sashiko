@@ -427,6 +427,20 @@ pub struct CustomRemoteSettings {
 pub struct GitSettings {
     pub repository_path: String,
     pub custom_remotes: Option<Vec<CustomRemoteSettings>>,
+    /// Work out where each file in a patch actually lives in the repository
+    /// instead of trusting the paths as sent, and hand `git am` the matching
+    /// `-p<n>` and `--directory=`.
+    ///
+    /// Off by default, which is right for lists that carry `git format-patch`
+    /// mail: those paths are already repository-relative with `a/` and `b/`
+    /// prefixes, so `-p1` is always correct and guessing can only do harm.
+    ///
+    /// Turn it on for lists where contributors send `cvs diff` or plain
+    /// `diff -u` output generated from inside a subdirectory -- OpenBSD's
+    /// tech@ being the motivating case, where paths arrive relative to the
+    /// submitter's working directory and no strip level can reach the file.
+    #[serde(default)]
+    pub resolve_patch_paths: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -543,9 +557,17 @@ pub struct LocalReviewReviewSettings {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct LocalReviewGitSettings {
+    pub resolve_patch_paths: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct LocalReviewSettings {
     pub ai: AiSettings,
     pub review: LocalReviewReviewSettings,
+    /// Present so `sashiko review --settings` can exercise path resolution
+    /// against the same knob the service uses.
+    pub git: Option<LocalReviewGitSettings>,
 }
 impl Settings {
     pub fn new() -> Result<Self, ConfigError> {
