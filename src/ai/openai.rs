@@ -41,9 +41,18 @@ pub struct OpenAiRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<OpenAiReasoning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
+}
+
+/// OpenRouter's reasoning-effort shape: a nested object rather than the
+/// top-level `reasoning_effort` field most other OpenAI-compatible endpoints use.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OpenAiReasoning {
+    pub effort: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -310,7 +319,12 @@ impl OpenAiCompatClient {
         }
         // Omitted unless configured: some endpoints that do not implement
         // reasoning_effort reject the whole request over an unknown field.
-        openai_req.reasoning_effort = self.effort.clone();
+        // OpenRouter takes the level as a nested reasoning object instead.
+        if is_openrouter(&self.base_url) {
+            openai_req.reasoning = self.effort.clone().map(|effort| OpenAiReasoning { effort });
+        } else {
+            openai_req.reasoning_effort = self.effort.clone();
+        }
         Ok(openai_req)
     }
 
@@ -502,6 +516,13 @@ fn gateway_error_message(body: &str) -> Option<String> {
     error.as_str().map(|s| s.to_string())
 }
 
+/// OpenRouter takes reasoning effort as a nested `reasoning: {"effort": ...}`
+/// object rather than the top-level `reasoning_effort` field most other
+/// OpenAI-compatible endpoints use.
+fn is_openrouter(base_url: &str) -> bool {
+    base_url.contains("openrouter.ai")
+}
+
 fn translate_ai_request(
     request: AiRequest,
     max_tokens: u32,
@@ -627,6 +648,7 @@ fn translate_ai_request(
         // Set by the caller, which holds the configured level; the translation
         // has no view of it.
         reasoning_effort: None,
+        reasoning: None,
         response_format,
         service_tier: None,
     })
@@ -1429,6 +1451,7 @@ mod tests {
             max_tokens: None,
             max_completion_tokens: None,
             reasoning_effort: None,
+            reasoning: None,
             response_format: None,
             service_tier: None,
         };
@@ -1862,6 +1885,33 @@ mod tests {
 
         let json = serde_json::to_value(&translated).unwrap();
         assert!(json.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn configured_effort_is_nested_for_openrouter() {
+        let client = test_client("https://openrouter.ai/api/v1", 65536, Some("high"));
+
+        let built = client.prepare_request(sample_request()).unwrap();
+        assert_eq!(built.reasoning_effort, None);
+
+        let json = serde_json::to_value(&built).unwrap();
+        assert!(json.get("reasoning_effort").is_none());
+        assert_eq!(json["reasoning"]["effort"], "high");
+
+        let unset = test_client("https://openrouter.ai/api/v1", 65536, None);
+        let json = serde_json::to_value(unset.prepare_request(sample_request()).unwrap()).unwrap();
+        assert!(json.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn is_openrouter_detects_the_openrouter_host() {
+        assert!(is_openrouter(
+            "https://openrouter.ai/api/v1/chat/completions"
+        ));
+        assert!(!is_openrouter("https://api.openai.com/v1/chat/completions"));
+        assert!(!is_openrouter(
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        ));
     }
 
     #[test]
