@@ -44,6 +44,15 @@ pub struct OpenAiRequest {
     pub service_tier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<OpenAiReasoning>,
+}
+
+/// OpenRouter's reasoning-effort shape: a nested object rather than the
+/// top-level `reasoning_effort` field most other OpenAI-compatible endpoints use.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OpenAiReasoning {
+    pub effort: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -307,6 +316,7 @@ impl OpenAiCompatClient {
             self.max_tokens,
             self.provider_type,
             self.effort.clone(),
+            is_openrouter(&self.base_url),
         )?;
         openai_req.model = self.model.clone();
         if self.temperature_unsupported.load(Ordering::Relaxed) {
@@ -503,11 +513,19 @@ fn gateway_error_message(body: &str) -> Option<String> {
     error.as_str().map(|s| s.to_string())
 }
 
+/// OpenRouter takes reasoning effort as a nested `reasoning: {"effort": ...}`
+/// object rather than the top-level `reasoning_effort` field most other
+/// OpenAI-compatible endpoints use.
+fn is_openrouter(base_url: &str) -> bool {
+    base_url.contains("openrouter.ai")
+}
+
 fn translate_ai_request(
     request: AiRequest,
     max_tokens: u32,
     provider_type: OpenAiProviderType,
     effort: Option<String>,
+    nested_reasoning: bool,
 ) -> Result<OpenAiRequest> {
     let mut messages = Vec::new();
 
@@ -619,6 +637,12 @@ fn translate_ai_request(
         OpenAiProviderType::OpenAiCompatible => (Some(max_tokens), None),
     };
 
+    let (reasoning_effort, reasoning) = if nested_reasoning {
+        (None, effort.map(|effort| OpenAiReasoning { effort }))
+    } else {
+        (effort, None)
+    };
+
     Ok(OpenAiRequest {
         model: String::new(),
         messages,
@@ -628,7 +652,8 @@ fn translate_ai_request(
         max_completion_tokens: max_completion_tokens_field,
         response_format,
         service_tier: None,
-        reasoning_effort: effort,
+        reasoning_effort,
+        reasoning,
     })
 }
 
@@ -923,8 +948,13 @@ mod tests {
             context_tag: None,
         };
 
-        let openai_req =
-            translate_ai_request(request, 4096, OpenAiProviderType::OpenAiCompatible, None)?;
+        let openai_req = translate_ai_request(
+            request,
+            4096,
+            OpenAiProviderType::OpenAiCompatible,
+            None,
+            false,
+        )?;
 
         assert_eq!(openai_req.messages.len(), 2);
         assert_eq!(openai_req.messages[0].role, "system");
@@ -968,8 +998,13 @@ mod tests {
             context_tag: None,
         };
 
-        let openai_req =
-            translate_ai_request(request, 4096, OpenAiProviderType::OpenAiCompatible, None)?;
+        let openai_req = translate_ai_request(
+            request,
+            4096,
+            OpenAiProviderType::OpenAiCompatible,
+            None,
+            false,
+        )?;
 
         assert_eq!(openai_req.messages.len(), 2);
         assert_eq!(openai_req.messages[0].role, "system");
@@ -1005,8 +1040,13 @@ mod tests {
             context_tag: None,
         };
 
-        let openai_req =
-            translate_ai_request(request, 4096, OpenAiProviderType::OpenAiCompatible, None)?;
+        let openai_req = translate_ai_request(
+            request,
+            4096,
+            OpenAiProviderType::OpenAiCompatible,
+            None,
+            false,
+        )?;
 
         assert_eq!(openai_req.messages.len(), 1);
         assert_eq!(openai_req.messages[0].role, "assistant");
@@ -1041,8 +1081,13 @@ mod tests {
             context_tag: None,
         };
 
-        let openai_req =
-            translate_ai_request(request, 4096, OpenAiProviderType::OpenAiCompatible, None)?;
+        let openai_req = translate_ai_request(
+            request,
+            4096,
+            OpenAiProviderType::OpenAiCompatible,
+            None,
+            false,
+        )?;
 
         assert_eq!(openai_req.messages.len(), 1);
         assert_eq!(openai_req.messages[0].role, "tool");
@@ -1073,8 +1118,13 @@ mod tests {
             context_tag: None,
         };
 
-        let openai_req =
-            translate_ai_request(request, 4096, OpenAiProviderType::OpenAiCompatible, None)?;
+        let openai_req = translate_ai_request(
+            request,
+            4096,
+            OpenAiProviderType::OpenAiCompatible,
+            None,
+            false,
+        )?;
 
         let tools = openai_req.tools.as_ref().unwrap();
         assert_eq!(tools.len(), 1);
@@ -1097,8 +1147,13 @@ mod tests {
             context_tag: None,
         };
 
-        let openai_req =
-            translate_ai_request(request, 4096, OpenAiProviderType::OpenAiCompatible, None)?;
+        let openai_req = translate_ai_request(
+            request,
+            4096,
+            OpenAiProviderType::OpenAiCompatible,
+            None,
+            false,
+        )?;
 
         // An empty tools array should be mapped to None so it gets skipped in serialization
         assert!(openai_req.tools.is_none());
@@ -1151,8 +1206,13 @@ mod tests {
             context_tag: None,
         };
 
-        let openai_req =
-            translate_ai_request(request, 4096, OpenAiProviderType::OpenAiCompatible, None)?;
+        let openai_req = translate_ai_request(
+            request,
+            4096,
+            OpenAiProviderType::OpenAiCompatible,
+            None,
+            false,
+        )?;
 
         assert_eq!(openai_req.messages.len(), 3);
         assert_eq!(openai_req.messages[0].role, "user");
@@ -1188,8 +1248,13 @@ mod tests {
             context_tag: None,
         };
 
-        let openai_req =
-            translate_ai_request(request, 4096, OpenAiProviderType::OpenAiCompatible, None)?;
+        let openai_req = translate_ai_request(
+            request,
+            4096,
+            OpenAiProviderType::OpenAiCompatible,
+            None,
+            false,
+        )?;
 
         assert_eq!(
             openai_req.response_format,
@@ -1223,8 +1288,13 @@ mod tests {
             context_tag: None,
         };
 
-        let openai_req =
-            translate_ai_request(request, 4096, OpenAiProviderType::OpenAiCompatible, None)?;
+        let openai_req = translate_ai_request(
+            request,
+            4096,
+            OpenAiProviderType::OpenAiCompatible,
+            None,
+            false,
+        )?;
 
         assert_eq!(
             openai_req.response_format,
@@ -1263,6 +1333,7 @@ mod tests {
                 4096,
                 OpenAiProviderType::OpenAiCompatible,
                 None,
+                false,
             )
         };
 
@@ -1290,8 +1361,13 @@ mod tests {
             context_tag: None,
         };
 
-        let translated =
-            translate_ai_request(request, 4096, OpenAiProviderType::OpenAiCompatible, None)?;
+        let translated = translate_ai_request(
+            request,
+            4096,
+            OpenAiProviderType::OpenAiCompatible,
+            None,
+            false,
+        )?;
         assert_eq!(translated.messages[0].role, "system");
         assert_eq!(translated.messages[1].role, "user");
         assert_eq!(
@@ -1319,8 +1395,13 @@ mod tests {
             context_tag: None,
         };
 
-        let openai_req =
-            translate_ai_request(request, 4096, OpenAiProviderType::OpenAiCompatible, None)?;
+        let openai_req = translate_ai_request(
+            request,
+            4096,
+            OpenAiProviderType::OpenAiCompatible,
+            None,
+            false,
+        )?;
 
         assert_eq!(openai_req.temperature, Some(0.5));
 
@@ -1529,6 +1610,7 @@ mod tests {
             response_format: None,
             service_tier: None,
             reasoning_effort: None,
+            reasoning: None,
         };
         let body = serde_json::to_value(&req).unwrap();
         assert!(body.get("service_tier").is_none());
@@ -1562,6 +1644,7 @@ mod tests {
             4096,
             OpenAiProviderType::OpenAiCompatible,
             None,
+            false,
         )
         .unwrap();
         let body = serde_json::to_value(&openai_req).unwrap();
@@ -1572,10 +1655,54 @@ mod tests {
             4096,
             OpenAiProviderType::OpenAiCompatible,
             Some("high".to_string()),
+            false,
         )
         .unwrap();
         let body = serde_json::to_value(&openai_req).unwrap();
         assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn test_reasoning_effort_nested_for_openrouter() {
+        let request = AiRequest {
+            system: None,
+            messages: vec![AiMessage {
+                role: AiRole::User,
+                content: Some("Test".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+        };
+
+        let openai_req = translate_ai_request(
+            request,
+            4096,
+            OpenAiProviderType::OpenAiCompatible,
+            Some("high".to_string()),
+            true,
+        )
+        .unwrap();
+        let body = serde_json::to_value(&openai_req).unwrap();
+
+        assert!(body.get("reasoning_effort").is_none());
+        assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn test_is_openrouter_detects_the_openrouter_host() {
+        assert!(is_openrouter(
+            "https://openrouter.ai/api/v1/chat/completions"
+        ));
+        assert!(!is_openrouter("https://api.openai.com/v1/chat/completions"));
+        assert!(!is_openrouter(
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        ));
     }
 
     #[test]
@@ -1656,8 +1783,13 @@ mod tests {
             context_tag: None,
         };
 
-        let openai_req =
-            translate_ai_request(request, 4096, OpenAiProviderType::OpenAiCompatible, None)?;
+        let openai_req = translate_ai_request(
+            request,
+            4096,
+            OpenAiProviderType::OpenAiCompatible,
+            None,
+            false,
+        )?;
 
         assert_eq!(openai_req.max_tokens, Some(4096));
         assert_eq!(openai_req.max_completion_tokens, None);
@@ -1688,7 +1820,8 @@ mod tests {
             context_tag: None,
         };
 
-        let openai_req = translate_ai_request(request, 4096, OpenAiProviderType::OpenAi, None)?;
+        let openai_req =
+            translate_ai_request(request, 4096, OpenAiProviderType::OpenAi, None, false)?;
 
         assert_eq!(openai_req.max_tokens, None);
         assert_eq!(openai_req.max_completion_tokens, Some(4096));
@@ -1721,8 +1854,13 @@ mod tests {
             context_tag: None,
         };
 
-        let openai_req =
-            translate_ai_request(request, 4096, OpenAiProviderType::OpenAiCompatible, None)?;
+        let openai_req = translate_ai_request(
+            request,
+            4096,
+            OpenAiProviderType::OpenAiCompatible,
+            None,
+            false,
+        )?;
 
         let tools = openai_req.tools.as_ref().unwrap();
         assert_eq!(tools[0].function.parameters["type"], "object");

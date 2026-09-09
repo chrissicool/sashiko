@@ -14,7 +14,7 @@ The official OpenAI API uses `max_completion_tokens` in the request body (introd
 | Provider names | `"openai"` (official API, uses `max_completion_tokens`) and `"openai-compatible"` (third-party, uses `max_tokens`) |
 | Token limit field | `"openai"` serializes `max_completion_tokens`; `"openai-compatible"` serializes `max_tokens`. Controlled by `OpenAiProviderType` enum on the client. |
 | Stdio support | Not needed for OpenAI-compatible provider |
-| Thinking/reasoning support | Request-side only: optional `effort` setting sends the top-level `reasoning_effort` field. No response-side change (`thought: None` always). |
+| Thinking/reasoning support | Request-side only: optional `effort` setting sends the top-level `reasoning_effort` field, or OpenRouter's nested `reasoning: {"effort": ...}` shape when `base_url` is an `openrouter.ai` endpoint. No response-side change (`thought: None` always). |
 | Temperature | Always passed through from `AiRequest` when present |
 | URL configuration | `base_url` from settings → model-based default (glm-*, moonshot-*, abab7-*, MiniMax-*, others) |
 | API key | `OPENAI_API_KEY` env only (fallback to `LLM_API_KEY`), no provider-specific keys |
