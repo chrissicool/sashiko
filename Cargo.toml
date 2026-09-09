@@ -115,6 +115,7 @@ jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs"], optional = true }
 [dev-dependencies]
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
 tokio = { version = "1", features = ["test-util"] }
+proptest = "1"
 
 [profile.dev]
 debug = 1
