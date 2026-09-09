@@ -368,6 +368,16 @@ pub trait AiProvider: Send + Sync {
     fn cache_identity(&self) -> String {
         self.get_capabilities().model_name
     }
+
+    /// When `refresh` is true, a caching provider bypasses the lookup and
+    /// overwrites the stored entry. Non-caching providers ignore it.
+    async fn generate_content_cached(
+        &self,
+        request: AiRequest,
+        _refresh: bool,
+    ) -> Result<AiResponse> {
+        self.generate_content(request).await
+    }
 }
 
 /// Appends the knobs a provider applies outside the request to its model name,

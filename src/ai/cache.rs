@@ -85,14 +85,22 @@ impl CachingAiProvider {
         })
     }
 
-    fn compute_cache_key(&self, request: &AiRequest) -> String {
+    /// Canonical JSON of the request with nondeterministic fields stripped.
+    /// Exposed standalone so a caller that only needs to detect a repeated
+    /// request (not look up a cached response) doesn't need a provider
+    /// instance or its cache identity.
+    pub(crate) fn canonical_request_json(request: &AiRequest) -> String {
         let mut val = serde_json::to_value(request).unwrap_or_default();
         // Strip nondeterministic fields
         if let serde_json::Value::Object(ref mut map) = val {
             map.remove("context_tag");
         }
         super::scrub_thought_signatures(&mut val);
-        let canonical = serde_json::to_string(&val).unwrap_or_default();
+        serde_json::to_string(&val).unwrap_or_default()
+    }
+
+    fn compute_cache_key(&self, request: &AiRequest) -> String {
+        let canonical = Self::canonical_request_json(request);
         // The model and the provider's own knobs never appear in the request,
         // so hash them alongside it. Without them a raised reasoning effort
         // replays the answer recorded at the lower one.
@@ -108,54 +116,67 @@ impl CachingAiProvider {
 #[async_trait]
 impl AiProvider for CachingAiProvider {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+        self.generate_content_cached(request, false).await
+    }
+
+    async fn generate_content_cached(
+        &self,
+        request: AiRequest,
+        refresh: bool,
+    ) -> Result<AiResponse> {
         let hash = self.compute_cache_key(&request);
         let hash_prefix = &hash[..12];
 
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT response_json, tokens_saved, created_at FROM response_cache WHERE request_hash = ?",
-                libsql::params![hash.clone()],
-            )
-            .await?;
+        // Refresh still writes below, overwriting the stale entry under the same key.
+        if !refresh {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT response_json, tokens_saved, created_at FROM response_cache WHERE request_hash = ?",
+                    libsql::params![hash.clone()],
+                )
+                .await?;
 
-        if let Some(row) = rows.next().await? {
-            let response_json: String = row.get(0)?;
-            let tokens_saved: i64 = row.get(1)?;
-            let created_at: i64 = row.get(2)?;
-            if let Ok(mut resp) = serde_json::from_str::<AiResponse>(&response_json) {
-                let (origin, total) = if created_at >= self.session_start {
-                    self.hits_this.fetch_add(1, Ordering::Relaxed);
-                    let t = self
-                        .tokens_saved_this
-                        .fetch_add(tokens_saved as u64, Ordering::Relaxed)
-                        + tokens_saved as u64;
-                    ("this session", t)
-                } else {
-                    self.hits_prev.fetch_add(1, Ordering::Relaxed);
-                    let t = self
-                        .tokens_saved_prev
-                        .fetch_add(tokens_saved as u64, Ordering::Relaxed)
-                        + tokens_saved as u64;
-                    ("previous session", t)
-                };
-                info!(
-                    "Cache hit [{}] ({}) — {} tokens saved (total {}: {})",
-                    hash_prefix, origin, tokens_saved, origin, total
-                );
-                if let Some(ref mut usage) = resp.usage {
-                    // The hit serves the whole prompt from this cache, so all
-                    // of it counts as cached.  cached_tokens is a breakdown
-                    // of prompt_tokens rather than an addend.  The count
-                    // recorded with the response covers this same prompt.
-                    usage.cached_tokens = Some(usage.prompt_tokens);
+            if let Some(row) = rows.next().await? {
+                let response_json: String = row.get(0)?;
+                let tokens_saved: i64 = row.get(1)?;
+                let created_at: i64 = row.get(2)?;
+                if let Ok(mut resp) = serde_json::from_str::<AiResponse>(&response_json) {
+                    let (origin, total) = if created_at >= self.session_start {
+                        self.hits_this.fetch_add(1, Ordering::Relaxed);
+                        let t = self
+                            .tokens_saved_this
+                            .fetch_add(tokens_saved as u64, Ordering::Relaxed)
+                            + tokens_saved as u64;
+                        ("this session", t)
+                    } else {
+                        self.hits_prev.fetch_add(1, Ordering::Relaxed);
+                        let t = self
+                            .tokens_saved_prev
+                            .fetch_add(tokens_saved as u64, Ordering::Relaxed)
+                            + tokens_saved as u64;
+                        ("previous session", t)
+                    };
+                    info!(
+                        "Cache hit [{}] ({}) — {} tokens saved (total {}: {})",
+                        hash_prefix, origin, tokens_saved, origin, total
+                    );
+                    if let Some(ref mut usage) = resp.usage {
+                        // The hit serves the whole prompt from this cache, so
+                        // all of it counts as cached.  cached_tokens is a
+                        // breakdown of prompt_tokens rather than an addend.
+                        // The count recorded with the response covers this
+                        // same prompt.
+                        usage.cached_tokens = Some(usage.prompt_tokens);
+                    }
+                    return Ok(resp);
                 }
-                return Ok(resp);
             }
-        }
-        drop(rows);
 
-        debug!("Cache miss [{}]", hash_prefix);
+            debug!("Cache miss [{}]", hash_prefix);
+        } else {
+            debug!("Cache refresh [{}]", hash_prefix);
+        }
 
         let resp = self.inner.generate_content(request.clone()).await?;
 
