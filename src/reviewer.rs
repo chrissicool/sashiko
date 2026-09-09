@@ -1987,6 +1987,9 @@ async fn run_review_tool_with_cmd(
             let ai_started = Arc::new(AtomicBool::new(false));
             let total_tokens_used = Arc::new(AtomicUsize::new(0));
             let total_output_tokens_used = Arc::new(AtomicUsize::new(0));
+            // Touched only from this sequential reader loop, so no locking.
+            let mut seen_request_hashes: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
 
             let (abort_tx, mut abort_rx) = tokio::sync::mpsc::channel::<anyhow::Error>(1);
 
@@ -2037,6 +2040,14 @@ async fn run_review_tool_with_cmd(
 
                                         let tx_id = json_msg.get("tx_id").and_then(|v| v.as_u64()).unwrap_or(0);
                                         let payload = json_msg["payload"].clone();
+                                        // A repeat hash within one child connection means the child's
+                                        // outer retry loop restarted, so refresh rather than replay.
+                                        let cache_refresh = serde_json::from_value::<AiRequest>(payload.clone())
+                                            .map(|req| {
+                                                let key = crate::ai::cache::CachingAiProvider::canonical_request_json(&req);
+                                                !seen_request_hashes.insert(key)
+                                            })
+                                            .unwrap_or(false);
 
                                         let db_clone = db.clone();
                                         let provider_clone = provider.clone();
@@ -2086,7 +2097,11 @@ async fn run_review_tool_with_cmd(
 
                                             let ctx_tag = req.context_tag.clone().unwrap_or_default();
                                             let resp_payload = crate::ai::LOG_CONTEXT
-                                                .scope(ctx_tag, provider_clone.generate_content(req.clone()))
+                                                .scope(
+                                                    ctx_tag,
+                                                    provider_clone
+                                                        .generate_content_cached(req.clone(), cache_refresh),
+                                                )
                                                 .await;
 
                                             let reply = match resp_payload {
