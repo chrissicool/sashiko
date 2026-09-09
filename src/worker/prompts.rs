@@ -60,7 +60,6 @@ use crate::workflows::sashiko_patch_review::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -138,29 +137,6 @@ pub struct PromptRegistry {
 impl PromptRegistry {
     pub fn new(base_dir: PathBuf) -> Self {
         Self { base_dir }
-    }
-
-    pub fn get_system_identity() -> &'static str {
-        SYSTEM_IDENTITY
-    }
-
-    pub fn calculate_content_hash<T: serde::Serialize>(
-        &self,
-        content: &str,
-        tools: Option<&[T]>,
-    ) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(content);
-        if let Some(tools) = tools
-            && let Ok(json) = serde_json::to_string(tools)
-        {
-            hasher.update(json);
-        }
-        hasher
-            .finalize()
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect()
     }
 }
 
