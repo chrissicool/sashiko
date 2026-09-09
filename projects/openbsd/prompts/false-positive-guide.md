@@ -18,9 +18,12 @@ to in the source.
   `smr_call(9)` callback, list what keeps the object alive on each side
   (references, held locks, open SMR read-side sections, barriers the freeing
   side has completed) up to the free. Report only if the free can run while
-  the using side still holds a pointer with no pin. Required output: the pins
-  held on each side and the free point. If analysis already produced them,
-  check them against the code again rather than copying them.
+  the using side still holds a pointer with no pin. When
+  `subsystem/locking.md` is in context, apply its "Object lifetime and
+  use-after-free" section. Required output: the `budget:` line defined there
+  when it is in context, otherwise the pins held on each side and the free
+  point. If analysis already produced one, check it against the code again
+  rather than copying it.
 - Do not flag a `PR_WAITOK`/`M_WAITOK` allocation as "sleeping in atomic
   context" unless you have established the call actually runs at raised spl, in
   an interrupt handler, or while holding a mutex.
