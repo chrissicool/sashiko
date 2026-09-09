@@ -335,7 +335,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("CRITICAL ERROR: Panic detected: {}", info);
                 }));
 
-                let result = run_worker_from_stdin(WorkerOptions {
+                let options = WorkerOptions {
                     project,
                     settings_path: None,
                     baseline: baseline.clone(),
@@ -351,8 +351,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     stages: stages.clone(),
                     scratch_clone: false,
                     current_tree: false,
-                })
-                .await;
+                };
+
+                // Race the review against Ctrl-C so the in-flight review future is
+                // dropped on interrupt and RAII cleanup (e.g. provider temp dirs) runs.
+                // Exit only after the select! finishes; exiting inside the branch would
+                // skip dropping the losing future.
+                let result = tokio::select! {
+                    res = run_worker_from_stdin(options) => Some(res),
+                    _ = tokio::signal::ctrl_c() => None,
+                };
+                let Some(result) = result else {
+                    eprintln!("Interrupted.");
+                    std::process::exit(130);
+                };
 
                 match result {
                     Ok(val) => {
