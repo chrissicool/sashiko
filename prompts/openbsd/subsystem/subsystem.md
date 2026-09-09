@@ -13,3 +13,4 @@ symbol patterns.
 | Subsystem | Triggers | File |
 |-----------|----------|------|
 | Networking | sys/net/, sys/netinet/, sys/netinet6/, sys/net80211/, `pf_*`, NET_LOCK, if_input, if_enqueue, `ifq_*`, `ifiq_*`, `ether_*`, ip_input, ip6_input, m_pullup, m_freem, mbuf | networking.md |
+| VMM/VMD | sys/arch/amd64/amd64/vmm*, sys/dev/vmm/, vmd, vcpu, vm_run, vmx_*, svm_*, ept, vmread, vmwrite | vmm.md |
