@@ -317,6 +317,16 @@ async fn parse_mbox_messages(raw: Vec<u8>) -> Result<Vec<(PatchsetMetadata, Opti
             messages
                 .into_iter()
                 .filter_map(|message| parse_email(&message).ok())
+                // A lore, b4 or Patchew series is format-patch: no patch comes
+                // in a reply, whatever a reply's diff looks like.
+                .map(|(metadata, patch)| {
+                    let patch = if crate::patch::is_reply_subject(&metadata.subject) {
+                        None
+                    } else {
+                        patch
+                    };
+                    (metadata, patch)
+                })
                 .collect::<Vec<_>>(),
         )
     })
