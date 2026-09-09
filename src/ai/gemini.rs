@@ -1294,6 +1294,7 @@ pub(crate) fn translate_ai_response(resp: GenerateContentResponse) -> Result<AiR
         },
         usage,
         truncated,
+        served_from_cache: false,
     })
 }
 
