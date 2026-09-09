@@ -150,7 +150,7 @@ Settings for the OpenAI providers (`provider = "openai"` or `provider = "openai-
 | `base_url` | string | model-derived | API endpoint URL. Derived from the model name, `https://api.openai.com/v1/chat/completions` for anything unrecognized. |
 | `context_window_size` | integer | model-derived | Context window size. `128000` for most models. |
 | `max_tokens` | integer | `4096` | Max output tokens per response. With `provider = "openai"` it is sent as `max_completion_tokens`, which bounds reasoning tokens as well as the reply. |
-| `effort` | string | -- | Reasoning effort, sent as the top-level `reasoning_effort` field (e.g. `"low"`, `"medium"`, `"high"`; valid values are model-dependent). Not honored by OpenRouter, which expects a different, nested shape. |
+| `effort` | string | -- | Reasoning effort (e.g. `"low"`, `"medium"`, `"high"`; valid values are model-dependent). Sent as the top-level `reasoning_effort` field, except when `base_url` is an `openrouter.ai` endpoint, where it is sent as the nested `reasoning.effort` shape OpenRouter expects instead. |
 
 #### `[ai.kiro_cli]`
 

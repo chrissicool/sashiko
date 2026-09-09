@@ -354,8 +354,9 @@ pub struct OpenAiCompatSettings {
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub service_tier: Option<String>,
-    /// Sent as the top-level `reasoning_effort` field. Not honored by OpenRouter,
-    /// which expects a nested shape instead. Leave unset for the model default.
+    /// Sent as the top-level `reasoning_effort` field, or as OpenRouter's
+    /// nested `reasoning.effort` shape when `base_url` is an openrouter.ai
+    /// endpoint. Leave unset for the model default.
     #[serde(default)]
     pub effort: Option<String>,
 }
