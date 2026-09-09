@@ -569,6 +569,7 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 ai.openai_compat
                     .as_ref()
                     .and_then(|c| c.service_tier.clone()),
+                ai.openai_compat.as_ref().and_then(|c| c.effort.clone()),
             )?;
 
             Ok(Arc::new(provider))
