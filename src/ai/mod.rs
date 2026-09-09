@@ -176,6 +176,13 @@ pub struct AiResponse {
     /// Whether the response was truncated by the provider (e.g., hit max tokens).
     #[serde(default)]
     pub truncated: bool,
+    /// True when this came from Sashiko's own response cache rather than the
+    /// provider. Nothing was sent and nothing was billed, so the usage attached
+    /// below describes the original call, not this one, and must not be counted
+    /// as spend. Not part of what gets cached: it describes the delivery, not
+    /// the response.
+    #[serde(default, skip_serializing)]
+    pub served_from_cache: bool,
 }
 
 /// Classifies a remote AI error using the typed stdio protocol payload.

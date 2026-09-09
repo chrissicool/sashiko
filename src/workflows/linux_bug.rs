@@ -3743,6 +3743,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                served_from_cache: false,
             })
         }
 
@@ -3997,6 +3998,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                served_from_cache: false,
             };
             let err = session.validate(&response).unwrap_err();
             match err {
@@ -4048,6 +4050,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                served_from_cache: false,
             };
             let output = session.validate(&response).unwrap();
             assert_eq!(output.canonical_title, *good);
@@ -4308,6 +4311,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                served_from_cache: false,
             })
         }
 
@@ -5200,6 +5204,7 @@ Call Trace:
             tool_calls: None,
             usage: None,
             truncated: false,
+            served_from_cache: false,
         };
         let err = session.validate(&response).unwrap_err();
         match err {
@@ -5241,6 +5246,7 @@ Call Trace:
             tool_calls: None,
             usage: None,
             truncated: false,
+            served_from_cache: false,
         };
         let err = session.validate(&response).unwrap_err();
         match err {
@@ -6095,6 +6101,7 @@ F:	drivers/net/ethernet/intel/e1000/
                     tool_calls: None,
                     usage: None,
                     truncated: false,
+                    served_from_cache: false,
                 })
             }
 

@@ -683,6 +683,7 @@ fn translate_ai_response(resp: OpenAiResponse) -> Result<AiResponse> {
         tool_calls,
         usage,
         truncated,
+        served_from_cache: false,
     })
 }
 

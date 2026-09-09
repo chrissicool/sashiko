@@ -528,6 +528,7 @@ mod tests {
                 }]),
                 usage: None,
                 truncated: false,
+                served_from_cache: false,
             },
             AiResponse {
                 content: Some("Recovered after tool error".to_string()),
@@ -536,6 +537,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                served_from_cache: false,
             },
         ];
 
@@ -574,6 +576,7 @@ mod tests {
                 }]),
                 usage: None,
                 truncated: false,
+                served_from_cache: false,
             },
             // Turn 2 (max turns): synthesized output
             AiResponse {
@@ -583,6 +586,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                served_from_cache: false,
             },
         ];
 

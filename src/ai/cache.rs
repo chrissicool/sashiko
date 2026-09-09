@@ -150,6 +150,7 @@ impl AiProvider for CachingAiProvider {
                     // recorded with the response covers this same prompt.
                     usage.cached_tokens = Some(usage.prompt_tokens);
                 }
+                resp.served_from_cache = true;
                 return Ok(resp);
             }
         }
@@ -257,6 +258,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                served_from_cache: false,
             })
         }
 
@@ -320,6 +322,7 @@ mod tests {
                 }),
                 usage: None,
                 truncated: false,
+                served_from_cache: false,
             })
         }
 
@@ -406,6 +409,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                served_from_cache: false,
             })
         }
 
@@ -463,6 +467,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: true,
+                served_from_cache: false,
             })
         }
 
@@ -521,6 +526,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: !first_answer,
+                served_from_cache: false,
             })
         }
 
