@@ -39,6 +39,8 @@ pub struct OpenAiRequest {
     pub max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -85,6 +87,8 @@ pub struct OpenAiResponse {
     pub choices: Vec<OpenAiChoice>,
     #[serde(default)]
     pub usage: OpenAiUsage,
+    #[serde(default)]
+    pub service_tier: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -176,10 +180,12 @@ pub struct OpenAiCompatClient {
     context_window_size: usize,
     max_tokens: u32,
     provider_type: OpenAiProviderType,
+    service_tier: Option<String>,
     client: Client,
 }
 
 impl OpenAiCompatClient {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         base_url: String,
         provider_type: OpenAiProviderType,
@@ -187,6 +193,7 @@ impl OpenAiCompatClient {
         context_window_size: usize,
         max_tokens: u32,
         api_timeout_secs: u64,
+        service_tier: Option<String>,
     ) -> Result<Self> {
         let api_key = std::env::var("OPENAI_API_KEY")
             .or_else(|_| std::env::var("LLM_API_KEY"))
@@ -214,6 +221,7 @@ impl OpenAiCompatClient {
             context_window_size,
             max_tokens,
             provider_type,
+            service_tier,
             client,
         })
     }
@@ -490,6 +498,7 @@ fn translate_ai_request(
         max_tokens: max_tokens_field,
         max_completion_tokens: max_completion_tokens_field,
         response_format,
+        service_tier: None,
     })
 }
 
@@ -566,9 +575,23 @@ impl AiProvider for OpenAiCompatClient {
 
         let mut openai_req = translate_ai_request(request, self.max_tokens, self.provider_type)?;
         openai_req.model = self.model.clone();
+        openai_req.service_tier = self.service_tier.clone();
 
         let resp_body = serde_json::to_value(&openai_req)?;
         let resp = self.post_request(&resp_body).await?;
+        if let Some(requested) = &self.service_tier {
+            match &resp.service_tier {
+                Some(served) if served != requested => tracing::warn!(
+                    "Request served at service tier '{}' (requested '{}')",
+                    served,
+                    requested
+                ),
+                Some(served) => {
+                    tracing::debug!("Request served at service tier '{}'", served)
+                }
+                None => {}
+            }
+        }
         translate_ai_response(resp)
     }
 
@@ -585,8 +608,10 @@ impl AiProvider for OpenAiCompatClient {
         // gpt-5.x call that hit the 4096 default comes back empty with
         // finish_reason "length"; raising max_tokens has to miss that entry
         // rather than replay it. base_url separates two endpoints serving
-        // the same model name, and provider_type decides whether the request
-        // carries max_tokens or max_completion_tokens.
+        // the same model name, provider_type decides whether the request
+        // carries max_tokens or max_completion_tokens, and service_tier
+        // travels outside the request too: a flex-tier response can be
+        // downgraded under load.
         let max_tokens = self.max_tokens.to_string();
         let provider_type = match self.provider_type {
             OpenAiProviderType::OpenAi => "openai",
@@ -598,6 +623,7 @@ impl AiProvider for OpenAiCompatClient {
                 ("max_tokens", Some(max_tokens.as_str())),
                 ("base_url", Some(self.base_url.as_str())),
                 ("provider_type", Some(provider_type)),
+                ("service_tier", self.service_tier.as_deref()),
             ],
         )
     }
@@ -1034,6 +1060,7 @@ mod tests {
                 total_tokens: 30,
                 prompt_tokens_details: None,
             },
+            service_tier: None,
         };
 
         let ai_resp = translate_ai_response(openai_resp)?;
@@ -1071,6 +1098,7 @@ mod tests {
                     cached_tokens: Some(1920),
                 }),
             },
+            service_tier: None,
         };
 
         let usage = translate_ai_response(openai_resp)?.usage.unwrap();
@@ -1104,6 +1132,7 @@ mod tests {
                     cached_tokens: Some(0),
                 }),
             },
+            service_tier: None,
         };
 
         let usage = translate_ai_response(openai_resp)?.usage.unwrap();
@@ -1189,6 +1218,7 @@ mod tests {
                     cached_tokens: Some(3000),
                 }),
             },
+            service_tier: None,
         };
 
         // An endpoint reporting the prefix alongside prompt_tokens offers no
@@ -1198,6 +1228,28 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 2048);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_service_tier_serialized_only_when_set() {
+        // Omitted from the body when None so the provider applies its default.
+        let mut req = OpenAiRequest {
+            model: "m".to_string(),
+            messages: vec![],
+            tools: None,
+            temperature: None,
+            max_tokens: None,
+            max_completion_tokens: None,
+            response_format: None,
+            service_tier: None,
+        };
+        let body = serde_json::to_value(&req).unwrap();
+        assert!(body.get("service_tier").is_none());
+
+        // Serialized verbatim as a top-level field when set.
+        req.service_tier = Some("flex".to_string());
+        let body = serde_json::to_value(&req).unwrap();
+        assert_eq!(body["service_tier"], "flex");
     }
 
     #[test]
@@ -1226,6 +1278,7 @@ mod tests {
                 total_tokens: 40,
                 prompt_tokens_details: None,
             },
+            service_tier: None,
         };
 
         let ai_resp = translate_ai_response(openai_resp)?;
@@ -1252,6 +1305,7 @@ mod tests {
                 total_tokens: 10,
                 prompt_tokens_details: None,
             },
+            service_tier: None,
         };
 
         let result = translate_ai_response(openai_resp);
@@ -1450,6 +1504,7 @@ mod tests {
             400_000,
             max_tokens,
             60,
+            None,
         )
         .unwrap()
     }
@@ -1462,5 +1517,21 @@ mod tests {
 
         let elsewhere = test_client("http://localhost:1234/v1", 4096);
         assert_ne!(capped.cache_identity(), elsewhere.cache_identity());
+    }
+
+    #[test]
+    fn cache_identity_tracks_service_tier() {
+        let default_tier = test_client("https://api.openai.com/v1", 4096);
+        let flex = OpenAiCompatClient::new(
+            "https://api.openai.com/v1".to_string(),
+            OpenAiProviderType::OpenAi,
+            "gpt-5.1".to_string(),
+            400_000,
+            4096,
+            60,
+            Some("flex".to_string()),
+        )
+        .unwrap();
+        assert_ne!(default_tier.cache_identity(), flex.cache_identity());
     }
 }
