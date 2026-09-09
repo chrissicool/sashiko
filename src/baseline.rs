@@ -363,6 +363,14 @@ impl BaselineRegistry {
         Ok(map)
     }
 
+    /// Whether the tree is the Linux kernel, judged by a MAINTAINERS file
+    /// that parsed into entries. The kernel.org candidates -- stable and
+    /// linux-next -- can only apply to such a tree; anywhere else each is a
+    /// doomed fetch in front of the local fallbacks.
+    fn is_linux_tree(&self) -> bool {
+        !self.entries.is_empty()
+    }
+
     pub async fn resolve_candidates(
         &self,
         files: &[String],
@@ -379,7 +387,7 @@ impl BaselineRegistry {
         }
 
         // 1.5 Version Tag from Subject
-        candidates.extend(subject_version_candidates(subject));
+        candidates.extend(subject_version_candidates(subject, self.is_linux_tree()));
 
         // 2. Subsystem Heuristic
         let heuristic_candidates = self.resolve_subsystem_heuristic(files, subject);
@@ -437,7 +445,9 @@ impl BaselineRegistry {
         }
 
         // 4. Linux Next
-        candidates.push(self.resolve_url(LINUX_NEXT_URL, None));
+        if self.is_linux_tree() {
+            candidates.push(self.resolve_url(LINUX_NEXT_URL, None));
+        }
 
         // 5. Mainline
         // Use the identified mainline remote (Linus tree or origin) as a
@@ -749,7 +759,9 @@ pub fn extract_version_tag(subject: &str) -> Option<String> {
         .and_then(|caps| caps.get(1).map(|m| m.as_str().to_lowercase()))
 }
 
-fn subject_version_candidates(subject: &str) -> Vec<BaselineResolution> {
+/// `linux_tree` gates the stable tree's branches, which only a Linux tree can
+/// carry; the local version tag is a candidate either way.
+fn subject_version_candidates(subject: &str, linux_tree: bool) -> Vec<BaselineResolution> {
     let version = extract_version_tag(subject);
     let stable_versions = explicit_stable_versions(subject).or_else(|| {
         let version = version.as_deref()?;
@@ -757,7 +769,7 @@ fn subject_version_candidates(subject: &str) -> Vec<BaselineResolution> {
             .then(|| (version.strip_suffix(".y").unwrap_or(version), None))
     });
     let mut candidates = Vec::new();
-    if let Some((first, last)) = stable_versions {
+    if linux_tree && let Some((first, last)) = stable_versions {
         for version in std::iter::once(first).chain(last) {
             candidates.push(BaselineResolution::RemoteTarget {
                 url: "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git".to_string(),
@@ -1518,7 +1530,13 @@ F: patterns/
         remote_map.insert(dummy_url.clone(), "dummy-repo".to_string());
 
         let registry = BaselineRegistry {
-            entries: Vec::new(),
+            // Non-empty: linux-next is only offered for Linux trees, so the
+            // ordering this test asserts is only observable with entries.
+            entries: vec![MaintainersEntry {
+                subsystem: "DUMMY".to_string(),
+                trees: Vec::new(),
+                patterns: Vec::new(),
+            }],
             remote_map,
             custom_remotes: Some(vec![CustomRemoteSettings {
                 name: "dummy-repo".to_string(),
@@ -1662,5 +1680,46 @@ F: patterns/
             std::ffi::OsStr::new("GIT_NO_LAZY_FETCH"),
             Some(std::ffi::OsStr::new("1"))
         )));
+    }
+
+    #[tokio::test]
+    async fn test_kernel_org_trees_are_skipped_on_non_linux_trees() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path();
+
+        crate::git_cmd::in_dir(repo_path)
+            .arg("init")
+            .output()
+            .unwrap();
+
+        // No MAINTAINERS file parsed => not a Linux tree (e.g. the OpenBSD
+        // src tree). linux-next must not be probed, so the HEAD fallback is
+        // reached without a doomed kernel.org fetch in front of it.
+        let registry = BaselineRegistry {
+            entries: Vec::new(),
+            remote_map: HashMap::new(),
+            custom_remotes: None,
+            repo_path: repo_path.to_path_buf(),
+            mainline_remote: None,
+        };
+
+        // A bare release prefix is how a Linux stable backport is marked, and
+        // also how an OpenBSD diff names the release it was made against.
+        let candidates = registry
+            .resolve_candidates(&[], "[PATCH 7.8] uvm: fix", None)
+            .await;
+
+        assert!(
+            !candidates
+                .iter()
+                .any(|c| matches!(c, BaselineResolution::RemoteTarget { .. })),
+            "no kernel.org tree may be a candidate on a non-Linux tree: {:?}",
+            candidates
+        );
+        assert!(
+            candidates.contains(&BaselineResolution::LocalRef("HEAD".to_string())),
+            "HEAD must remain the fallback: {:?}",
+            candidates
+        );
     }
 }
