@@ -758,6 +758,7 @@ fn translate_ai_response(resp: GenerateContentResponse) -> Result<AiResponse> {
         },
         usage,
         truncated,
+        served_from_cache: false,
     })
 }
 

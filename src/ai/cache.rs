@@ -185,6 +185,7 @@ impl AiProvider for CachingAiProvider {
                         // same prompt.
                         usage.cached_tokens = Some(usage.prompt_tokens);
                     }
+                    resp.served_from_cache = true;
                     return Ok(resp);
                 }
             }

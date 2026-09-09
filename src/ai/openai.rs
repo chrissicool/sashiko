@@ -648,6 +648,7 @@ fn translate_ai_response(resp: OpenAiResponse) -> Result<AiResponse> {
         tool_calls,
         usage,
         truncated,
+        served_from_cache: false,
     })
 }
 
@@ -1758,18 +1759,6 @@ mod tests {
         )
         .unwrap();
         assert_ne!(default_tier.cache_identity(), flex.cache_identity());
-    }
-
-    fn retry_test_client() -> OpenAiCompatClient {
-        OpenAiCompatClient {
-            model: "test-model".to_string(),
-            base_url: "https://example.invalid/v1/chat/completions".to_string(),
-            context_window_size: 8192,
-            max_tokens: 1024,
-            provider_type: OpenAiProviderType::OpenAiCompatible,
-            service_tier: None,
-            client: Client::new(),
-        }
     }
 
     #[test]

@@ -15,7 +15,7 @@
 use crate::ReviewStatus;
 use crate::ai::quota::QuotaManager;
 use crate::ai::{
-    AiErrorClass, AiProvider, AiRequest, RemoteAiErrorPayload, classify_ai_error,
+    AiErrorClass, AiProvider, AiRequest, AiUsage, RemoteAiErrorPayload, classify_ai_error,
     create_provider_cached,
 };
 use crate::baseline::{BaselineRegistry, BaselineResolution, extract_files_from_diff};
@@ -1250,38 +1250,33 @@ impl Reviewer {
                         None
                     };
 
-                    let interaction_id = if let Some(tokens_in) = json_output["tokens_in"].as_u64()
-                    {
-                        let i_id = generate_interaction_id();
-                        let input_ctx = json_output["input_context"].as_str().unwrap_or("");
-                        let output_raw = if let Some(r) = json_output.get("review") {
-                            r.to_string()
-                        } else if let Some(e) = json_output.get("error") {
-                            e.to_string()
-                        } else {
-                            String::new()
-                        };
-
-                        let _ = ctx
-                            .db
-                            .create_ai_interaction(AiInteractionParams {
-                                id: &i_id,
-                                parent_id: None,
-                                workflow_id: None,
-                                provider: &ctx.settings.ai.provider,
-                                model: &ctx.settings.ai.model,
-                                input: input_ctx,
-                                output: &output_raw,
-                                tokens_in: tokens_in as u32,
-                                tokens_out: json_output["tokens_out"].as_u64().unwrap_or(0) as u32,
-                                tokens_cached: json_output["tokens_cached"].as_u64().unwrap_or(0)
-                                    as u32,
-                            })
-                            .await;
-                        Some(i_id)
+                    // Token counts come from the service, not from the child:
+                    // the child reports only the attempt that succeeded, while
+                    // every call -- including the ones that failed and were
+                    // retried -- passed through the service on its way out.
+                    let input_ctx = json_output["input_context"].as_str().unwrap_or("");
+                    let output_raw = if let Some(r) = json_output.get("review") {
+                        r.to_string()
+                    } else if let Some(e) = json_output.get("error") {
+                        e.to_string()
                     } else {
-                        None
+                        String::new()
                     };
+                    let interaction_id = record_review_spend(
+                        &ctx.db,
+                        review_id,
+                        &ctx.settings,
+                        input_ctx,
+                        &output_raw,
+                        TokenSpend {
+                            prompt: json_output["spent_tokens_in"].as_u64().unwrap_or(0) as usize,
+                            completion: json_output["spent_tokens_out"].as_u64().unwrap_or(0)
+                                as usize,
+                            cached: json_output["spent_tokens_cached"].as_u64().unwrap_or(0)
+                                as usize,
+                        },
+                    )
+                    .await;
 
                     if target_applied {
                         if let Some(error_msg) = json_output["error"].as_str() {
@@ -1609,6 +1604,14 @@ async fn run_review_tool_with_cmd(
     provider: Arc<dyn AiProvider>,
     llm_semaphore: Arc<Semaphore>,
 ) -> Result<serde_json::Value> {
+    // Spend, tracked separately from the budget counters further down. Every
+    // AI call for this review passes through here, so these survive a child
+    // that crashes, is killed on timeout, or exhausts its retries without ever
+    // reporting a total of its own.
+    let spent_prompt = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let spent_completion = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let spent_cached = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
     // Cap concurrent model calls with the shared limiter instead of taking the
     // semaphore by hand around each call. This also releases the permit as soon
     // as the call returns, so a request that is backing off no longer occupies
@@ -1836,6 +1839,9 @@ async fn run_review_tool_with_cmd(
                                         let stdin_clone = stdin_writer.clone();
                                         let total_tokens_used_clone = total_tokens_used.clone();
                                         let total_output_tokens_used_clone = total_output_tokens_used.clone();
+                                        let spent_prompt_clone = spent_prompt.clone();
+                                        let spent_completion_clone = spent_completion.clone();
+                                        let spent_cached_clone = spent_cached.clone();
                                         let abort_tx_clone = abort_tx.clone();
 
                                         let handle = tokio::spawn(async move {
@@ -1888,6 +1894,18 @@ async fn run_review_tool_with_cmd(
                                             let reply = match resp_payload {
                                                 Ok(p) => {
                                                     if let Some(usage) = &p.usage {
+                                                        let spend = spend_from(
+                                                            usage,
+                                                            p.served_from_cache,
+                                                        );
+                                                        spent_prompt_clone
+                                                            .fetch_add(spend.prompt, Ordering::SeqCst);
+                                                        spent_completion_clone.fetch_add(
+                                                            spend.completion,
+                                                            Ordering::SeqCst,
+                                                        );
+                                                        spent_cached_clone
+                                                            .fetch_add(spend.cached, Ordering::SeqCst);
                                                         let cached = usage.cached_tokens.unwrap_or(0);
                                                         let uncached_input = usage.prompt_tokens.saturating_sub(cached);
                                                         let current_total = total_tokens_used_clone.fetch_add(uncached_input + usage.completion_tokens, Ordering::SeqCst) + uncached_input + usage.completion_tokens;
@@ -2062,7 +2080,7 @@ async fn run_review_tool_with_cmd(
     }
 
     match interaction_result {
-        Ok(json) => {
+        Ok(mut json) => {
             // Update DB with patch statuses if final_result available
             if let Some(patches) = json["patches"].as_array() {
                 for p in patches {
@@ -2106,10 +2124,115 @@ async fn run_review_tool_with_cmd(
                     }
                 }
             }
+            // The child reported its own totals, but only for the attempt that
+            // succeeded; these cover every call the review made.
+            json["spent_tokens_in"] = json!(spent_prompt.load(Ordering::SeqCst));
+            json["spent_tokens_out"] = json!(spent_completion.load(Ordering::SeqCst));
+            json["spent_tokens_cached"] = json!(spent_cached.load(Ordering::SeqCst));
             Ok(json)
         }
-        Err(e) => Err(e),
+        Err(e) => {
+            // Nothing came back to attribute usage to, so record it here.
+            record_review_spend(
+                &db,
+                review_id,
+                settings,
+                "",
+                &format!("Review failed: {e}"),
+                TokenSpend {
+                    prompt: spent_prompt.load(Ordering::SeqCst),
+                    completion: spent_completion.load(Ordering::SeqCst),
+                    cached: spent_cached.load(Ordering::SeqCst),
+                },
+            )
+            .await;
+            Err(e)
+        }
     }
+}
+
+/// What one response cost, for accounting purposes.
+///
+/// A response served from Sashiko's own cache never reached a provider, so it
+/// costs nothing -- the usage attached to it describes the original call. What
+/// that hit saved is recorded by the cache itself, in
+/// `response_cache.tokens_saved`, and counting it here as well would report the
+/// same tokens twice under two different names.
+///
+/// A provider-side prefix cache hit is a different thing and does count: the
+/// request was sent and billed, just at a discount. It arrives as
+/// `cached_tokens` within `prompt_tokens`, and is carried through as such.
+fn spend_from(usage: &AiUsage, served_from_cache: bool) -> TokenSpend {
+    if served_from_cache {
+        return TokenSpend::default();
+    }
+    TokenSpend {
+        prompt: usage.prompt_tokens,
+        completion: usage.completion_tokens,
+        cached: usage.cached_tokens.unwrap_or(0),
+    }
+}
+
+/// Tokens actually sent to and returned by a provider for one review.
+///
+/// `prompt` includes `cached`, following the convention across the codebase
+/// that a cached count is a breakdown of the prompt rather than an addend.
+/// Responses served from Sashiko's own cache contribute nothing at all.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TokenSpend {
+    prompt: usize,
+    completion: usize,
+    cached: usize,
+}
+
+/// Persist what a review spent, and point the review row at it.
+///
+/// Called on every exit from the review tool, so usage survives a child that
+/// crashed, was killed on timeout or exhausted its retries without reporting a
+/// total. `input`/`output` are empty on those paths because the child never got
+/// far enough to hand them over; the token counts are the point.
+async fn record_review_spend(
+    db: &Arc<Database>,
+    review_id: i64,
+    settings: &Settings,
+    input: &str,
+    output: &str,
+    spend: TokenSpend,
+) -> Option<String> {
+    let TokenSpend {
+        prompt: tokens_in,
+        completion: tokens_out,
+        cached: tokens_cached,
+    } = spend;
+    if tokens_in == 0 && tokens_out == 0 {
+        return None;
+    }
+    let id = generate_interaction_id();
+    if let Err(e) = db
+        .create_ai_interaction(AiInteractionParams {
+            id: &id,
+            parent_id: None,
+            workflow_id: None,
+            provider: &settings.ai.provider,
+            model: &settings.ai.model,
+            input,
+            output,
+            tokens_in: tokens_in as u32,
+            tokens_out: tokens_out as u32,
+            tokens_cached: tokens_cached as u32,
+        })
+        .await
+    {
+        error!(
+            "Failed to record token usage for review {}: {}",
+            review_id, e
+        );
+        return None;
+    }
+    if let Err(e) = db.set_review_interaction(review_id, &id).await {
+        error!("Failed to link review {} to its usage: {}", review_id, e);
+    }
+    Some(id)
 }
 impl Reviewer {
     #[allow(clippy::too_many_arguments)]
@@ -2527,6 +2650,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                served_from_cache: false,
             })
         }
         fn estimate_tokens(&self, _request: &AiRequest) -> usize {
@@ -2581,6 +2705,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                served_from_cache: false,
             })
         }
 
@@ -3107,6 +3232,7 @@ fi
                     cached_tokens: Some(self.cached_tokens),
                 }),
                 truncated: false,
+                served_from_cache: false,
             })
         }
         fn estimate_tokens(&self, _request: &AiRequest) -> usize {
@@ -3637,5 +3763,69 @@ inline review content 3\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             .collect();
         assert!(args.contains(&"worker".to_string()));
         Ok(())
+    }
+
+    fn usage(prompt: usize, completion: usize, cached: Option<usize>) -> AiUsage {
+        AiUsage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: prompt + completion,
+            cached_tokens: cached,
+        }
+    }
+
+    #[test]
+    fn test_spend_counts_a_provider_call() {
+        let s = spend_from(&usage(1000, 200, None), false);
+        assert_eq!(
+            s,
+            TokenSpend {
+                prompt: 1000,
+                completion: 200,
+                cached: 0
+            }
+        );
+    }
+
+    #[test]
+    fn test_spend_ignores_a_response_cache_hit() {
+        // Nothing was sent, so nothing was spent -- not even the output, which
+        // came out of the store rather than being generated.
+        let s = spend_from(&usage(50_000, 900, Some(50_000)), true);
+        assert_eq!(s, TokenSpend::default());
+        assert_eq!(s.completion, 0, "cached output must not count as spend");
+    }
+
+    #[test]
+    fn test_spend_keeps_provider_prefix_cache_as_a_breakdown() {
+        // A provider-side prefix hit was still sent and billed. cached stays
+        // inside prompt: subtracting gives the uncached input, and adding the
+        // two would count the prefix twice.
+        let s = spend_from(&usage(10_000, 300, Some(8_000)), false);
+        assert_eq!(s.prompt, 10_000);
+        assert_eq!(s.cached, 8_000);
+        assert_eq!(s.prompt - s.cached, 2_000, "uncached input");
+    }
+
+    #[test]
+    fn test_served_from_cache_is_not_stored_with_the_response() {
+        // The flag describes delivery, not the response, so a cached payload
+        // must not come back out of the store already claiming to be a hit.
+        let mut resp = crate::ai::AiResponse {
+            content: Some("x".to_string()),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            usage: Some(usage(1, 1, None)),
+            truncated: false,
+            served_from_cache: true,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(
+            !json.contains("served_from_cache"),
+            "flag leaked into the cached payload: {json}"
+        );
+        resp = serde_json::from_str(&json).unwrap();
+        assert!(!resp.served_from_cache);
     }
 }
