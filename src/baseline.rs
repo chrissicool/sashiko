@@ -330,9 +330,14 @@ impl BaselineRegistry {
             }
         }
 
-        // 4. Linux Next
-        let linux_next_url = "https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git";
-        candidates.push(self.resolve_url(linux_next_url, None));
+        // 4. Linux Next — only for Linux trees (non-empty MAINTAINERS);
+        // skip on non-Linux repos so it doesn't shadow the local HEAD fallback
+        // below, which would otherwise sit behind a doomed linux-next fetch.
+        if !self.entries.is_empty() {
+            let linux_next_url =
+                "https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git";
+            candidates.push(self.resolve_url(linux_next_url, None));
+        }
 
         // 5. Mainline
         // Use the identified mainline remote (Linus tree or origin) as a
@@ -940,7 +945,13 @@ F: patterns/
 
         let dummy_url = repo_path.join("dummy_remote").to_str().unwrap().to_string();
         let registry = BaselineRegistry {
-            entries: Vec::new(),
+            // Non-empty: linux-next is only offered for Linux trees, so the
+            // ordering this test asserts is only observable with entries.
+            entries: vec![MaintainersEntry {
+                subsystem: "DUMMY".to_string(),
+                trees: Vec::new(),
+                patterns: Vec::new(),
+            }],
             remote_map: HashMap::new(),
             custom_remotes: Some(vec![CustomRemoteSettings {
                 name: "topic-tree".to_string(),
@@ -969,6 +980,44 @@ F: patterns/
             pos_custom,
             pos_next,
             names
+        );
+    }
+
+    #[tokio::test]
+    async fn test_linux_next_is_skipped_on_non_linux_trees() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path();
+
+        crate::git_cmd::in_dir(repo_path)
+            .arg("init")
+            .output()
+            .unwrap();
+
+        // No MAINTAINERS file parsed => not a Linux tree (e.g. the OpenBSD
+        // src tree). linux-next must not be probed, so the HEAD fallback is
+        // reached without a doomed kernel.org fetch in front of it.
+        let registry = BaselineRegistry {
+            entries: Vec::new(),
+            remote_map: HashMap::new(),
+            custom_remotes: None,
+            repo_path: repo_path.to_path_buf(),
+            mainline_remote: None,
+        };
+
+        let candidates = registry.resolve_candidates(&[], "Subject", None).await;
+
+        assert!(
+            !candidates.iter().any(|c| matches!(
+                c,
+                BaselineResolution::RemoteTarget { name, .. } if name == "linux-next"
+            )),
+            "linux-next must not be a candidate on a non-Linux tree: {:?}",
+            candidates
+        );
+        assert!(
+            candidates.contains(&BaselineResolution::LocalRef("HEAD".to_string())),
+            "HEAD must remain the fallback: {:?}",
+            candidates
         );
     }
 }
