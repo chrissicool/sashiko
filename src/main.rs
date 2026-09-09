@@ -451,23 +451,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )),
                 };
 
-                let result = run_worker_from_stdin(
-                    WorkerOptions {
-                        project,
-                        baseline: baseline.clone(),
-                        prompts: resolve_prompts_path(prompts.clone(), project)?,
-                        review_patch_index: *review_patch_index,
-                        review_commit: review_commit.clone(),
-                        reuse_worktree: reuse_worktree.clone(),
-                        custom_prompt: custom_prompt.clone(),
-                        scratch_clone: false,
-                        current_tree: false,
-                        agent: *agent,
-                        report_preexisting: *report_preexisting,
-                    },
-                    &settings,
-                )
-                .await;
+                let options = WorkerOptions {
+                    project,
+                    baseline: baseline.clone(),
+                    prompts: resolve_prompts_path(prompts.clone(), project)?,
+                    review_patch_index: *review_patch_index,
+                    review_commit: review_commit.clone(),
+                    reuse_worktree: reuse_worktree.clone(),
+                    custom_prompt: custom_prompt.clone(),
+                    scratch_clone: false,
+                    current_tree: false,
+                    agent: *agent,
+                    report_preexisting: *report_preexisting,
+                };
+
+                // Race the review against Ctrl-C so the in-flight review future is
+                // dropped on interrupt and RAII cleanup (e.g. provider temp dirs) runs.
+                // Exit only after the select! finishes; exiting inside the branch would
+                // skip dropping the losing future.
+                let result = tokio::select! {
+                    res = run_worker_from_stdin(options, &settings) => Some(res),
+                    _ = tokio::signal::ctrl_c() => None,
+                };
+                let Some(result) = result else {
+                    eprintln!("Interrupted.");
+                    std::process::exit(130);
+                };
 
                 match result {
                     Ok(val) => {
