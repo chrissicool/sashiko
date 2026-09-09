@@ -256,13 +256,17 @@ pub(crate) fn classify_status_code(status: reqwest::StatusCode) -> Option<AiErro
         reqwest::StatusCode::TOO_MANY_REQUESTS => Some(AiErrorClass::RateLimit {
             retry_after: DEFAULT_RETRY_AFTER,
         }),
-        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        // 408 is a transient client-side timeout; a verbatim retry can succeed.
+        reqwest::StatusCode::REQUEST_TIMEOUT
+        | reqwest::StatusCode::INTERNAL_SERVER_ERROR
         | reqwest::StatusCode::BAD_GATEWAY
         | reqwest::StatusCode::SERVICE_UNAVAILABLE
         | reqwest::StatusCode::GATEWAY_TIMEOUT => Some(AiErrorClass::Transient {
             retry_after: DEFAULT_RETRY_AFTER,
         }),
-        status if status.as_u16() == 529 => Some(AiErrorClass::Transient {
+        // 498 and 529 are non-standard best-effort-capacity signals returned by
+        // some endpoints when overloaded — retry with backoff.
+        status if matches!(status.as_u16(), 498 | 529) => Some(AiErrorClass::Transient {
             retry_after: DEFAULT_RETRY_AFTER,
         }),
         _ => None,
@@ -1310,8 +1314,36 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_status_code_request_timeout_is_transient() {
+        assert_eq!(
+            classify_status_code(reqwest::StatusCode::REQUEST_TIMEOUT),
+            Some(AiErrorClass::Transient {
+                retry_after: DEFAULT_RETRY_AFTER,
+            })
+        );
+    }
+
+    #[test]
+    fn test_classify_status_code_capacity_exceeded_is_transient() {
+        // 498 is non-standard, so reqwest has no named constant for it.
+        let status = reqwest::StatusCode::from_u16(498).unwrap();
+        assert_eq!(
+            classify_status_code(status),
+            Some(AiErrorClass::Transient {
+                retry_after: DEFAULT_RETRY_AFTER,
+            })
+        );
+    }
+
+    #[test]
     fn test_classify_status_code_other() {
+        // Request-defect 4xx stay fatal — a verbatim retry reproduces them.
         assert_eq!(classify_status_code(reqwest::StatusCode::BAD_REQUEST), None);
+        assert_eq!(
+            classify_status_code(reqwest::StatusCode::UNAUTHORIZED),
+            None
+        );
+        assert_eq!(classify_status_code(reqwest::StatusCode::NOT_FOUND), None);
     }
 
     fn assert_ai_error_class(error: impl Into<anyhow::Error>, expected: AiErrorClass) {
