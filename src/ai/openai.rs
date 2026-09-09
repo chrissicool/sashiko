@@ -175,6 +175,43 @@ pub enum OpenAiProviderType {
     OpenAiCompatible,
 }
 
+/// Parse a `Retry-After` value.
+///
+/// The header takes either form: delta-seconds, or an HTTP-date. Parsing only
+/// the integer silently discards the date form, and the caller then falls back
+/// to a default that is usually far too short. A date already in the past
+/// yields no delay rather than an error, since the wait is over.
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    let value = value.trim();
+
+    if let Ok(secs) = value.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    // Fractional seconds are not in the spec, but some gateways send them.
+    if let Ok(secs) = value.parse::<f64>()
+        && secs.is_finite()
+        && secs >= 0.0
+    {
+        return Some(Duration::from_secs_f64(secs));
+    }
+
+    // IMF-fixdate, e.g. "Wed, 21 Oct 2015 07:28:00 GMT".
+    let parsed = chrono::DateTime::parse_from_rfc2822(value)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(value, "%a, %d %b %Y %H:%M:%S GMT")
+                .map(|naive| naive.and_utc())
+        })
+        .ok()?;
+
+    // A past date means the window has already elapsed.
+    Some(
+        (parsed - chrono::Utc::now())
+            .to_std()
+            .unwrap_or(Duration::ZERO),
+    )
+}
+
 pub struct OpenAiCompatClient {
     model: String,
     base_url: String,
@@ -334,33 +371,39 @@ impl OpenAiCompatClient {
         let status = res.status();
         let status_code = status.as_u16();
 
-        let retry_after_duration = res
+        let retry_after_hint = res
             .headers()
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(Duration::from_secs);
+            .and_then(parse_retry_after);
 
         let error_text = redact_secret(&res.text().await.unwrap_or_default());
 
         match status_code {
             429 => {
-                let mut retry_seconds = retry_after_duration
-                    .unwrap_or(Duration::from_secs(60))
-                    .as_secs_f64();
-                if let Some(caps) = re.captures(&error_text) {
-                    retry_seconds = caps[1].parse::<f64>().unwrap_or(retry_seconds);
-                }
-                tracing::warn!("OpenAI 429 Rate Limit. Retry in {}s", retry_seconds);
-                Err(OpenAiCompatError::RateLimitExceeded(
-                    Duration::from_secs_f64(retry_seconds),
-                ))?
+                // Some gateways state the wait in the body rather than the
+                // header; prefer whichever is longer.
+                let body_hint = re
+                    .captures(&error_text)
+                    .and_then(|caps| caps[1].parse::<f64>().ok())
+                    .filter(|secs| secs.is_finite() && *secs >= 0.0)
+                    .map(Duration::from_secs_f64);
+                let hint = match (retry_after_hint, body_hint) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (a, b) => a.or(b),
+                };
+                let delay = hint.unwrap_or(Duration::from_secs(60));
+                tracing::warn!(
+                    "OpenAI 429 Rate Limit. Retry in {:.1}s",
+                    delay.as_secs_f64()
+                );
+                Err(OpenAiCompatError::RateLimitExceeded(delay))?
             }
             401 | 403 => Err(OpenAiCompatError::AuthenticationError(error_text))?,
             500..=599 => {
                 tracing::warn!("OpenAI Server Error {}: {}", status, error_text);
                 Err(OpenAiCompatError::TransientError(
-                    retry_after_duration.unwrap_or(Duration::from_secs(0)),
+                    retry_after_hint.unwrap_or(Duration::from_secs(0)),
                     error_text,
                 ))?
             }
@@ -718,6 +761,23 @@ mod tests {
         );
 
         assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
+    }
+
+    #[test]
+    fn test_api_error_capacity_exceeded_classifies_as_transient() {
+        // A 498 (a non-standard capacity-exceeded signal) falls into the
+        // ApiError catch-all, which defers to classify_status_code and retries.
+        let err = OpenAiCompatError::ApiError(
+            reqwest::StatusCode::from_u16(498).unwrap(),
+            "capacity_exceeded".to_string(),
+        );
+
+        assert_eq!(
+            err.ai_error_class(),
+            AiErrorClass::Transient {
+                retry_after: DEFAULT_RETRY_AFTER
+            }
+        );
     }
 
     #[test]
@@ -1606,5 +1666,58 @@ mod tests {
         )
         .unwrap();
         assert_ne!(default_tier.cache_identity(), flex.cache_identity());
+    }
+
+    fn retry_test_client() -> OpenAiCompatClient {
+        OpenAiCompatClient {
+            model: "test-model".to_string(),
+            base_url: "https://example.invalid/v1/chat/completions".to_string(),
+            context_window_size: 8192,
+            max_tokens: 1024,
+            provider_type: OpenAiProviderType::OpenAiCompatible,
+            service_tier: None,
+            client: Client::new(),
+        }
+    }
+
+    #[test]
+    fn test_parse_retry_after_delta_seconds() {
+        assert_eq!(parse_retry_after("30"), Some(Duration::from_secs(30)));
+        assert_eq!(parse_retry_after("  30  "), Some(Duration::from_secs(30)));
+        assert_eq!(parse_retry_after("0"), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn test_parse_retry_after_fractional_seconds() {
+        // Not in the spec, but gateways send it.
+        let d = parse_retry_after("1.5").expect("fractional accepted");
+        assert!((d.as_secs_f64() - 1.5).abs() < 1e-9, "{d:?}");
+    }
+
+    #[test]
+    fn test_parse_retry_after_http_date_is_not_dropped() {
+        // The form an integer-only parser silently discards.
+        let future = chrono::Utc::now() + chrono::Duration::seconds(120);
+        let header = future.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let d = parse_retry_after(&header).expect("HTTP-date must parse");
+        // Allow slack for the clock moving between formatting and parsing.
+        assert!(
+            d.as_secs() >= 110 && d.as_secs() <= 121,
+            "expected ~120s, got {d:?} from {header:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_retry_after_past_date_is_zero() {
+        let past = chrono::Utc::now() - chrono::Duration::seconds(600);
+        let header = past.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        assert_eq!(parse_retry_after(&header), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn test_parse_retry_after_rejects_garbage() {
+        assert_eq!(parse_retry_after(""), None);
+        assert_eq!(parse_retry_after("soon"), None);
+        assert_eq!(parse_retry_after("-5"), None);
     }
 }
