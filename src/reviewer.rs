@@ -1124,7 +1124,9 @@ impl Reviewer {
                     prerequisite.git_patch_id, prerequisite.message_id
                 )
             })?;
-            worktree.apply_patch(&mbox).await.map_err(|e| {
+            // b4 prerequisites arrive as git format-patch, whose paths are
+            // already repository-relative.
+            worktree.apply_patch(&mbox, false).await.map_err(|e| {
                 anyhow!(
                     "Prerequisite {} ({}) failed to apply: {}",
                     prerequisite.git_patch_id,
@@ -1490,7 +1492,10 @@ impl Reviewer {
                     };
 
                     // Try git am
-                    match worktree.apply_patch(&mbox).await {
+                    match worktree
+                        .apply_patch(&mbox, ctx.settings.git.resolve_patch_paths)
+                        .await
+                    {
                         Ok(()) => applied = true,
                         Err(e) => {
                             apply_logs.push_str(&format!(

@@ -807,6 +807,20 @@ pub struct GitSettings {
     #[serde(default)]
     pub repository_path: String,
     pub custom_remotes: Option<Vec<CustomRemoteSettings>>,
+    /// Work out where each file in a patch actually lives in the repository
+    /// instead of trusting the paths as sent, and hand `git am` the matching
+    /// `-p<n>` and `--directory=`.
+    ///
+    /// Off by default, which is right for lists that carry `git format-patch`
+    /// mail: those paths are already repository-relative with `a/` and `b/`
+    /// prefixes, so `-p1` is always correct and guessing can only do harm.
+    ///
+    /// Turn it on for lists where contributors send `cvs diff` or plain
+    /// `diff -u` output generated from inside a subdirectory -- OpenBSD's
+    /// tech@ being the motivating case, where paths arrive relative to the
+    /// submitter's working directory and no strip level can reach the file.
+    #[serde(default)]
+    pub resolve_patch_paths: bool,
 }
 
 /// No repository. A local review has none to configure, since it reviews the
@@ -817,6 +831,7 @@ impl Default for GitSettings {
         Self {
             repository_path: String::new(),
             custom_remotes: None,
+            resolve_patch_paths: false,
         }
     }
 }
