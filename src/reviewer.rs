@@ -1089,7 +1089,11 @@ impl Reviewer {
                     );
 
                     // Try git am
-                    if (worktree.apply_patch(&mbox).await).is_ok() {
+                    if (worktree
+                        .apply_patch(&mbox, ctx.settings.git.resolve_patch_paths)
+                        .await)
+                        .is_ok()
+                    {
                         applied = true;
                     }
                 }
