@@ -736,6 +736,11 @@
         }
 
         /* Thread tree */
+        /* Patchsets clustered by mailing-list thread in the list view. */
+        .thread-first td { border-top: 1px solid var(--border, #444); }
+        .thread-child td:first-child { padding-left: 12px; }
+        .thread-link { color: #888; margin-right: 6px; }
+
         .thread-tree {
             font-size: 0.95em;
         }
@@ -1915,6 +1920,40 @@
             }
         }
 
+        // Cluster patchsets that share a mailing-list thread, so a diff posted as
+        // a reply sits under the submission it answers instead of looking like
+        // unrelated work. Ordering within a cluster follows the page order, and
+        // the cluster is anchored where its newest member already sat, so the
+        // overall date ordering of the page is preserved.
+        //
+        // Grouping is per page on purpose: the list is paginated, so a thread can
+        // straddle a page boundary and we do not pretend to group across one.
+        function groupByThread(items) {
+            const counts = new Map();
+            items.forEach(p => {
+                if (p.thread_id === null || p.thread_id === undefined) return;
+                counts.set(p.thread_id, (counts.get(p.thread_id) || 0) + 1);
+            });
+
+            const out = [];
+            const done = new Set();
+            items.forEach(p => {
+                const tid = p.thread_id;
+                // Patchsets with no thread (git imports, API submissions) and
+                // lone members of a thread render exactly as before.
+                if (tid === null || tid === undefined || counts.get(tid) < 2) {
+                    out.push({ item: p, threadRole: null });
+                    return;
+                }
+                if (done.has(tid)) return; // already pulled in beside its sibling
+                done.add(tid);
+                items
+                    .filter(q => q.thread_id === tid)
+                    .forEach((q, i) => out.push({ item: q, threadRole: i === 0 ? 'first' : 'child' }));
+            });
+            return out;
+        }
+
         async function fetchListData() {
             const endpoint = state.listMode === 'patchsets' ? '/api/patchsets' : '/api/messages';
             let url = `${endpoint}?page=${state.currentPage}&per_page=${state.perPage}`;
@@ -1936,8 +1975,13 @@
             const tbody = document.getElementById('tableBody');
             tbody.innerHTML = '';
 
-            items.forEach((p, idx) => {
+            const rows = state.listMode === 'patchsets'
+                ? groupByThread(items)
+                : items.map(item => ({ item, threadRole: null }));
+
+            rows.forEach(({ item: p, threadRole }) => {
                 const row = document.createElement('tr');
+                if (threadRole) row.classList.add('thread-' + threadRole);
                 const d = new Date(p.date * 1000);
                 const dateStr = d.toISOString().split('T')[0];
                 const timeStr = d.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
@@ -1992,7 +2036,7 @@
                     }
 
                     row.innerHTML = `
-                        <td><div>${escapeHtml(p.subject) || '(no subject)'}</div>${tagsHtml}</td>
+                        <td><div>${threadRole === 'child' ? '<span class="thread-link" title="Same mailing-list thread as the patchset above">&#8627;</span>' : ''}${escapeHtml(p.subject) || '(no subject)'}</div>${tagsHtml}</td>
                         <td style="line-height:1.2;">${authorHtml}</td>
                         <td style="line-height:1.2;">${dateHtml}</td>
                         <td>${parts}</td>
