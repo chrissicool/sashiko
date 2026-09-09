@@ -363,6 +363,14 @@ impl BaselineRegistry {
         Ok(map)
     }
 
+    /// Whether the tree is the Linux kernel, judged by a MAINTAINERS file
+    /// that parsed into entries. The kernel.org candidates -- stable and
+    /// linux-next -- can only apply to such a tree; anywhere else each is a
+    /// doomed fetch in front of the local fallbacks.
+    fn is_linux_tree(&self) -> bool {
+        !self.entries.is_empty()
+    }
+
     pub async fn resolve_candidates(
         &self,
         files: &[String],
@@ -381,7 +389,9 @@ impl BaselineRegistry {
         // 1.5 Version Tag from Subject
         if let Some(version) = extract_version_tag(subject) {
             let base_version = version.strip_suffix(".y").unwrap_or(&version);
-            if version.ends_with(".y") || is_stable_series_prefix(subject, &version) {
+            if self.is_linux_tree()
+                && (version.ends_with(".y") || is_stable_series_prefix(subject, &version))
+            {
                 candidates.push(BaselineResolution::RemoteTarget {
                     url: "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git"
                         .to_string(),
@@ -448,7 +458,9 @@ impl BaselineRegistry {
         }
 
         // 4. Linux Next
-        candidates.push(self.resolve_url(LINUX_NEXT_URL, None));
+        if self.is_linux_tree() {
+            candidates.push(self.resolve_url(LINUX_NEXT_URL, None));
+        }
 
         // 5. Mainline
         // Use the identified mainline remote (Linus tree or origin) as a
@@ -1548,7 +1560,13 @@ F: patterns/
 
         let dummy_url = repo_path.join("dummy_remote").to_str().unwrap().to_string();
         let registry = BaselineRegistry {
-            entries: Vec::new(),
+            // Non-empty: linux-next is only offered for Linux trees, so the
+            // ordering this test asserts is only observable with entries.
+            entries: vec![MaintainersEntry {
+                subsystem: "DUMMY".to_string(),
+                trees: Vec::new(),
+                patterns: Vec::new(),
+            }],
             remote_map: HashMap::new(),
             custom_remotes: Some(vec![CustomRemoteSettings {
                 name: "topic-tree".to_string(),
@@ -1577,6 +1595,47 @@ F: patterns/
             pos_custom,
             pos_next,
             names
+        );
+    }
+
+    #[tokio::test]
+    async fn test_kernel_org_trees_are_skipped_on_non_linux_trees() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path();
+
+        crate::git_cmd::in_dir(repo_path)
+            .arg("init")
+            .output()
+            .unwrap();
+
+        // No MAINTAINERS file parsed => not a Linux tree (e.g. the OpenBSD
+        // src tree). linux-next must not be probed, so the HEAD fallback is
+        // reached without a doomed kernel.org fetch in front of it.
+        let registry = BaselineRegistry {
+            entries: Vec::new(),
+            remote_map: HashMap::new(),
+            custom_remotes: None,
+            repo_path: repo_path.to_path_buf(),
+            mainline_remote: None,
+        };
+
+        // A bare release prefix is how a Linux stable backport is marked, and
+        // also how an OpenBSD diff names the release it was made against.
+        let candidates = registry
+            .resolve_candidates(&[], "[PATCH 7.8] uvm: fix", None)
+            .await;
+
+        assert!(
+            !candidates
+                .iter()
+                .any(|c| matches!(c, BaselineResolution::RemoteTarget { .. })),
+            "no kernel.org tree may be a candidate on a non-Linux tree: {:?}",
+            candidates
+        );
+        assert!(
+            candidates.contains(&BaselineResolution::LocalRef("HEAD".to_string())),
+            "HEAD must remain the fallback: {:?}",
+            candidates
         );
     }
 }
