@@ -434,6 +434,11 @@ cp docs/examples/Settings.openai-compat.toml Settings.toml
 
 Adjust `base_url` to point to your provider's endpoint.
 
+For reasoning models, set `effort` in `[ai.openai_compat]` (e.g. `"low"`,
+`"medium"`, `"high"`) to send the top-level `reasoning_effort` field. This
+matches OpenAI, GLM/z.ai, OrcaRouter, OpenCode Zen and Kilo Gateway.
+OpenRouter uses a different, nested shape and does not honor this field.
+
 `base_url` may be either:
 
 - a shorthand such as `http://localhost:8080/v1` (the `/chat/completions`
