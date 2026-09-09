@@ -1143,6 +1143,7 @@ mod tests {
                         tool_calls: None,
                         usage: None,
                         truncated: false,
+                        served_from_cache: false,
                     });
                 }
                 anyhow::bail!(
@@ -1322,6 +1323,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                served_from_cache: false,
             })
         }
 

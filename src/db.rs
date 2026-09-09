@@ -1823,6 +1823,21 @@ impl Database {
         Ok(())
     }
 
+    /// Point a review at the interaction row holding its token usage.
+    ///
+    /// `complete_review` sets this alongside a result, but a review that never
+    /// produced one -- a crashed, killed or aborted child -- still spent tokens
+    /// that have to be attributable to something.
+    pub async fn set_review_interaction(&self, review_id: i64, interaction_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE reviews SET interaction_id = ? WHERE id = ?",
+                libsql::params![interaction_id, review_id],
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn create_ai_interaction(&self, params: AiInteractionParams<'_>) -> Result<()> {
         self.conn.execute(
             "INSERT INTO ai_interactions (id, parent_interaction_id, workflow_id, provider, model, input_context, output_raw, tokens_in, tokens_out, tokens_cached, created_at)

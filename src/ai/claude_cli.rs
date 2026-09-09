@@ -345,6 +345,7 @@ pub fn parse_inner_response(text: &str, usage: Option<AiUsage>) -> Result<AiResp
             tool_calls: Some(merged_tool_calls),
             usage,
             truncated: false,
+            served_from_cache: false,
         });
     }
 
@@ -358,6 +359,7 @@ pub fn parse_inner_response(text: &str, usage: Option<AiUsage>) -> Result<AiResp
             tool_calls: None,
             usage,
             truncated: false,
+            served_from_cache: false,
         });
     }
 
@@ -370,6 +372,7 @@ pub fn parse_inner_response(text: &str, usage: Option<AiUsage>) -> Result<AiResp
         tool_calls: None,
         usage,
         truncated: false,
+        served_from_cache: false,
     })
 }
 
@@ -398,6 +401,7 @@ fn parse_single_json(v: &Value, json_str: &str, usage: Option<AiUsage>) -> Resul
                 tool_calls: Some(tool_calls),
                 usage,
                 truncated: false,
+                served_from_cache: false,
             });
         }
     }
@@ -411,6 +415,7 @@ fn parse_single_json(v: &Value, json_str: &str, usage: Option<AiUsage>) -> Resul
             tool_calls: None,
             usage,
             truncated: false,
+            served_from_cache: false,
         });
     }
 
@@ -422,6 +427,7 @@ fn parse_single_json(v: &Value, json_str: &str, usage: Option<AiUsage>) -> Resul
         tool_calls: None,
         usage,
         truncated: false,
+        served_from_cache: false,
     })
 }
 

@@ -565,6 +565,7 @@ mod tests {
                     tool_calls: Some(self.calls.clone()),
                     usage: None,
                     truncated: false,
+                    served_from_cache: false,
                 });
             }
             Ok(AiResponse {
@@ -574,6 +575,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                served_from_cache: false,
             })
         }
 

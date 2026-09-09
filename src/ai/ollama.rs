@@ -336,6 +336,7 @@ fn translate_ollama_response(resp: OllamaResponse) -> Result<AiResponse> {
         tool_calls,
         usage,
         truncated: false,
+        served_from_cache: false,
     })
 }
 

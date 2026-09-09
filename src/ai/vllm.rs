@@ -596,6 +596,7 @@ fn translate_vllm_response(resp: VllmResponse) -> Result<AiResponse> {
         tool_calls,
         usage,
         truncated,
+        served_from_cache: false,
     })
 }
 
