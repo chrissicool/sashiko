@@ -12,6 +12,7 @@ symbol patterns.
 
 | Subsystem | Triggers | File |
 |-----------|----------|------|
+| Audio | sys/dev/audio*, `audio_*`, sys/dev/midi*, `mixer_*`, `*_trigger_output`, `*_trigger_input`, audio_if | audio.md |
 | Crypto | sys/crypto/, `crypto_*`, `swcr_*`, `CRYPTO_*`, aes, chacha, poly1305, hmac, sys/dev/ic/*crypto* | crypto.md |
 | Drivers | sys/dev/, config_found, config_attach, cfattach, cfdriver, bus_space_, `bus_dmamap_*`, `.*_intr_establish`, spl | drivers.md |
 | Networking | sys/net/, sys/netinet/, sys/netinet6/, sys/net80211/, `pf_*`, NET_LOCK, if_input, if_enqueue, `ifq_*`, `ifiq_*`, `ether_*`, ip_input, ip6_input, m_pullup, m_freem, mbuf | networking.md |
