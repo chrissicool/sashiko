@@ -238,16 +238,28 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
         || subject_clean.starts_with("[reproducer]") // Reproducers
         || subject_lower.contains("(was ")
         || subject_lower.contains("(was:");
+    // A forward relays someone else's content; the forwarder isn't submitting a
+    // patch, so a fresh diff inside a forward should not promote it to a patchset.
+    let is_forward = subject_clean.starts_with("fwd:")
+        || subject_clean.starts_with("forwarded:")
+        || subject_clean.starts_with("wg:"); // German 'Weitergeleitet' (forwarded)
     let has_patch_tag = subject_clean.contains("patch") || subject_clean.contains("rfc");
     let has_diff = !diff.is_empty();
+    // A *fresh* diff is one on unquoted lines, not ">"-prefixed reply context.
+    // OpenBSD posts the actual diff as a reply in the discussion thread, so a
+    // reply carrying an unquoted diff is a real patch — whereas a reply that only
+    // quotes someone else's diff to comment on it is not.
+    let has_unquoted_diff = body_has_unquoted_diff(&body);
 
     // A message is part of a series if it's a cover letter (index 0) or has multiple parts (total > 1)
     let is_series_metadata = total > 1 || index == 0;
 
-    // It is a patch or cover letter if:
-    // 1. It is NOT a reply (Re: ...)
-    // 2. AND (It has [PATCH]/[RFC] tag OR it has a diff OR it looks like a series cover letter/part)
-    let is_patch_or_cover = !is_reply && (has_patch_tag || has_diff || is_series_metadata);
+    // It is a patch or cover letter if either:
+    // 1. It is NOT a reply (Re: ...) AND it has a [PATCH]/[RFC] tag, a diff, or is series metadata; or
+    // 2. It is a reply (but not a forward) carrying a fresh, unquoted diff — e.g.
+    //    an OpenBSD diff posted as a thread reply.
+    let is_patch_or_cover = (!is_reply && (has_patch_tag || has_diff || is_series_metadata))
+        || (has_unquoted_diff && !is_forward);
 
     let metadata = PatchsetMetadata {
         message_id: message_id.clone(),
@@ -278,6 +290,30 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
     };
 
     Ok((metadata, patch))
+}
+
+/// Returns true if `body` contains a diff on unquoted lines — i.e. a fresh diff
+/// the sender wrote, not a ">"-quoted diff carried over from earlier in a thread.
+/// Mirrors the marker set used for `has_diff`: a `diff --git` line, or the
+/// `--- ` / `+++ ` / `@@ -` triad, all required to appear unquoted.
+fn body_has_unquoted_diff(body: &str) -> bool {
+    let (mut minus, mut plus, mut hunk) = (false, false, false);
+    for raw in body.lines() {
+        let line = raw.trim_start();
+        if line.starts_with('>') {
+            continue; // quoted reply context
+        }
+        if line.starts_with("diff --git ") {
+            return true;
+        } else if line.starts_with("--- ") {
+            minus = true;
+        } else if line.starts_with("+++ ") {
+            plus = true;
+        } else if line.starts_with("@@ -") {
+            hunk = true;
+        }
+    }
+    minus && plus && hunk
 }
 
 fn parse_subject_index(subject: &str) -> (u32, u32) {
@@ -674,6 +710,33 @@ Body";
         assert!(
             !meta.is_patch_or_cover,
             "Reply with diff should NOT be a patchset"
+        );
+    }
+
+    #[test]
+    fn test_reply_with_fresh_diff_is_patchset() {
+        // OpenBSD style: the actual diff is posted as a reply in the thread,
+        // below some quoted discussion. The unquoted diff makes it a patch.
+        let raw = b"Message-ID: <obsd>\r\nSubject: Re: sys/vfs: do not reclaim\r\n\r\n\
+> On some date, someone wrote:\n\
+> > Thoughts?\n\
+> > Index: sys/kern/vfs_subr.c\n\
+\n\
+Here is the diff:\n\
+Index: sys/kern/vfs_subr.c\n\
+--- sys/kern/vfs_subr.c\t1\n\
++++ sys/kern/vfs_subr.c\t2\n\
+@@ -1021,7 +1021,7 @@\n\
+-old\n\
++new\n";
+        let (meta, patch) = parse_email(raw).unwrap();
+        assert!(
+            meta.is_patch_or_cover,
+            "Reply carrying a fresh unquoted diff SHOULD be a patchset"
+        );
+        assert!(
+            patch.is_some(),
+            "A patch should be extracted from the reply"
         );
     }
 
