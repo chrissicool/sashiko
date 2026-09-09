@@ -2,9 +2,10 @@
 //!
 //! This does not run a review (no AI); it only confirms the directory passes
 //! the same validation the worker performs, and that the files the review
-//! actually renders -- the stage instructions -- come out of the OpenBSD
-//! directory rather than from anywhere else.
+//! actually renders -- the stage instructions and the reviewer identity --
+//! come out of the OpenBSD directory rather than from anywhere else.
 
+use sashiko::worker::kernel_workflow::{KernelReviewState, kernel_system_prompt};
 use sashiko::worker::prompts::PromptRegistry;
 use sashiko::workflow::PromptTemplate;
 use std::path::PathBuf;
@@ -48,4 +49,21 @@ async fn openbsd_stage_prompts_load() {
             "OpenBSD stage {n} rendered Linux text: {rendered}"
         );
     }
+}
+
+#[tokio::test]
+async fn openbsd_system_prompt_uses_the_openbsd_identity() {
+    let rendered = kernel_system_prompt(true)
+        .render_for_model(&KernelReviewState::default(), &openbsd_dir())
+        .await
+        .expect("OpenBSD system prompt should render");
+
+    assert!(
+        rendered.contains("OpenBSD"),
+        "OpenBSD identity should reach the system prompt: {rendered}"
+    );
+    assert!(
+        !rendered.contains("Linux kernel maintainer"),
+        "the Linux identity must not leak into an OpenBSD review: {rendered}"
+    );
 }

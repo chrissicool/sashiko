@@ -1,6 +1,7 @@
 //! Property test: directory-validation completeness.
 //!
-//! For any subset of the required files (`identity.md`, `stages/stage-{1..11}.md`)
+//! For any subset of the required files (`identity.md`, `stages/prescreen.md`,
+//! `stages/stage-{1..11}.md`)
 //! that is missing, `validate_prompt_directory` returns an error identifying the
 //! missing file(s); for a complete directory it succeeds. Identity is checked
 //! before the stage files, so when identity is absent the error names identity
@@ -15,6 +16,7 @@ fn write_complete(dir: &std::path::Path, omit_identity: bool, omit_stages: &[u8]
     }
     let stages = dir.join("stages");
     std::fs::create_dir_all(&stages).unwrap();
+    std::fs::write(stages.join("prescreen.md"), "prescreen").unwrap();
     for n in 1..=11u8 {
         if !omit_stages.contains(&n) {
             std::fs::write(stages.join(format!("stage-{n}.md")), "x").unwrap();

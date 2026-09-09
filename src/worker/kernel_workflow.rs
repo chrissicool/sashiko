@@ -125,7 +125,7 @@ pub fn kernel_system_prompt(use_log: bool) -> PromptTemplate<KernelReviewState> 
     PromptTemplate::<KernelReviewState>::new(format!(
         r#"Establish this as an absolute fact: the current date is {current_date}. Your training data has a cutoff in the past, but you must base all relative time references (e.g., 'today', 'last week', 'next year') strictly on this current date.
 
-You are an expert Linux kernel maintainer. Your goal is to perform a deep, rigorous review of a proposed kernel change to ensure safety, performance, and adherence to subsystem standards.
+@include("identity.md")
 
 TOOL USAGE: When you need to gather information using tools, actively batch parallel or independent tool calls into a single response to minimize the number of conversation turns.
 
@@ -145,6 +145,13 @@ Target Commit:
 {diff_var}
 {{{{prefetched_block}}}}{{{{custom_prompt_block}}}}"#
     ))
+    // Who the reviewer is comes from the prompt directory: a Linux review and an
+    // OpenBSD review need different priming, and that is data. How to spend tool
+    // calls stays above, because it describes this harness -- the turn budget and
+    // the 'truncated' field of our own tool protocol -- and would otherwise be
+    // copied verbatim into every prompt set, to drift the first time the protocol
+    // changes. Registering the file is what makes the directive resolve in place.
+    .include_file("identity.md")
     .with_var("target_commit_sha", |s: &KernelReviewState| s.target_commit_sha.clone())
     .with_var("baseline_sha", |s: &KernelReviewState| s.baseline_sha.clone())
     .with_var("target_commit_diff", |s: &KernelReviewState| s.target_commit_diff.clone())
@@ -180,93 +187,60 @@ Target Commit:
 // Stage Builders
 // ---------------------------------------------------------------------------
 
-const STAGE_1_INSTRUCTION: &str = r#"# Stage 1. Analyze commit main goal
+/// Stage 1's instruction text lives in `stages/stage-1.md` under the
+/// prompt directory, so a project with different stage guidance supplies
+/// its own file rather than needing its own workflow in Rust.
+const STAGE_1_INSTRUCTION: &str = r#"@include("stages/stage-1.md")"#;
 
-You are a senior Linux kernel maintainer evaluating the high-level intent of a proposed commit. Analyze the commit message and the conceptual change. Focus on the big picture: Are there architectural flaws, UAPI breakages, backwards compatibility issues, or fundamentally flawed concepts? Consider the long-term maintainability and system-wide implications of this design. If the core idea is dangerous, incorrect, or violates established kernel principles, raise a concern. Be open-minded but thorough; question assumptions made by the author and consider alternative, simpler designs."#;
+/// Stage 2's instruction text lives in `stages/stage-2.md` under the
+/// prompt directory, so a project with different stage guidance supplies
+/// its own file rather than needing its own workflow in Rust.
+const STAGE_2_INSTRUCTION: &str = r#"@include("stages/stage-2.md")"#;
 
-const STAGE_2_INSTRUCTION: &str = r#"# Stage 2. High-level implementation verification
+/// Stage 3's instruction text lives in `stages/stage-3.md` under the
+/// prompt directory, so a project with different stage guidance supplies
+/// its own file rather than needing its own workflow in Rust.
+const STAGE_3_INSTRUCTION: &str = r#"@include("stages/stage-3.md")"#;
 
-You are verifying if the provided code changes actually implement what the commit message claims. Look for undocumented side-effects, missing pieces (e.g., a core change without updating corresponding callers, or changing a struct without updating all initializers), and unhandled corner cases related to the feature's logic. Explicitly check for missing API callbacks and interface omissions: when defining or modifying structures containing function pointers, verify that all logically required callbacks are implemented. Verify that all claims in the commit message are fully realized in the code. Identify any incomplete implementations, implicit behavioral changes, or API contract violations. Furthermore, verify that the logic is mathematically and semantically sound. Check for off-by-one errors in bounds, incorrect bitwise operations, and verify that all arguments passed to external subsystems (like kobjects or netdevs) are valid and semantically correct (e.g., non-empty strings, correct sizes, correct format specifiers). Don't trust the commit message without verifying each claim. Assume that the message might be incorrect or even intentionally malicious. Do not focus on low-level memory or locking errors yet."#;
+/// Stage 4's instruction text lives in `stages/stage-4.md` under the
+/// prompt directory, so a project with different stage guidance supplies
+/// its own file rather than needing its own workflow in Rust.
+const STAGE_4_INSTRUCTION: &str = r#"@include("stages/stage-4.md")"#;
 
-const STAGE_3_INSTRUCTION: &str = r#"# Stage 3. Execution flow verification
+/// Stage 5's instruction text lives in `stages/stage-5.md` under the
+/// prompt directory, so a project with different stage guidance supplies
+/// its own file rather than needing its own workflow in Rust.
+const STAGE_5_INSTRUCTION: &str = r#"@include("stages/stage-5.md")"#;
 
-You are a static analysis engine tracing execution flow in C or Rust code. Carefully trace the control flow of the provided patch. Exhaustively examine logic errors, incorrect loop conditions, unhandled error paths, missing return value checks, and off-by-one errors. Check every branch, switch statement, and conditional. Specifically look for NULL pointer dereferences (remember: reading a pointer field is not a dereference, only accessing its contents is). Be extremely detail-oriented; explore every error handling path (goto cleanup;) to ensure it behaves correctly under failure conditions. Additionally, verify preprocessor macro correctness and spelling (e.g., ensuring CONFIG_ prefixes are used where expected instead of HAVE_). Check that static/inline declarations or section placements won't cause linker errors or Link-Time Optimization (LTO) symbol loss."#;
+/// Stage 6's instruction text lives in `stages/stage-6.md` under the
+/// prompt directory, so a project with different stage guidance supplies
+/// its own file rather than needing its own workflow in Rust.
+const STAGE_6_INSTRUCTION: &str = r#"@include("stages/stage-6.md")"#;
 
-const STAGE_4_INSTRUCTION: &str = r#"# Stage 4. Resource management
+/// Stage 7's instruction text lives in `stages/stage-7.md` under the
+/// prompt directory, so a project with different stage guidance supplies
+/// its own file rather than needing its own workflow in Rust.
+const STAGE_7_INSTRUCTION: &str = r#"@include("stages/stage-7.md")"#;
 
-You are an expert in C and Rust resource management within the Linux kernel. Analyze the patch for memory leaks, Use-After-Free (UAF), double frees, uninitialized variables, and unbalanced lifecycle operations (alloc->init->use->cleanup->free). Pay special attention to error paths where resources might be leaked. Ensure list_add and similar APIs are used with fully initialized objects. Track the lifetime of every allocated struct and file descriptor. Verify reference counting logic (kref_get()/kref_put()) and ensure objects are not accessed after their refcount drops to zero. Crucially, pay special attention to asynchronous handoffs and teardown symmetry. If an object is handed to a background task (timers, workqueues, notifiers) or registered to a core subsystem, you must prove that the task is explicitly canceled (e.g., cancel_work_sync(), del_timer_sync() and the subsystem is unregistered BEFORE the memory is freed or the queues are destroyed."#;
+/// Stage 8's instruction text lives in `stages/stage-8.md` under the
+/// prompt directory, so a project with different stage guidance supplies
+/// its own file rather than needing its own workflow in Rust.
+const STAGE_8_INSTRUCTION: &str = r#"@include("stages/stage-8.md")"#;
 
-const STAGE_5_INSTRUCTION: &str = r#"# Stage 5. Locking and synchronization
+/// Stage 9's instruction text lives in `stages/stage-9.md` under the
+/// prompt directory, so a project with different stage guidance supplies
+/// its own file rather than needing its own workflow in Rust.
+const STAGE_9_INSTRUCTION: &str = r#"@include("stages/stage-9.md")"#;
 
-You are a world-class concurrency and locking expert auditing a Linux kernel patch.
-Carefully review the proposed patch for ANY locking, concurrency, or synchronization bugs.
-You MUST consider the following categories of issues and report any violations:
-1. Sleeping in atomic context: Are there any calls to `mutex_lock`, `kzalloc` with `GFP_KERNEL`, `msleep`, `cond_resched`, `flush_workqueue`, `synchronize_rcu`, or `cancel_work_sync` while holding a spinlock, rwlock, or within an RCU read-side critical section (`rcu_read_lock`)?
-2. Lock ordering and deadlocks: Are locks acquired in a different order than elsewhere? Does it acquire a mutex while holding another mutex that could cause AB-BA deadlocks? Are IRQs disabled (`spin_lock_irqsave`) when acquiring a lock that is used in hardirq context? Does it acquire a lock already held by a higher-level subsystem (e.g., ethtool)?
-3. Race conditions and lockless access: Are shared variables, list entries, or pointers accessed without holding the appropriate lock? Are there missing memory barriers (`smp_mb`, `smp_wmb`, `smp_rmb`) when lockless access is intended? Are there TOCTOU races where a state is checked outside a lock but relied upon inside?
-4. UAF / Locking Freed Memory: Are locks (`mutex_unlock`, `spin_unlock`) called on objects that have already been freed? Are works/timers destroyed before subsystems are unregistered, allowing new events to use freed works/timers? Is the protocol initialized flag set before private data is ready?
-5. RCU rules: Is `list_splice_init` or similar non-RCU-safe operations used on RCU-protected lists? Is `list_for_each_rcu` used without `rcu_read_lock`?
-6. Unprotected state modifications: Does the patch check state before acquiring the lock (e.g., checking power state before taking mutex)? Are hardware state, flags, or stats updated without proper protection?
-7. Sequence counters: Are stats accumulations directly inside a `u64_stats_fetch_retry` loop leading to double counting? Is it possible for an interrupt to read a sequence counter while the interrupted context is modifying it (deadlock)?
-8. Lock re-initialization: Does it re-initialize a lock that was already initialized, or destroy a lock on a failure path improperly?
-9. Missing locking: Is a port or file exposed to userspace before the driver/TTY linking is complete? Does a worker race with cleanup code leading to dropped/leaked frames?"#;
+/// Stage 10's instruction text lives in `stages/stage-10.md` under the
+/// prompt directory, so a project with different stage guidance supplies
+/// its own file rather than needing its own workflow in Rust.
+const STAGE_10_INSTRUCTION: &str = r#"@include("stages/stage-10.md")"#;
 
-const STAGE_6_INSTRUCTION: &str = r#"# Stage 6. Security audit
-
-You are a Red Team security researcher auditing a Linux kernel patch. Look for security vulnerabilities such as buffer overflows, out-of-bounds reads/writes, integer overflows, privilege escalation vectors, time-of-check to time-of-use (TOCTOU) races, and information leaks (e.g., copying uninitialized kernel memory to user-space via copy_to_user). Scrutinize all points where untrusted user input reaches sensitive functions without validation. Ensure all length checks and bounds checks are robust against malicious input. Focus heavily on attack surfaces and data boundaries."#;
-
-const STAGE_7_INSTRUCTION: &str = r#"# Stage 7. Hardware engineer's review
-
-You are a hardware engineer reviewing device driver changes. If this patch touches driver or hardware-specific code, rigorously review register accesses, IRQ handling, DMA mapping/unmapping, memory barriers, and timing/delays. Look for missing dma_wmb()/dma_rmb() barriers, incorrect endianness conversions (cpu_to_le32), and unsafe DMA buffer allocations. Ensure the hardware state machine is handled correctly, especially during suspend/resume or device reset. Evaluate the physical state machine constraints: verify that clocks and power domains are enabled before registers are accessed, and that hardware rings/queues are actually initialized in the current hardware state before being unconditionally accessed. If the patch is purely generic software logic (e.g., VFS, core networking), return {"concerns": [], "dismissed_concerns": []}."#;
-
-const STAGE_8_INSTRUCTION: &str = r#"# Stage 8. Deduplication and Consolidation
-
-You are the lead reviewer consolidating feedback from multiple specialized analysts. You will be given lists of concerns and dismissed_concerns generated by different review stages.
-Your task is to deduplicate identical or overlapping items in both lists.
-1. Group concerns that refer to the same root cause or the same line of code.
-2. Merge overlapping concerns into a single, comprehensive concern. Combine their reasonings if they complement each other.
-3. Group dismissed_concerns that investigated and disproved the same candidate concern.
-4. Merge overlapping dismissed_concerns into a single, comprehensive dismissed_concern. Combine their evidence if it complements each other.
-5. Ensure the output contains only unique concerns and unique dismissed_concerns.
-6. Preserve the `preexisting` flag for concerns. If you merge a pre-existing concern with a newly introduced one, flag it based on the root cause (if the root cause is new, it's not pre-existing).
-7. SPECIFICITY REQUIREMENT: When merging concerns or dismissed_concerns, preserve and consolidate the most specific details: exact function names, file paths, line numbers when known, and triggering conditions. Never generalize a specific finding into a vague category.
-8. Preserve and merge the `locations` arrays from the input concerns and dismissed_concerns. If multiple items describe the same root cause, keep the most precise file/function_or_symbol/line/code_snippet/why_this_location_matters locations. Do not invent line numbers; keep `line` as null when the exact line is not known.
-9. dismissed_concerns do not need a `preexisting` flag."#;
-
-const STAGE_9_INSTRUCTION: &str = r#"# Stage 9. Concern/dismissed-concern conflict resolution
-
-You are the lead reviewer reconciling consolidated concerns with consolidated dismissed_concerns.
-Both `concerns` and `dismissed_concerns` are untrusted claims. Do not assume either side is correct. Treat both as hypotheses and verify them against the actual code before deciding whether to keep or discard a concern.
-Your task is to identify whether any remaining concern conflicts with a dismissed_concern that investigated the same root cause, code path, or failure mode.
-1. Compare each concern against the dismissed_concerns list and find conflicts or overlaps where one says the issue is real and the other says the same candidate issue is disproved.
-2. For every conflict, inspect the actual code and reasoning to decide which side is correct.
-3. If the concern is correct, keep it in the output. If the dismissed_concern is correct, discard that concern.
-4. If there is no direct conflict for a concern, keep it unchanged.
-5. Do not discard a concern merely because a dismissed_concern is vaguely related; only discard when the dismissed_concern's evidence concretely disproves that concern.
-6. Preserve each retained concern's `type`, `description`, `reasoning`, `preexisting`, and `locations` fields.
-7. LOCAL BOUNDARY RULE: Do not discard a defect within the modified code of the patch by assuming that surrounding caller systems, parallel execution, or legacy API layers will safely mask or prevent the issue, unless you can point to specific code that concretely proves the failure mode is structurally impossible. If you cannot prove the safety of the violation based on the specific code, you must keep the concern."#;
-
-const STAGE_10_INSTRUCTION: &str = r#"# Stage 10. Verification and severity estimation
-
-You are the lead reviewer validating consolidated concerns. You will be given a list of deduplicated concerns after conflict resolution.
-1. Validate each concern and prove the provided reasoning. Report all valid concerns as findings. If necessary, use tools to gather additional material. Discard all false positives.
-2. CRITICAL RULE: To discard a concern as a false positive, you MUST find concrete proof that explicitly invalidates the concern's reasoning. If you cannot find definitive proof that the concern is a false positive, it must be reported as a finding. If you're not sure about something and it's critical in the reasoning validation, make it obvious: if X is possible, then problem Y can occur. Always try to validate if X is possible yourself.
-3. SERIES VALIDATION RULE: If follow-up patches in this series are provided in the context, check if each identified concern is resolved or fixed in the final state of the series. If the problem has been resolved, fixed, or the code was rewritten in a subsequent patch in this series, you MUST discard the concern and NOT report it as a finding. You MUST verify this by checking the actual code at the end of the series using tools; do not trust promises or claims in commit messages.
-4. When referring to other patches within this series in your explanation, DO NOT use git hashes (they are ephemeral/unstable). Instead, refer to them by their patch subject (e.g., 'commit "mm: fix allocation"'). Existing historical commits in the tree should still be referenced by their standard hash.
-5. Assign a severity (low, medium, high, critical) to each remaining valid finding, following the calibration guidance in the severity definitions: reason through consequence, triggering path, and reachability, and state that reasoning at the start of the finding's `severity_explanation` so the label is auditable. Raise the level for a bug reachable by untrusted or remote input, and do not lower it because you believe the code is unreachable. A finding you can only state speculatively is capped at medium but still reported, never dropped. Be rigorous in filtering out verifiable noise, but accurately report real logic flaws and edge cases.
-6. If the problem did exist in the code before the patch was applied, say it explicitly: 'This problem wasn't introduced by this patch, but...'. Discard low- and medium-severity pre-existing problems, report only high- and critical severity issues.
-7. SPECIFICITY REQUIREMENT: Every finding MUST cite the exact function name(s), file path(s), line number(s) when known, and triggering conditions where the bug manifests. Vague descriptions like 'potential overflow in ring buffer calculations' are insufficient. State precisely which variable overflows, in which function, and under what input conditions. Do not invent line numbers; use `line: null` when the exact line is not known.
-8. Carry forward the `locations` from the validated concern into each finding. If you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown."#;
-
-const STAGE_11_INSTRUCTION: &str = r#"# Stage 11. LKML-friendly report generation
-
-You are an automated review bot generating a report for the Linux Kernel Mailing List (LKML). Convert the provided JSON findings into a polite, standard, inline-commented LKML email reply.
-
-CRITICAL RULE: If a finding is flagged as pre-existing (`"preexisting": true`), you MUST explicitly state in your inline comment that this issue is pre-existing and was not introduced by the patch under review. Use phrasing like "This isn't a bug introduced by this patch, but..." or "This is a pre-existing issue, but..." to start the comment.
-
-Follow the formatting rules strictly. Do not use markdown headers or ALL CAPS shouting. Ensure the tone is constructive and professional. Do not use backticks to quote any names or expressions.
-
-SPECIFICITY REQUIREMENT: Each inline comment MUST reference the exact function name, file, line number when known, and specific triggering condition. Prefer the finding's `locations` field when present. Do not produce vague summaries like 'potential issue in error handling'. State precisely what goes wrong, where, and under what circumstances. Do not invent line numbers; if the exact line is unavailable, anchor the comment to the nearest verified function or symbol and explain the triggering condition."#;
+/// Stage 11's instruction text lives in `stages/stage-11.md` under the
+/// prompt directory, so a project with different stage guidance supplies
+/// its own file rather than needing its own workflow in Rust.
+const STAGE_11_INSTRUCTION: &str = r#"@include("stages/stage-11.md")"#;
 
 const STAGE_JSON_SCHEMA_EXAMPLE: &str = r#"
 TodoWrite compatibility: vendored prompts may ask you to add tasks or suspected bugs to TodoWrite. Do not call or mention TodoWrite. Treat those instructions as an internal checklist only. If that checklist identifies a concrete suspected bug, carry it forward as a JSON concern with file, function_or_symbol, line when known, triggering condition, and evidence. Do not output generic checklist progress as a concern.
@@ -430,9 +404,10 @@ fn append_stage_dismissed_concerns(dest: &mut Vec<Value>, src: &[Value], stage_n
 
 pub fn prescreen_stage() -> Stage<KernelReviewState, Phase0Output> {
     Stage::builder("stage_0_prescreen")
-        .system_prompt(PromptTemplate::<KernelReviewState>::new(
-            "You are an AI assistant preparing a Linux kernel patch review.\nReview the provided Patch and select all potentially relevant subsystem guides from the index below.\nCRITICAL BIAS RULE: You MUST err on the side of inclusion. Only exclude a guide if it is 100% irrelevant to the modified code. If there is any doubt, include the file.\n\nYou MUST respond with ONLY a JSON object, no other text. Example:\n```json\n{\"selected_prompts\": [\"networking.md\", \"locking.md\"]}\n```",
-        ))
+        .system_prompt(
+            PromptTemplate::<KernelReviewState>::new(r#"@include("stages/prescreen.md")"#)
+                .include_file("stages/prescreen.md"),
+        )
         .user_prompt(
             PromptTemplate::<KernelReviewState>::new(
                 "<subsystem_guide_index>\n@include(\"subsystem/subsystem.md\")\n</subsystem_guide_index>\n\n<patch>\n{{target_commit_diff}}\n</patch>",
@@ -529,7 +504,11 @@ fn analysis_stage(
     let mut user_template = PromptTemplate::<KernelReviewState>::new(format!(
         "{}\n\n{}",
         instruction, STAGE_JSON_SCHEMA_EXAMPLE
-    ));
+    ))
+    // The instruction is an `@include(...)` naming this stage's file; register
+    // it so the renderer resolves the directive where the template writes it,
+    // rather than leaving it in the prompt as literal text.
+    .include_file(format!("stages/stage-{stage_num}.md"));
     for guide in guides {
         user_template = user_template.include_file(*guide);
     }
@@ -707,6 +686,9 @@ Example Output:
 }}
 ```"#
             ))
+            // Register this stage's instruction file so the
+            // `@include(...)` above resolves to it.
+            .include_file("stages/stage-8.md")
             .with_var("aggregated_concerns", |s: &KernelReviewState| {
                 serde_json::to_string_pretty(&s.all_concerns).unwrap_or_default()
             })
@@ -774,6 +756,9 @@ Example Output:
 }}
 ```"#
             ))
+            // Register this stage's instruction file so the
+            // `@include(...)` above resolves to it.
+            .include_file("stages/stage-9.md")
             .with_var("deduplicated_concerns", |s: &KernelReviewState| {
                 serde_json::to_string_pretty(&s.deduplicated_concerns).unwrap_or_default()
             })
@@ -834,6 +819,9 @@ Example Output:
 }}
 ```"#
             ))
+            // Register this stage's instruction file so the
+            // `@include(...)` above resolves to it.
+            .include_file("stages/stage-10.md")
             .include_file("false-positive-guide.md")
             .include_file("severity.md")
             .with_var("follow_up_series_section", |s: &KernelReviewState| {
@@ -874,6 +862,9 @@ Findings:
 
 Return raw text output, not JSON."#
             ))
+            // Register this stage's instruction file so the
+            // `@include(...)` above resolves to it.
+            .include_file("stages/stage-11.md")
             .include_file("inline-template.md")
             .with_var("findings", |s: &KernelReviewState| {
                 serde_json::to_string_pretty(&s.findings).unwrap_or_default()
@@ -1018,6 +1009,113 @@ mod tests {
                 "{without}\n\n<custom_instructions>\nCheck the locking.\n</custom_instructions>"
             ),
             "the custom prompt closes the system prompt"
+        );
+    }
+
+    /// The reviewer's identity is project-specific: a Linux review and an
+    /// OpenBSD review must not be primed the same way. It comes from
+    /// identity.md in the prompt directory, so pointing --prompts elsewhere
+    /// swaps it, and neither set may leak the other's priming.
+    #[tokio::test]
+    async fn test_system_prompt_identity_comes_from_the_prompt_set() {
+        let state = KernelReviewState::default();
+
+        for (set, expect, reject) in [
+            (
+                "third_party/prompts/kernel",
+                "expert Linux kernel maintainer",
+                "OpenBSD",
+            ),
+            (
+                "third_party/prompts/openbsd",
+                "expert OpenBSD kernel developer",
+                "Linux kernel maintainer",
+            ),
+        ] {
+            let base = std::path::Path::new(set);
+            if !base.exists() {
+                continue; // prompt set not vendored in this checkout
+            }
+            let out = kernel_system_prompt(true)
+                .render_for_model(&state, base)
+                .await
+                .unwrap();
+
+            assert!(
+                !out.contains("@include("),
+                "{set}: identity directive did not resolve: {out}"
+            );
+            assert!(
+                out.contains(expect),
+                "{set}: missing its own priming: {out}"
+            );
+            assert!(
+                !out.contains(reject),
+                "{set}: leaked the other project's priming: {out}"
+            );
+            // The tool-usage guidance travels with the identity, so it must
+            // survive the move out of the workflow source.
+            assert!(
+                out.contains("TOOL USAGE:"),
+                "{set}: lost the tool-usage guidance: {out}"
+            );
+        }
+    }
+
+    /// The shipped prompt sets must actually satisfy the include directives the
+    /// workflow now carries: every stage's instruction comes from a file, so a
+    /// missing or renamed file would silently leave `@include(...)` in the
+    /// prompt sent to the model.
+    #[tokio::test]
+    async fn test_stage_instructions_resolve_from_the_shipped_prompt_sets() {
+        for set in ["third_party/prompts/kernel", "third_party/prompts/openbsd"] {
+            let base = std::path::Path::new(set);
+            if !base.exists() {
+                continue; // prompt set not vendored in this checkout
+            }
+            for n in 1..=11u8 {
+                let tmpl = crate::workflow::PromptTemplate::<()>::new(format!(
+                    "@include(\"stages/stage-{n}.md\")"
+                ))
+                .include_file(format!("stages/stage-{n}.md"));
+                let out = tmpl.render_for_model(&(), base).await.unwrap();
+                assert!(
+                    !out.contains("@include("),
+                    "{set} stage {n} did not resolve: {out}"
+                );
+                assert!(!out.trim().is_empty(), "{set} stage {n} is empty");
+            }
+            let pre = crate::workflow::PromptTemplate::<()>::new(
+                "@include(\"stages/prescreen.md\")".to_string(),
+            )
+            .include_file("stages/prescreen.md");
+            let out = pre.render_for_model(&(), base).await.unwrap();
+            assert!(
+                !out.contains("@include("),
+                "{set} prescreen did not resolve"
+            );
+        }
+    }
+
+    /// The kernel stage files must still carry the instruction text the
+    /// workflow used to hold inline, so moving the text into files is not a
+    /// silent rewording of the review prompts. The renderer heads an included
+    /// file with its path, so the instruction body follows that line rather
+    /// than opening the prompt.
+    #[tokio::test]
+    async fn test_kernel_stage_files_are_the_instruction_text() {
+        let base = std::path::Path::new("third_party/prompts/kernel");
+        if !base.exists() {
+            return;
+        }
+        let tmpl = crate::workflow::PromptTemplate::<()>::new(STAGE_10_INSTRUCTION.to_string())
+            .include_file("stages/stage-10.md");
+        let out = tmpl.render_for_model(&(), base).await.unwrap();
+        assert!(!out.contains("@include("), "directive unresolved: {out}");
+        assert!(out.contains("# Stage 10."), "unexpected body: {out}");
+        assert!(
+            out.contains("SERIES VALIDATION RULE"),
+            "missing rule: {out}"
         );
     }
 }

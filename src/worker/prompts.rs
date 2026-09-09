@@ -133,9 +133,10 @@ impl PromptRegistry {
     }
 
     /// Validate that the prompt directory is usable before any review stage runs.
-    /// The base directory and `identity.md` must exist, and all stage files
-    /// `stages/stage-{1..11}.md` must exist; every missing stage file is reported
-    /// together in a single error. Paths in error messages are absolute.
+    /// The base directory and `identity.md` must exist, and the stage files
+    /// `stages/stage-{1..11}.md` plus `stages/prescreen.md` must exist; every
+    /// missing file is reported together in a single error. Paths in error
+    /// messages are absolute.
     pub fn validate_prompt_directory(&self) -> Result<()> {
         let abs = |p: &Path| {
             std::path::absolute(p)
@@ -159,6 +160,10 @@ impl PromptRegistry {
             if !stage.exists() {
                 missing.push(abs(&stage));
             }
+        }
+        let prescreen = self.base_dir.join("stages/prescreen.md");
+        if !prescreen.exists() {
+            missing.push(abs(&prescreen));
         }
         if !missing.is_empty() {
             anyhow::bail!(
@@ -979,6 +984,23 @@ mod tests {
 
     /// Populate a temp prompt directory with the minimal stub files the worker
     /// reads while running stages: an identity file and stage-1.md..stage-11.md.
+    /// Seed a prompt directory with the stage files the workflow includes.
+    /// The instruction text is data now, so a test that exercises prompt
+    /// content has to provide it; the `# Stage N.` headers match the real
+    /// files so assertions on them stay meaningful.
+    fn seed_stage_files(dir: &std::path::Path) {
+        let stages = dir.join("stages");
+        std::fs::create_dir_all(&stages).unwrap();
+        for n in 1..=11 {
+            std::fs::write(
+                stages.join(format!("stage-{n}.md")),
+                format!("# Stage {n}. Test instruction."),
+            )
+            .unwrap();
+        }
+        std::fs::write(stages.join("prescreen.md"), "Test prescreen instruction.").unwrap();
+    }
+
     fn write_stub_prompt_dir(dir: &std::path::Path) {
         std::fs::write(dir.join("identity.md"), "Test identity.\n").unwrap();
         let stages = dir.join("stages");
@@ -990,6 +1012,7 @@ mod tests {
             )
             .unwrap();
         }
+        std::fs::write(stages.join("prescreen.md"), "Test prescreen.\n").unwrap();
     }
 
     #[test]
@@ -1343,6 +1366,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let prompts_dir = temp_dir.path().join("prompts");
         std::fs::create_dir_all(&prompts_dir).unwrap();
+        seed_stage_files(&prompts_dir);
 
         let provider = std::sync::Arc::new(MockProviderAlwaysFails);
         let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
@@ -1491,6 +1515,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let prompts_dir = temp_dir.path().join("prompts");
         std::fs::create_dir_all(&prompts_dir).unwrap();
+        seed_stage_files(&prompts_dir);
 
         let provider = std::sync::Arc::new(MockBlockedProvider {
             attempts: AtomicUsize::new(0),
@@ -1525,6 +1550,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let prompts_dir = temp_dir.path().join("prompts");
         std::fs::create_dir_all(&prompts_dir).unwrap();
+        seed_stage_files(&prompts_dir);
 
         let provider = std::sync::Arc::new(MockBlockedProvider {
             attempts: AtomicUsize::new(0),
@@ -1563,6 +1589,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let prompts_dir = temp_dir.path().join("prompts");
         std::fs::create_dir_all(&prompts_dir).unwrap();
+        seed_stage_files(&prompts_dir);
 
         let provider = std::sync::Arc::new(MockBlockedProvider {
             attempts: AtomicUsize::new(0),
@@ -1661,6 +1688,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let prompts_dir = temp_dir.path().join("prompts");
         std::fs::create_dir_all(&prompts_dir).unwrap();
+        seed_stage_files(&prompts_dir);
 
         let provider = std::sync::Arc::new(MockMultiStageSeriesProvider);
         let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
@@ -1708,7 +1736,7 @@ mod tests {
                     && m.content
                         .as_deref()
                         .unwrap_or_default()
-                        .contains("# Stage 10.")
+                        .contains("@stages/stage-10.md")
             })
             .expect("Stage 10 user message should be in history");
 
