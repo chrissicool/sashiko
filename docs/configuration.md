@@ -214,6 +214,30 @@ SASHIKO__SERVER__ACL__ADMINS="first@example.org,second@example.org"
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `repository_path` | string | -- | Path to the kernel git repository used for patch application and context. |
+| `resolve_patch_paths` | bool | `false` | Work out where each file in a patch actually lives before applying it. See below. |
+
+#### `resolve_patch_paths`
+
+Leave this off for lists that carry `git format-patch` mail. Those diffs are
+already repository-relative and prefixed with `a/` and `b/`, so `git am -p1` is
+always right and inferring anything can only do harm.
+
+Turn it on for lists where contributors send `cvs diff` or plain `diff -u`
+output generated from inside a subdirectory. OpenBSD's tech@ is the motivating
+case: a diff of `sys/netinet/ip_output.c` produced while sitting in `sys/`
+arrives as `netinet/ip_output.c`, which no strip level can resolve.
+
+When enabled, each `+++` path is looked up in the tree by basename and the
+directories that satisfy every path in the patch are intersected, giving the
+`-p<n>` and `--directory=` to hand `git am`. A path matching nothing is skipped
+rather than fatal, so a patch that adds files still resolves on the ones it
+modifies. If more than one directory qualifies, the `RCS file:` header breaks
+the tie -- `ofwboot/Makefile` exists under both `sys/arch/macppc/stand` and
+`sys/arch/sparc64/stand`, and only that header says which. The header's leading
+`CVSROOT` is ignored, since it is whatever the submitter happens to use.
+
+Standard `a/` and `b/` prefixes are assumed. A diff built with a custom
+`--src-prefix`/`--dst-prefix`, or one needing `-p2`, is applied as sent.
 
 #### `[[git.custom_remotes]]`
 

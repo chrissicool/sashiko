@@ -14,7 +14,7 @@
 
 use crate::utils::redact_secret;
 use anyhow::{Result, anyhow};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
@@ -39,6 +39,203 @@ pub const GIT_PROTOCOL_RESTRICTIONS: &[&str] = &[
 ];
 
 #[allow(dead_code)]
+/// How a patch should be handed to `git am`.
+///
+/// `git am` is told a strip level and, when the diff was generated from inside
+/// a subdirectory, the directory to apply it in. Both are derived from the
+/// patch's own paths and the contents of the tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchPathPlan {
+    /// Leading path components for git to strip, i.e. `-p<strip>`.
+    pub strip: u32,
+    /// Repository-relative directory to apply in, i.e. `--directory=`.
+    /// `None` means the paths are already repository-relative.
+    pub directory: Option<String>,
+    /// True when more than one directory matched and the tie had to be broken.
+    /// Worth logging: it means the patch alone did not identify its target.
+    pub ambiguous: bool,
+}
+
+/// The file paths a patch writes to, as they appear in its `+++` lines.
+///
+/// `cvs diff` writes `+++ path\tdate\trevision`, and mail transport sometimes
+/// turns that tab into spaces, so the path is cut at the first tab or run of
+/// two spaces. `/dev/null` marks a deletion and carries no location.
+fn patch_target_paths(patch: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in patch.lines() {
+        let Some(rest) = line.strip_prefix("+++ ") else {
+            continue;
+        };
+        let cut = rest
+            .find('\t')
+            .or_else(|| rest.find("  "))
+            .unwrap_or(rest.len());
+        let path = rest[..cut].trim();
+        if path.is_empty() || path == "/dev/null" {
+            continue;
+        }
+        out.push(path.to_string());
+    }
+    out
+}
+
+/// `-p1` for `git format-patch` style diffs, which prefix every path with
+/// `a/` and `b/`; `-p0` for the bare paths `cvs diff` and `diff -u` produce.
+fn strip_level(paths: &[String]) -> u32 {
+    if paths
+        .iter()
+        .any(|p| p.starts_with("a/") || p.starts_with("b/"))
+    {
+        1
+    } else {
+        0
+    }
+}
+
+/// Drop the `a/` or `b/` that [`strip_level`] accounts for.
+fn without_prefix(path: &str) -> &str {
+    path.strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path)
+}
+
+/// The `RCS file:` paths a `cvs diff` header carries.
+fn rcs_paths(patch: &str) -> Vec<String> {
+    patch
+        .lines()
+        .filter_map(|l| l.strip_prefix("RCS file: "))
+        .map(|v| v.trim().trim_end_matches(",v").to_string())
+        .collect()
+}
+
+/// Turn an `RCS file:` path into a repository-relative one.
+///
+/// The leading component is the submitter's `CVSROOT` and is arbitrary --
+/// `/cvs/`, `/home/cvs/`, `/data/mirror/openbsd/cvs/` and bare relative paths
+/// all occur on tech@ -- so it is ignored entirely. What is dependable is that
+/// the CVS repository mirrors the checkout below that point, so the longest
+/// trailing portion that names a real file is the repository-relative path.
+fn rcs_repo_path(rcs: &str, tree_files: &BTreeSet<String>) -> Option<String> {
+    let trimmed = rcs.trim_start_matches('/');
+    let parts: Vec<&str> = trimmed.split('/').collect();
+    (0..parts.len())
+        .map(|i| parts[i..].join("/"))
+        .find(|cand| tree_files.contains(cand))
+}
+
+/// Work out how to apply `patch` to a tree containing `tree_files`.
+///
+/// Every `+++` path is looked up by basename; a path contributes the set of
+/// directories under which it exists. Intersecting those sets across the whole
+/// patch leaves the directories that satisfy all of it. A path that matches
+/// nothing is skipped rather than fatal, so a patch that adds files still
+/// resolves on the ones it modifies.
+///
+/// When the intersection leaves more than one directory the `RCS file:` header
+/// breaks the tie. That case is not hypothetical: `ofwboot/Makefile` exists
+/// under both `sys/arch/macppc/stand` and `sys/arch/sparc64/stand`, and
+/// choosing by path length alone picks the wrong architecture.
+pub fn plan_patch_application(patch: &str, tree_files: &BTreeSet<String>) -> PatchPathPlan {
+    let targets = patch_target_paths(patch);
+    let strip = strip_level(&targets);
+
+    // Index by basename so each target only examines files that could match,
+    // rather than rescanning the whole tree per target.
+    let mut by_basename: HashMap<&str, Vec<&String>> = HashMap::new();
+    for file in tree_files {
+        let base = file.rsplit('/').next().unwrap_or(file.as_str());
+        by_basename.entry(base).or_default().push(file);
+    }
+
+    let mut candidates: Option<BTreeSet<String>> = None;
+    for target in &targets {
+        let rel = without_prefix(target);
+        let base = rel.rsplit('/').next().unwrap_or(rel);
+        let mut here = BTreeSet::new();
+        for file in by_basename.get(base).into_iter().flatten() {
+            if file.as_str() == rel {
+                here.insert(String::new());
+            } else if let Some(dir) = file.strip_suffix(rel)
+                && dir.ends_with('/')
+            {
+                here.insert(dir.trim_end_matches('/').to_string());
+            }
+        }
+        if here.is_empty() {
+            // A file the patch creates. It cannot constrain the location.
+            continue;
+        }
+        candidates = Some(match candidates {
+            None => here,
+            Some(prev) => {
+                let both: BTreeSet<String> = prev.intersection(&here).cloned().collect();
+                // An empty intersection means the patch spans files that share
+                // no common directory; keep what we had rather than giving up.
+                if both.is_empty() { prev } else { both }
+            }
+        });
+    }
+
+    let Some(candidates) = candidates else {
+        return PatchPathPlan {
+            strip,
+            directory: None,
+            ambiguous: false,
+        };
+    };
+
+    let ambiguous = candidates.len() > 1;
+    let mut chosen: Option<String> = if candidates.len() == 1 {
+        candidates.iter().next().cloned()
+    } else {
+        None
+    };
+
+    if chosen.is_none() {
+        // Tie-break on the CVS header, which names the file exactly.
+        'outer: for rcs in rcs_paths(patch) {
+            let Some(repo_path) = rcs_repo_path(&rcs, tree_files) else {
+                continue;
+            };
+            for target in &targets {
+                let rel = without_prefix(target);
+                if let Some(dir) = repo_path.strip_suffix(rel) {
+                    let dir = dir.trim_end_matches('/').to_string();
+                    if candidates.contains(&dir) {
+                        chosen = Some(dir);
+                        break 'outer;
+                    }
+                }
+            }
+        }
+    }
+
+    // Still tied: prefer the repository root if it is a candidate, else the
+    // shallowest, so the choice is at least deterministic.
+    let chosen = chosen.unwrap_or_else(|| {
+        if candidates.contains("") {
+            String::new()
+        } else {
+            candidates
+                .iter()
+                .min_by_key(|d| (d.matches('/').count(), d.len()))
+                .cloned()
+                .unwrap_or_default()
+        }
+    });
+
+    PatchPathPlan {
+        strip,
+        directory: if chosen.is_empty() {
+            None
+        } else {
+            Some(chosen)
+        },
+        ambiguous,
+    }
+}
+
 pub struct GitWorktree {
     pub dir: Option<TempDir>,
     pub path: PathBuf,
@@ -183,9 +380,78 @@ impl GitWorktree {
     }
 
     #[allow(dead_code)]
-    pub async fn apply_patch(&self, patch_content: &str) -> Result<()> {
+    /// Apply a patch with `git am`, in one attempt.
+    ///
+    /// With `resolve_paths` off, the patch is taken at face value and applied
+    /// with `-p1`, which is what `git format-patch` mail wants and is the
+    /// correct behaviour for the Linux lists.
+    ///
+    /// With it on, the strip level and directory come from
+    /// [`plan_patch_application`], which reads them off the patch's paths and
+    /// the tree. One attempt is made, at the level the patch itself states;
+    /// guessing a second level would target a different file, and one that
+    /// happens to exist with matching context would apply and report success.
+    ///
+    /// Assumes the standard `a/` and `b/` prefixes. A diff built with custom
+    /// `--src-prefix`/`--dst-prefix`, or one needing `-p2`, is applied as sent;
+    /// handling those would mean measuring the prefix depth rather than
+    /// assuming it.
+    pub async fn apply_patch(&self, patch_content: &str, resolve_paths: bool) -> Result<()> {
         info!("Applying patch in {:?}", self.path);
 
+        if !resolve_paths {
+            return self.try_am(patch_content, 1, None).await;
+        }
+
+        let plan = match self.tracked_files().await {
+            Ok(files) => plan_patch_application(patch_content, &files),
+            Err(e) => {
+                warn!("Could not list tracked files ({e}); applying patch as sent");
+                PatchPathPlan {
+                    strip: 1,
+                    directory: None,
+                    ambiguous: false,
+                }
+            }
+        };
+
+        if plan.ambiguous {
+            warn!(
+                "Patch matched more than one directory; applying in {:?}",
+                plan.directory.as_deref().unwrap_or(".")
+            );
+        }
+        info!(
+            "Applying with -p{} in {:?}",
+            plan.strip,
+            plan.directory.as_deref().unwrap_or(".")
+        );
+
+        self.try_am(patch_content, plan.strip, plan.directory.as_deref())
+            .await
+    }
+
+    /// Repository-relative paths of every tracked file in the worktree.
+    async fn tracked_files(&self) -> Result<BTreeSet<String>> {
+        let output = crate::git_cmd::in_dir_async(&self.path)
+            .args(["-c", "safe.bareRepository=all"])
+            .args(["ls-files", "-z"])
+            .output()
+            .await?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "git ls-files failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    async fn try_am(&self, patch_content: &str, strip: u32, directory: Option<&str>) -> Result<()> {
         let mut child = crate::git_cmd::in_dir_async(&self.path)
             .env("GIT_AUTHOR_NAME", "Sashiko Bot")
             .env("GIT_AUTHOR_EMAIL", "sashiko@localhost")
@@ -193,6 +459,12 @@ impl GitWorktree {
             .env("GIT_COMMITTER_EMAIL", "sashiko@localhost")
             .args(["-c", "safe.bareRepository=all"])
             .arg("am")
+            .arg(format!("-p{}", strip))
+            .args(
+                directory
+                    .map(|d| vec![format!("--directory={d}")])
+                    .unwrap_or_default(),
+            )
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -207,15 +479,32 @@ impl GitWorktree {
         let output = child.wait_with_output().await?;
 
         if !output.status.success() {
-            let _ = crate::git_cmd::in_dir_async(&self.path)
+            // Leave no half-applied state behind: anything left in
+            // .git/rebase-apply breaks the next operation on this worktree,
+            // so a failed abort is worth surfacing here rather than as a
+            // confusing error somewhere later.
+            match crate::git_cmd::in_dir_async(&self.path)
                 .args(["-c", "safe.bareRepository=all"])
                 .arg("am")
                 .arg("--abort")
                 .output()
-                .await;
+                .await
+            {
+                Ok(abort) if !abort.status.success() => warn!(
+                    "git am --abort failed in {:?}: {}",
+                    self.path,
+                    String::from_utf8_lossy(&abort.stderr).trim()
+                ),
+                Err(e) => warn!("Could not run git am --abort in {:?}: {}", self.path, e),
+                _ => {}
+            }
 
             return Err(anyhow!(
-                "git am failed. stdout: {}\nstderr: {}",
+                "git am -p{}{} failed. stdout: {}\nstderr: {}",
+                strip,
+                directory
+                    .map(|d| format!(" --directory={d}"))
+                    .unwrap_or_default(),
                 String::from_utf8_lossy(&output.stdout).trim(),
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
@@ -1946,7 +2235,7 @@ mod tests {
 
         // Try to apply a bad patch
         let bad_patch = "Invalid patch content";
-        let result = worktree.apply_patch(bad_patch).await;
+        let result = worktree.apply_patch(bad_patch, false).await;
 
         assert!(result.is_err());
         let err_msg = result.err().unwrap().to_string();
@@ -1954,7 +2243,11 @@ mod tests {
         // Check if stdout and stderr are mentioned in the error message
         assert!(err_msg.contains("stdout:"));
         assert!(err_msg.contains("stderr:"));
-        assert!(err_msg.contains("git am failed"));
+        // The error names the strip level that was used.
+        assert!(
+            err_msg.contains("git am -p1 failed"),
+            "error should name the attempt: {err_msg}"
+        );
 
         Ok(())
     }
@@ -2425,5 +2718,162 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    fn tree(paths: &[&str]) -> BTreeSet<String> {
+        paths.iter().map(|p| p.to_string()).collect()
+    }
+
+    #[test]
+    fn test_plan_git_format_patch_is_left_alone() {
+        // The Linux case: paths are already repository-relative.
+        let patch = "--- a/sys/net/if_wg.c\n+++ b/sys/net/if_wg.c\n@@ -1 +1 @@\n";
+        let plan = plan_patch_application(patch, &tree(&["sys/net/if_wg.c"]));
+        assert_eq!(plan.strip, 1);
+        assert_eq!(plan.directory, None);
+        assert!(!plan.ambiguous);
+    }
+
+    #[test]
+    fn test_plan_bare_root_relative_uses_p0() {
+        // cvs diff from the top of the tree: no a/ b/ prefix to strip.
+        let patch = "--- sys/dev/pci/if_em.c\n+++ sys/dev/pci/if_em.c\n@@ -1 +1 @@\n";
+        let plan = plan_patch_application(patch, &tree(&["sys/dev/pci/if_em.c"]));
+        assert_eq!(plan.strip, 0);
+        assert_eq!(plan.directory, None);
+    }
+
+    #[test]
+    fn test_plan_recovers_subdirectory_prefix() {
+        // Generated inside sys/: no strip level can reach the file, so the
+        // directory has to be supplied.
+        let patch = "--- netinet/ip_output.c\n+++ netinet/ip_output.c\n@@ -1 +1 @@\n";
+        let plan = plan_patch_application(patch, &tree(&["sys/netinet/ip_output.c"]));
+        assert_eq!(plan.strip, 0);
+        assert_eq!(plan.directory.as_deref(), Some("sys"));
+    }
+
+    #[test]
+    fn test_plan_recovers_prefix_for_prefixed_diff() {
+        // git-style diff of a vendored subproject: a/ b/ prefixes *and* a
+        // directory to supply. OpenSSH and relayd both arrive this way.
+        let patch = "--- a/channels.c\n+++ b/channels.c\n@@ -1 +1 @@\n";
+        let plan = plan_patch_application(patch, &tree(&["usr.bin/ssh/channels.c"]));
+        assert_eq!(plan.strip, 1);
+        assert_eq!(plan.directory.as_deref(), Some("usr.bin/ssh"));
+    }
+
+    #[test]
+    fn test_plan_intersects_across_files() {
+        // Two files pin the directory more tightly than either alone.
+        let patch = "+++ ip_output.c\n+++ ip_mroute.c\n";
+        let files = tree(&[
+            "sys/netinet/ip_output.c",
+            "sys/netinet/ip_mroute.c",
+            "regress/ip_output.c",
+        ]);
+        let plan = plan_patch_application(patch, &files);
+        assert_eq!(plan.directory.as_deref(), Some("sys/netinet"));
+        assert!(!plan.ambiguous);
+    }
+
+    #[test]
+    fn test_plan_tolerates_added_files() {
+        // A patch that creates a file still resolves on the ones it edits.
+        let patch = "+++ netinet/ip_output.c\n+++ netinet/brand_new.c\n";
+        let plan = plan_patch_application(patch, &tree(&["sys/netinet/ip_output.c"]));
+        assert_eq!(plan.directory.as_deref(), Some("sys"));
+    }
+
+    #[test]
+    fn test_plan_ignores_dev_null_targets() {
+        let patch = "+++ /dev/null\n+++ netinet/ip_output.c\n";
+        let plan = plan_patch_application(patch, &tree(&["sys/netinet/ip_output.c"]));
+        assert_eq!(plan.directory.as_deref(), Some("sys"));
+    }
+
+    #[test]
+    fn test_plan_cuts_cvs_timestamp_from_path() {
+        // cvs diff appends a tab-separated date and revision; mail transport
+        // sometimes turns the tab into spaces.
+        let tabbed = "+++ cert.pem\t20 Aug 2026 13:26:52 -0000\t1.35\n";
+        let spaced = "+++ cert.pem    20 Aug 2026 13:26:52 -0000\n";
+        let files = tree(&["lib/libcrypto/cert.pem"]);
+        for patch in [tabbed, spaced] {
+            let plan = plan_patch_application(patch, &files);
+            assert_eq!(
+                plan.directory.as_deref(),
+                Some("lib/libcrypto"),
+                "failed for {patch:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_plan_breaks_ambiguity_with_rcs_header() {
+        // ofwboot/Makefile exists under two architectures. Choosing by path
+        // length picks macppc; the RCS header names sparc64.
+        let patch = "RCS file: /cvs/src/sys/arch/sparc64/stand/ofwboot/Makefile,v\n\
+                     +++ ofwboot/Makefile\n";
+        let files = tree(&[
+            "sys/arch/macppc/stand/ofwboot/Makefile",
+            "sys/arch/sparc64/stand/ofwboot/Makefile",
+        ]);
+        let plan = plan_patch_application(patch, &files);
+        assert_eq!(
+            plan.directory.as_deref(),
+            Some("sys/arch/sparc64/stand"),
+            "RCS header must win over the shallowest match"
+        );
+        assert!(plan.ambiguous, "the tie should be reported");
+    }
+
+    #[test]
+    fn test_plan_rcs_tiebreak_ignores_arbitrary_cvsroot() {
+        // The CVSROOT prefix is the submitter's own; tech@ shows at least
+        // eight different ones, plus paths with no leading slash at all.
+        let files = tree(&[
+            "sys/arch/macppc/stand/ofwboot/Makefile",
+            "sys/arch/sparc64/stand/ofwboot/Makefile",
+        ]);
+        for root in [
+            "/cvs/src/",
+            "/home/cvs/src/",
+            "/data/mirror/openbsd/cvs/src/",
+            "/home/afresh1/OpenBSD-perl/OP/cvs/src/",
+            "src/",
+        ] {
+            let patch = format!(
+                "RCS file: {root}sys/arch/sparc64/stand/ofwboot/Makefile,v\n\
+                 +++ ofwboot/Makefile\n"
+            );
+            let plan = plan_patch_application(&patch, &files);
+            assert_eq!(
+                plan.directory.as_deref(),
+                Some("sys/arch/sparc64/stand"),
+                "failed for CVSROOT {root:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_plan_unresolvable_paths_fall_back_to_as_sent() {
+        // A ports or xenocara patch against a src-only checkout: nothing
+        // matches, so no directory is invented.
+        let patch = "--- a/devel/cargo/cargo.port.mk\n+++ b/devel/cargo/cargo.port.mk\n";
+        let plan = plan_patch_application(patch, &tree(&["sys/net/if_wg.c"]));
+        assert_eq!(plan.strip, 1);
+        assert_eq!(plan.directory, None);
+        assert!(!plan.ambiguous);
+    }
+
+    #[test]
+    fn test_plan_prefers_root_when_still_tied() {
+        // Deterministic choice when neither the intersection nor the RCS
+        // header settles it.
+        let patch = "+++ Makefile\n";
+        let plan = plan_patch_application(patch, &tree(&["Makefile", "usr.bin/vi/Makefile"]));
+        assert!(plan.ambiguous);
+        assert_eq!(plan.directory, None, "root wins the tie");
     }
 }

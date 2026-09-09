@@ -315,26 +315,36 @@ pub async fn run_worker(
     repo_override: Option<PathBuf>,
     progress: Option<&ProgressCallback<'_>>,
 ) -> Result<Value> {
-    let (mut ai, configured_repo_path, concurrency, timeout_seconds) =
+    let (mut ai, configured_repo_path, concurrency, timeout_seconds, resolve_patch_paths) =
         if let Some(path) = &options.settings_path {
             let local_settings = Settings::local_review_from_file(path)
                 .with_context(|| format!("Failed to load settings from {}", path.display()))?;
+            let resolve = local_settings
+                .git
+                .and_then(|g| g.resolve_patch_paths)
+                .unwrap_or(false);
             let review = local_settings.review;
             (
                 local_settings.ai,
                 None,
                 review.concurrency,
                 review.timeout_seconds,
+                resolve,
             )
         } else if repo_override.is_some() {
             let local_settings = Settings::local_review_settings()
                 .context("Failed to load local review settings")?;
+            let resolve = local_settings
+                .git
+                .and_then(|g| g.resolve_patch_paths)
+                .unwrap_or(false);
             let review = local_settings.review;
             (
                 local_settings.ai,
                 None,
                 review.concurrency,
                 review.timeout_seconds,
+                resolve,
             )
         } else {
             let settings = Settings::new().context("Failed to load settings")?;
@@ -343,6 +353,7 @@ pub async fn run_worker(
                 Some(PathBuf::from(settings.git.repository_path)),
                 settings.review.concurrency,
                 settings.review.timeout_seconds,
+                settings.git.resolve_patch_paths,
             )
         };
 
@@ -440,6 +451,7 @@ pub async fn run_worker(
         &ai,
         concurrency,
         timeout_seconds,
+        resolve_patch_paths,
         patchset_id,
         subject,
         patches,
@@ -825,6 +837,7 @@ async fn run_worker_in_worktree(
     ai: &AiSettings,
     concurrency: usize,
     timeout_seconds: u64,
+    resolve_patch_paths: bool,
     patchset_id: i64,
     subject: String,
     patches: Vec<PatchInput>,
@@ -904,6 +917,7 @@ async fn run_worker_in_worktree(
             let success = apply_single_patch(
                 worktree,
                 p,
+                resolve_patch_paths,
                 &mut patch_shas,
                 &mut patch_shows,
                 &mut patch_messages,
@@ -1353,6 +1367,7 @@ pub fn format_agent_review_output(result: &Value) -> Value {
 async fn apply_single_patch(
     worktree: &GitWorktree,
     p: &PatchInput,
+    resolve_patch_paths: bool,
     patch_shas: &mut HashMap<i64, String>,
     patch_shows: &mut HashMap<i64, String>,
     patch_messages: &mut HashMap<i64, String>,
@@ -1413,7 +1428,7 @@ async fn apply_single_patch(
             author, date_str, subject, p.diff
         );
 
-        match worktree.apply_patch(&mbox).await {
+        match worktree.apply_patch(&mbox, resolve_patch_paths).await {
             Ok(_) => {
                 if let Ok(sha) = get_commit_hash(&worktree.path, "HEAD").await {
                     patch_shas.insert(p.index, sha.clone());
@@ -1833,6 +1848,7 @@ mod tests {
         let success = apply_single_patch(
             &worktree,
             &patch,
+            false,
             &mut patch_shas,
             &mut patch_shows,
             &mut patch_messages,
@@ -1871,6 +1887,7 @@ mod tests {
         let success = apply_single_patch(
             &worktree,
             &patch,
+            false,
             &mut patch_shas,
             &mut patch_shows,
             &mut patch_messages,
@@ -1908,6 +1925,7 @@ mod tests {
         let success = apply_single_patch(
             &worktree,
             &patch,
+            false,
             &mut patch_shas,
             &mut patch_shows,
             &mut patch_messages,
