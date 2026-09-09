@@ -21,5 +21,6 @@ symbol patterns.
 | SMR | `smr_*`, `SMR_PTR_*`, `SMR_*_FOREACH*`, smr_read_enter, smr_call, smr_barrier, sys/smr.h | smr.md |
 | Syscalls | `sys_*`, `copyin*`, `copyout*`, SCARG, any change to syscall parameter validation | syscall.md |
 | USB | sys/dev/usb/, `usbd_*`, `usb_add_task`, `usb_init_task`, usbd_xfer, usbd_pipe, usbd_status, USBD_ | usb.md |
+| UVM | sys/uvm/, sys/arch/*/*/pmap*, `uvm_*`, `pmap_*`, `km_alloc`, `uvm_km_*`, vm_page, vm_map, vmobjlock, PG_BUSY, `amap_*`, vm_anon, `uvm_fault`, mmap, round_page | uvm.md |
 | VFS | sys/kern/vfs_*, sys/ufs/, sys/nfs/, sys/miscfs/, sys/isofs/, `VOP_*`, vref, vrele, vput, vget, vn_lock, getnewvnode, namei, struct vops | vfs.md |
 | VMM/VMD | sys/arch/amd64/amd64/vmm*, sys/dev/vmm/, vmd, vcpu, vm_run, vmx_*, svm_*, ept, vmread, vmwrite | vmm.md |
