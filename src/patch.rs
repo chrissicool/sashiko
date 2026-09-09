@@ -242,16 +242,28 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
         || subject_clean.starts_with("[reproducer]") // Reproducers
         || subject_lower.contains("(was ")
         || subject_lower.contains("(was:");
+    // A forward relays someone else's content; the forwarder isn't submitting a
+    // patch, so a fresh diff inside a forward should not promote it to a patchset.
+    let is_forward = subject_clean.starts_with("fwd:")
+        || subject_clean.starts_with("forwarded:")
+        || subject_clean.starts_with("wg:"); // German 'Weitergeleitet' (forwarded)
     let has_patch_tag = subject_clean.contains("patch") || subject_clean.contains("rfc");
     let has_diff = !diff.is_empty();
+    // A *fresh* diff is one on unquoted lines, not ">"-prefixed reply context.
+    // OpenBSD posts the actual diff as a reply in the discussion thread, so a
+    // reply carrying an unquoted diff is a real patch — whereas a reply that only
+    // quotes someone else's diff to comment on it is not.
+    let has_unquoted_diff = body_has_unquoted_diff(&body);
 
     // A message is part of a series if it's a cover letter (index 0) or has multiple parts (total > 1)
     let is_series_metadata = total > 1 || index == 0;
 
-    // It is a patch or cover letter if:
-    // 1. It is NOT a reply (Re: ...)
-    // 2. AND (It has [PATCH]/[RFC] tag OR it has a diff OR it looks like a series cover letter/part)
-    let is_patch_or_cover = !is_reply && (has_patch_tag || has_diff || is_series_metadata);
+    // It is a patch or cover letter if either:
+    // 1. It is NOT a reply (Re: ...) AND it has a [PATCH]/[RFC] tag, a diff, or is series metadata; or
+    // 2. It is a reply (but not a forward) carrying a fresh, unquoted diff — e.g.
+    //    an OpenBSD diff posted as a thread reply.
+    let is_patch_or_cover = (!is_reply && (has_patch_tag || has_diff || is_series_metadata))
+        || (has_unquoted_diff && !is_forward);
 
     let metadata = PatchsetMetadata {
         message_id: message_id.clone(),
@@ -282,6 +294,116 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
     };
 
     Ok((metadata, patch))
+}
+
+/// A line that only ever appears inside a diff, so it continues the block the
+/// walk is already in rather than starting a new one. Covers git's extended
+/// headers and the `Index:`/`===`/`RCS file:` preamble cvs(1) writes per file.
+#[cfg(feature = "server")]
+fn is_diff_metadata(line: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "===",
+        "RCS file:",
+        "retrieving revision",
+        "diff -",
+        "Index: ",
+        "index ",
+        "new file mode",
+        "deleted file mode",
+        "old mode",
+        "new mode",
+        "similarity index",
+        "dissimilarity index",
+        "rename from",
+        "rename to",
+        "copy from",
+        "copy to",
+        "Binary files",
+        "GIT binary patch",
+    ];
+    PREFIXES.iter().any(|p| line.starts_with(p))
+}
+
+/// A line that can begin a diff block: the first file of a changeset, or the
+/// next file of the one already being read. Which of the two it is depends on
+/// what preceded it, not on the line itself.
+#[cfg(feature = "server")]
+fn opens_diff_block(line: &str) -> bool {
+    line.starts_with("diff --git ")
+        || line.starts_with("Index: ")
+        || line.starts_with("--- ")
+        || line.starts_with("@@ -")
+}
+
+/// A line that carries diff payload: hunk content, a hunk header, or a file
+/// header. An empty line counts, because mailers strip the single space from a
+/// blank context line.
+#[cfg(feature = "server")]
+fn is_diff_payload(line: &str) -> bool {
+    line.is_empty() || line.starts_with([' ', '+', '-', '\\', '@']) || is_diff_metadata(line)
+}
+
+/// Where each changeset in `body` starts, as an index into its lines.
+///
+/// tech@ imposes no format, so this keys on structure rather than on any one
+/// tool's output. A diff block that follows prose begins a changeset; a diff
+/// block that follows hunk content is the next file of the changeset already
+/// open. That one rule separates a batch of patches from a single diff touching
+/// several files, whether the sender used git format-patch, git diff, cvs diff,
+/// or a bare unified diff.
+///
+/// Quoted lines are skipped, so a reply discussing someone else's diff
+/// contributes no changeset of its own.
+#[cfg(feature = "server")]
+fn changeset_starts(body: &str) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut in_diff = false;
+    for (idx, line) in body.lines().enumerate() {
+        // Only the quote test may ignore leading space: a context line is
+        // identified by exactly that space, so trimming would make every line
+        // of hunk body look like prose.
+        if line.trim_start().starts_with('>') {
+            continue; // quoted reply context
+        }
+        if opens_diff_block(line) {
+            if !in_diff {
+                starts.push(idx);
+                in_diff = true;
+            }
+        } else if in_diff && !is_diff_payload(line) {
+            in_diff = false;
+        }
+    }
+    starts
+}
+
+/// Splits `body` into one string per changeset, dropping any region that turns
+/// out to carry no diff after all.
+///
+/// A region is kept when it holds a hunk, or is a git diff whose only change is
+/// to a mode or a name and so has none.
+#[cfg(feature = "server")]
+fn split_changesets(body: &str) -> Vec<String> {
+    let lines: Vec<&str> = body.lines().collect();
+    let starts = changeset_starts(body);
+    let mut out = Vec::new();
+    for (n, &start) in starts.iter().enumerate() {
+        let end = starts.get(n + 1).copied().unwrap_or(lines.len());
+        let region = lines[start..end].join("\n");
+        let carries_diff = region.lines().any(|l| l.starts_with("@@ -"))
+            || region.lines().any(|l| l.starts_with("diff --git "));
+        if carries_diff {
+            out.push(region);
+        }
+    }
+    out
+}
+
+/// Returns true if `body` contains a diff on unquoted lines -- i.e. a fresh diff
+/// the sender wrote, not a ">"-quoted diff carried over from earlier in a thread.
+#[cfg(feature = "server")]
+fn body_has_unquoted_diff(body: &str) -> bool {
+    !split_changesets(body).is_empty()
 }
 
 /// Read the `M/N` part counter out of a patch subject, as `(index, total)`.
@@ -692,6 +814,34 @@ Body";
 
     #[cfg(feature = "server")]
     #[test]
+    fn test_reply_with_fresh_diff_is_patchset() {
+        // OpenBSD style: the actual diff is posted as a reply in the thread,
+        // below some quoted discussion. The unquoted diff makes it a patch.
+        let raw = b"Message-ID: <obsd>\r\nSubject: Re: sys/vfs: do not reclaim\r\n\r\n\
+> On some date, someone wrote:\n\
+> > Thoughts?\n\
+> > Index: sys/kern/vfs_subr.c\n\
+\n\
+Here is the diff:\n\
+Index: sys/kern/vfs_subr.c\n\
+--- sys/kern/vfs_subr.c\t1\n\
++++ sys/kern/vfs_subr.c\t2\n\
+@@ -1021,7 +1021,7 @@\n\
+-old\n\
++new\n";
+        let (meta, patch) = parse_email(raw).unwrap();
+        assert!(
+            meta.is_patch_or_cover,
+            "Reply carrying a fresh unquoted diff SHOULD be a patchset"
+        );
+        assert!(
+            patch.is_some(),
+            "A patch should be extracted from the reply"
+        );
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
     fn test_diff_without_patch_tag_ignored() {
         let raw = b"Message-ID: <diffnopatch>\r\nSubject: Random fix\r\n\r\ndiff --git a/file b/file\nindex...";
         let (meta, _) = parse_email(raw).unwrap();
@@ -971,5 +1121,57 @@ diff --git a/file.c b/file.c";
             inject_changelog_into_git_show(git_show, changelog),
             expected
         );
+    }
+    /// A diff touching several files is one changeset, not one per file.
+    ///
+    /// The next file's header follows hunk content directly, with no prose
+    /// between, which is what separates it from a new patch.
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_a_multi_file_diff_is_one_changeset() {
+        let git = "Here is the fix.\n\n\
+            diff --git a/a.c b/a.c\n--- a/a.c\n+++ b/a.c\n@@ -1,2 +1,2 @@\n ctx\n-old\n+new\n\
+            diff --git a/b.h b/b.h\n--- a/b.h\n+++ b/b.h\n@@ -9,1 +9,1 @@\n-x\n+y\n";
+        assert_eq!(split_changesets(git).len(), 1);
+
+        let cvs = "It seems we can only assume this.\n\n\
+            Index: a.c\n===================================================================\n\
+            RCS file: /cvs/src/a.c,v\nretrieving revision 1.2\ndiff -u -p -r1.2 a.c\n\
+            --- a.c\n+++ a.c\n@@ -1,2 +1,2 @@\n ctx\n-old\n+new\n\
+            Index: b.c\n===================================================================\n\
+            RCS file: /cvs/src/b.c,v\nretrieving revision 1.1\ndiff -u -p -r1.1 b.c\n\
+            --- b.c\n+++ b.c\n@@ -3,1 +3,1 @@\n-p\n+q\n";
+        assert_eq!(split_changesets(cvs).len(), 1);
+    }
+
+    /// Prose between two diffs makes them two changesets, whatever the format.
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_prose_between_diffs_splits_them() {
+        let body = "First fix:\n\n\
+            diff --git a/a.c b/a.c\n--- a/a.c\n+++ b/a.c\n@@ -1,1 +1,1 @@\n-old\n+new\n\
+            \nAnd the second, unrelated one:\n\n\
+            Index: b.c\n===================================================================\n\
+            --- b.c\n+++ b.c\n@@ -3,1 +3,1 @@\n-p\n+q\n";
+        assert_eq!(split_changesets(body).len(), 2);
+    }
+
+    /// A reply quoting someone else's diff contributes no changeset.
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_a_quoted_diff_is_not_a_changeset() {
+        let body = "I think this is wrong:\n\n\
+            > diff --git a/a.c b/a.c\n> --- a/a.c\n> +++ b/a.c\n> @@ -1,1 +1,1 @@\n> -old\n> +new\n\
+            \nbecause it breaks the lock.\n";
+        assert!(split_changesets(body).is_empty());
+        assert!(!body_has_unquoted_diff(body));
+    }
+
+    /// Prose that merely mentions a dashed separator is not a diff.
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_prose_without_a_hunk_yields_no_changeset() {
+        let body = "See below.\n\n--- this is a separator, not a diff ---\n\nthanks\n";
+        assert!(split_changesets(body).is_empty());
     }
 }
