@@ -114,6 +114,10 @@ enum Commands {
         /// Items per page
         #[arg(long, default_value_t = 20)]
         per_page: usize,
+
+        /// Fetch every page and emit all results (ignores --page)
+        #[arg(long)]
+        all: bool,
     },
     /// Show details of a patchset or review
     Show {
@@ -301,7 +305,8 @@ async fn run_command(
             filter,
             page,
             per_page,
-        } => handle_list(client, base_url, page, per_page, filter, format).await,
+            all,
+        } => handle_list(client, base_url, page, per_page, all, filter, format).await,
         Commands::Show {
             id,
             watch,
@@ -511,14 +516,48 @@ async fn handle_status(client: &Client, base_url: &str, format: OutputFormat) ->
     Ok(())
 }
 
-async fn handle_list(
+fn print_list_header() {
+    println!(
+        "{:<10} {:<18} {:<50} {:<20}",
+        "ID", "Status", "Subject", "Date"
+    );
+    println!("{:-<10} {:-<18} {:-<50} {:-<20}", "", "", "", "");
+}
+
+fn print_list_row(item: sashiko::db::PatchsetRow) {
+    let status_str = item.status.as_deref().unwrap_or("Unknown");
+
+    let status_color = match status_str {
+        "Reviewed" => Color::Green,
+        "Embargoed" => Color::Magenta,
+        "Failed" | "Error" | "Failed To Apply" => Color::Red,
+        "Pending" | "In Review" => Color::Yellow,
+        "Cancelled" => Color::Red,
+        _ => Color::White,
+    };
+
+    print!("{:<10} ", item.id);
+    print_colored(status_color, &format!("{:<18}", status_str));
+
+    let subject = item.subject.unwrap_or_else(|| "(no subject)".to_string());
+    let subject_display = format_subject(&subject);
+
+    let date_display = if let Some(ts) = item.date {
+        format_timestamp(ts)
+    } else {
+        "-".to_string()
+    };
+
+    println!(" {:<50} {}", subject_display, date_display);
+}
+
+async fn fetch_patchsets(
     client: &Client,
     base_url: &str,
     page: usize,
     per_page: usize,
-    filter: Option<String>,
-    format: OutputFormat,
-) -> Result<()> {
+    filter: Option<&str>,
+) -> Result<PatchsetsResponse> {
     let mut url = format!(
         "{}/api/patchsets?page={}&per_page={}",
         base_url, page, per_page
@@ -526,53 +565,70 @@ async fn handle_list(
     if let Some(q) = filter {
         url.push_str(&format!("&q={}", q));
     }
-
     let resp = client.get(&url).send().await?;
+    if !resp.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "Failed to list patchsets: {}",
+            resp.status()
+        ));
+    }
+    let data: PatchsetsResponse = resp.json().await?;
+    Ok(data)
+}
 
-    if resp.status().is_success() {
-        let data: PatchsetsResponse = resp.json().await?;
+async fn handle_list(
+    client: &Client,
+    base_url: &str,
+    page: usize,
+    per_page: usize,
+    all: bool,
+    filter: Option<String>,
+    format: OutputFormat,
+) -> Result<()> {
+    // Walk pages into a single response. In the default (single-page) mode we
+    // break after the first iteration, so `data` is exactly one page; with
+    // --all we keep fetching until the reported total is covered. Either way
+    // the output below goes through one serializer, so JSON framing stays in
+    // serde's hands and the text path reuses the row helpers.
+    let mut current = if all { 1 } else { page };
+    let mut data: Option<PatchsetsResponse> = None;
 
-        match format {
-            OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&data)?),
-            OutputFormat::Text => {
-                if data.items.is_empty() {
-                    println!("No items found.");
-                    return Ok(());
-                }
+    loop {
+        let next = fetch_patchsets(client, base_url, current, per_page, filter.as_deref()).await?;
+        let done = !all
+            || next.items.is_empty()
+            || next.per_page == 0
+            || current * next.per_page >= next.total;
+        match &mut data {
+            None => data = Some(next),
+            Some(acc) => {
+                acc.total = next.total;
+                acc.items.extend(next.items);
+            }
+        }
+        if done {
+            break;
+        }
+        current += 1;
+    }
 
-                println!(
-                    "{:<10} {:<18} {:<50} {:<20}",
-                    "ID", "Status", "Subject", "Date"
-                );
-                println!("{:-<10} {:-<18} {:-<50} {:-<20}", "", "", "", "");
+    let data = data.expect("loop runs at least once");
 
-                for item in data.items {
-                    let status_str = item.status.as_deref().unwrap_or("Unknown");
-
-                    let status_color = match status_str {
-                        "Reviewed" => Color::Green,
-                        "Embargoed" => Color::Magenta,
-                        "Failed" | "Error" | "Failed To Apply" => Color::Red,
-                        "Pending" | "In Review" => Color::Yellow,
-                        "Cancelled" => Color::Red,
-                        _ => Color::White,
-                    };
-
-                    print!("{:<10} ", item.id);
-                    print_colored(status_color, &format!("{:<18}", status_str));
-
-                    let subject = item.subject.unwrap_or_else(|| "(no subject)".to_string());
-                    let subject_display = format_subject(&subject);
-
-                    let date_display = if let Some(ts) = item.date {
-                        format_timestamp(ts)
-                    } else {
-                        "-".to_string()
-                    };
-
-                    println!(" {:<50} {}", subject_display, date_display);
-                }
-
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&data)?),
+        OutputFormat::Text => {
+            if data.items.is_empty() {
+                println!("No items found.");
+                return Ok(());
+            }
+            let emitted = data.items.len();
+            print_list_header();
+            for item in data.items {
+                print_list_row(item);
+            }
+            if all {
+                println!("\n{} item(s) (Total: {})", emitted, data.total);
+            } else {
                 println!(
                     "\nPage {} of {} (Total: {})",
                     data.page,
@@ -581,11 +637,6 @@ async fn handle_list(
                 );
             }
         }
-    } else {
-        return Err(anyhow::anyhow!(
-            "Failed to list patchsets: {}",
-            resp.status()
-        ));
     }
 
     Ok(())
