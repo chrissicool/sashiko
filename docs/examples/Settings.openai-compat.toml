@@ -14,3 +14,9 @@ max_tokens = 2048
 # an endpoint that spends reasoning tokens from that same cap returns an empty
 # reply once thinking exhausts it, which the run reports as truncated output.
 # effort = "medium"
+# Sent as the service_tier request field. Left unset the field is omitted and
+# the provider applies its default. "flex" asks for cheaper, best-effort
+# capacity, which suits a review that is not waiting on an answer; "priority"
+# asks for faster, costlier scheduling. An endpoint that does not implement the
+# field ignores it.
+# service_tier = "flex"

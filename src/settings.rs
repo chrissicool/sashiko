@@ -472,6 +472,8 @@ pub struct OpenAiCompatSettings {
     /// not implement it needs.
     #[serde(default)]
     pub effort: Option<String>,
+    #[serde(default)]
+    pub service_tier: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

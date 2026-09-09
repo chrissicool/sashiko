@@ -457,6 +457,14 @@ Adjust `base_url` to point to your provider's endpoint.
   `https://api.z.ai/api/coding/paas/v4/chat/completions`. Use this form for
   providers whose path is not a recognised shorthand.
 
+`service_tier` in `[ai.openai_compat]` selects a service tier, `"flex"` for
+cheaper, best-effort capacity or `"priority"` for faster, costlier
+scheduling. It is sent as the top-level `service_tier` field, which the
+official OpenAI API and OpenRouter accept, and is omitted when unset so the
+provider applies its own default. A best-effort tier can be downgraded under
+load, so the tier a response was served at is logged when it differs from the
+one requested.
+
 **z.ai / Zhipu (glm-*) example:**
 
 z.ai exposes two OpenAI-compatible gateways with **separate billing**: a

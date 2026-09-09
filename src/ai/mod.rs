@@ -684,6 +684,9 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 max_tokens,
                 ai.api_timeout_secs,
                 effort,
+                ai.openai_compat
+                    .as_ref()
+                    .and_then(|c| c.service_tier.clone()),
             )?;
 
             Ok(Arc::new(provider))

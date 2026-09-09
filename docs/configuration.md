@@ -180,6 +180,7 @@ Settings for the OpenAI providers (`provider = "openai"` or `provider = "openai-
 | `context_window_size` | integer | model-derived | Context window size. `128000` for most models. |
 | `max_tokens` | integer | `4096` | Max output tokens per response. With `provider = "openai"` it is sent as `max_completion_tokens`, which bounds reasoning tokens as well as the reply. |
 | `effort` | string | -- | Reasoning effort, sent as the `reasoning_effort` request field and omitted entirely when unset. The valid set belongs to the model rather than to the API: `"none"` is legal, and is what a gpt-5.6 chat completion carrying function tools requires, while gpt-5.4-pro takes only `"medium"` and `"high"`. A level the model rejects comes back as a 400, which is fatal. Applies to both `provider = "openai"` and `provider = "openai-compatible"`; a compatible endpoint that does not implement the field may reject the request, so leave it unset there. |
+| `service_tier` | string | -- | Service tier, sent as the top-level `service_tier` request field and omitted entirely when unset, so the provider applies its own default. `"flex"` asks for cheaper, best-effort capacity and `"priority"` for faster, costlier scheduling; the official OpenAI API and OpenRouter accept both. The tier a response was served at is logged when it differs from the one requested, since a best-effort tier can be downgraded under load. A compatible endpoint that does not implement the field ignores it. |
 
 #### `[ai.kiro_cli]`
 
