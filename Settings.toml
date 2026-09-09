@@ -144,6 +144,9 @@ repository_path = "third_party/linux"
 
 [review]
 concurrency = 16
+# Directory holding the stage prompt set. The --prompts CLI flag overrides this;
+# can also be set via SASHIKO__REVIEW__PROMPTS_DIR.
+prompts_dir = "third_party/prompts/kernel"
 worktree_dir = "review_trees"
 timeout_seconds = 7200
 max_retries = 3

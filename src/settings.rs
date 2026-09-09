@@ -447,6 +447,11 @@ pub struct ReviewSettings {
     pub ignore_files: Vec<String>,
     #[serde(default = "default_email_policy_path")]
     pub email_policy_path: String,
+    /// Directory holding the stage prompt set (e.g. `third_party/prompts/kernel`).
+    /// Overridden by the `--prompts` CLI flag when set; when unset as well, the
+    /// review binary falls back to the installed prompt bundle.
+    #[serde(default)]
+    pub prompts_dir: Option<String>,
     /// Maximum cumulative non-cached tokens (uncached input + output) across all turns in a
     /// single review. Cached input tokens are excluded because they cost ~10x less and don't
     /// reflect runaway model behaviour. At Sonnet 4.6 pricing ($3/M uncached input, $15/M

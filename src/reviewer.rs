@@ -1676,6 +1676,15 @@ async fn run_review_tool_with_cmd(
         cmd.arg("--stages").arg(stages_str);
     }
 
+    // Tell the review binary which prompt set to use rather than letting it
+    // resolve `review.prompts_dir` from its own copy of the settings. Two
+    // independent reads can disagree -- the child loads Settings.toml relative
+    // to its own working directory -- and the service is the one that has to
+    // know which prompts a review actually ran against.
+    if let Some(dir) = &settings.review.prompts_dir {
+        cmd.arg("--prompts").arg(dir);
+    }
+
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());

@@ -318,7 +318,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("CRITICAL ERROR: Panic detected: {}", info);
                 }));
 
-                let prompts = resolve_prompts_path(prompts.clone())?;
+                // Effective prompt directory: CLI `--prompts` wins, then
+                // `review.prompts_dir` from settings (which honours the
+                // SASHIKO__REVIEW__PROMPTS_DIR env override), then the
+                // installed prompt bundle.
+                let prompts = match prompts.clone() {
+                    Some(p) => p,
+                    None => match settings_result
+                        .as_ref()
+                        .ok()
+                        .and_then(|s| s.review.prompts_dir.clone())
+                    {
+                        Some(dir) => PathBuf::from(dir),
+                        None => resolve_prompts_path(None)?,
+                    },
+                };
 
                 // Validate the prompt directory up front, before any review work, so a
                 // missing or incomplete prompt set fails fast with a clear message and a
