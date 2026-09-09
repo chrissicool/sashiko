@@ -23,6 +23,7 @@ use sashiko::local_review::{
 use sashiko::prompt_bundle;
 use sashiko::reviewer::Reviewer;
 use sashiko::settings::Settings;
+use sashiko::worker::prompts::PromptRegistry;
 use serde_json::Value;
 use std::io::IsTerminal;
 use std::io::Write;
@@ -317,12 +318,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("CRITICAL ERROR: Panic detected: {}", info);
                 }));
 
+                let prompts = resolve_prompts_path(prompts.clone())?;
+
+                // Validate the prompt directory up front, before any review work, so a
+                // missing or incomplete prompt set fails fast with a clear message and a
+                // non-zero exit rather than partway through a review.
+                if let Err(e) = PromptRegistry::new(prompts.clone()).validate_prompt_directory() {
+                    error!("Invalid prompt directory: {e:#}");
+                    let err_val = serde_json::json!({
+                        "patchset_id": 0,
+                        "error": format!("Invalid prompt directory: {e:#}")
+                    });
+                    let _ = print_worker_json(&err_val);
+                    std::process::exit(1);
+                }
+
                 let result = run_worker_from_stdin(WorkerOptions {
                     settings_path: None,
                     baseline: baseline.clone(),
                     repo: repo.clone(),
                     worktree_dir: worktree_dir.clone(),
-                    prompts: resolve_prompts_path(prompts.clone())?,
+                    prompts,
                     review_patch_index: *review_patch_index,
                     review_commit: review_commit.clone(),
                     no_ai: *no_ai,

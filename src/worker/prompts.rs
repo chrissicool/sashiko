@@ -132,6 +132,44 @@ impl PromptRegistry {
         Self { base_dir }
     }
 
+    /// Validate that the prompt directory is usable before any review stage runs.
+    /// The base directory and `identity.md` must exist, and all stage files
+    /// `stages/stage-{1..11}.md` must exist; every missing stage file is reported
+    /// together in a single error. Paths in error messages are absolute.
+    pub fn validate_prompt_directory(&self) -> Result<()> {
+        let abs = |p: &Path| {
+            std::path::absolute(p)
+                .unwrap_or_else(|_| p.to_path_buf())
+                .display()
+                .to_string()
+        };
+
+        if !self.base_dir.exists() {
+            anyhow::bail!("Prompt directory not found: {}", abs(&self.base_dir));
+        }
+
+        let identity = self.base_dir.join("identity.md");
+        if !identity.exists() {
+            anyhow::bail!("Required prompt file not found: {}", abs(&identity));
+        }
+
+        let mut missing = Vec::new();
+        for n in 1..=11u8 {
+            let stage = self.base_dir.join(format!("stages/stage-{n}.md"));
+            if !stage.exists() {
+                missing.push(abs(&stage));
+            }
+        }
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "Missing required stage prompt files:\n{}",
+                missing.join("\n")
+            );
+        }
+
+        Ok(())
+    }
+
     pub fn get_system_identity() -> &'static str {
         SYSTEM_IDENTITY
     }
@@ -937,6 +975,78 @@ mod tests {
         );
         assert_eq!(planned_stages_from(&[]), Vec::<u8>::new());
         assert_eq!(planned_stages_from(&["stage_planning"]), Vec::<u8>::new());
+    }
+
+    /// Populate a temp prompt directory with the minimal stub files the worker
+    /// reads while running stages: an identity file and stage-1.md..stage-11.md.
+    fn write_stub_prompt_dir(dir: &std::path::Path) {
+        std::fs::write(dir.join("identity.md"), "Test identity.\n").unwrap();
+        let stages = dir.join("stages");
+        std::fs::create_dir_all(&stages).unwrap();
+        for n in 1..=11 {
+            std::fs::write(
+                stages.join(format!("stage-{n}.md")),
+                format!("# Stage {n}\nTest stub instruction."),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_validate_prompt_directory_complete_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        write_stub_prompt_dir(dir.path());
+        let reg = PromptRegistry::new(dir.path().to_path_buf());
+        reg.validate_prompt_directory()
+            .expect("complete dir is valid");
+    }
+
+    #[test]
+    fn test_validate_prompt_directory_missing_path() {
+        let reg = PromptRegistry::new(PathBuf::from("/nonexistent/prompt/dir/xyz"));
+        let err = reg
+            .validate_prompt_directory()
+            .expect_err("missing dir is fatal");
+        assert!(
+            err.to_string().contains("/nonexistent/prompt/dir/xyz"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_prompt_directory_missing_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let stages = dir.path().join("stages");
+        std::fs::create_dir_all(&stages).unwrap();
+        for n in 1..=11 {
+            std::fs::write(stages.join(format!("stage-{n}.md")), "x").unwrap();
+        }
+        let reg = PromptRegistry::new(dir.path().to_path_buf());
+        let err = reg
+            .validate_prompt_directory()
+            .expect_err("missing identity is fatal");
+        assert!(err.to_string().contains("identity.md"), "error: {err}");
+    }
+
+    #[test]
+    fn test_validate_prompt_directory_reports_all_missing_stages() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("identity.md"), "x").unwrap();
+        let stages = dir.path().join("stages");
+        std::fs::create_dir_all(&stages).unwrap();
+        // Only stage 1 present; 2..=11 missing.
+        std::fs::write(stages.join("stage-1.md"), "x").unwrap();
+        let reg = PromptRegistry::new(dir.path().to_path_buf());
+        let err = reg
+            .validate_prompt_directory()
+            .expect_err("missing stages are fatal");
+        let msg = err.to_string();
+        assert!(msg.contains("stage-2.md"), "error: {msg}");
+        assert!(msg.contains("stage-11.md"), "error: {msg}");
+        assert!(
+            !msg.contains("stage-1.md"),
+            "stage-1 present, should not be listed: {msg}"
+        );
     }
 
     #[test]
