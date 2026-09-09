@@ -3290,6 +3290,20 @@ impl Database {
         Ok(())
     }
 
+    /// Point a review at the interaction row holding its token usage.
+    ///
+    /// `complete_review` sets this alongside a result, but a review that never
+    /// produced one -- a crashed, killed or aborted child -- still spent tokens
+    /// that have to be attributable to something.
+    pub async fn set_review_interaction(&self, review_id: i64, interaction_id: &str) -> Result<()> {
+        self.execute(
+            "UPDATE reviews SET interaction_id = ? WHERE id = ?",
+            libsql::params![interaction_id, review_id],
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn create_ai_interaction(&self, params: AiInteractionParams<'_>) -> Result<()> {
         let compressed_input = crate::compression::compress_string_async(params.input).await;
         let compressed_output = crate::compression::compress_string_async(params.output).await;

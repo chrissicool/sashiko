@@ -528,6 +528,7 @@ fn translate_response(
         },
         usage,
         truncated: false,
+        served_from_cache: false,
     })
 }
 

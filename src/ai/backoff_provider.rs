@@ -503,6 +503,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                served_from_cache: false,
             })
         }
 
@@ -764,6 +765,7 @@ mod tests {
                         cached_tokens: None,
                     }),
                     truncated: false,
+                    served_from_cache: false,
                 })
             }
             fn get_capabilities(&self) -> ProviderCapabilities {

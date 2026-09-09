@@ -480,6 +480,7 @@ mod tests {
                     cached_tokens: None,
                 }),
                 truncated: false,
+                served_from_cache: false,
             })
         }
 

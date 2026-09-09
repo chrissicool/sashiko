@@ -215,6 +215,7 @@ mod tests {
                     tool_calls: None,
                     usage: None,
                     truncated: false,
+                    served_from_cache: false,
                 })
             }
             fn get_capabilities(&self) -> ProviderCapabilities {
@@ -279,6 +280,7 @@ mod tests {
                     tool_calls: None,
                     usage: None,
                     truncated: false,
+                    served_from_cache: false,
                 })
             }
             fn get_capabilities(&self) -> ProviderCapabilities {

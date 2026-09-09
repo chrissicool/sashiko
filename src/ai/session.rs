@@ -444,7 +444,9 @@ impl<'a> SessionRunner<'a> {
                 ));
             }
 
-            if let Some(usage) = &resp.usage {
+            // A response from the cache never reached a provider, so the usage
+            // it carries is the original call's, not this run's spend.
+            if let Some(usage) = resp.usage.as_ref().filter(|_| !resp.served_from_cache) {
                 total_prompt_tokens = total_prompt_tokens.saturating_add(usage.prompt_tokens);
                 total_completion_tokens =
                     total_completion_tokens.saturating_add(usage.completion_tokens);
@@ -672,6 +674,7 @@ mod tests {
                 }]),
                 usage: None,
                 truncated: false,
+                served_from_cache: false,
             },
             AiResponse {
                 content: Some("Recovered after tool error".to_string()),
@@ -680,6 +683,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                served_from_cache: false,
             },
         ];
 
@@ -703,6 +707,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_session_totals_leave_out_a_response_served_from_cache() {
+        let answer = |served_from_cache| AiResponse {
+            content: Some("done".to_string()),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            usage: Some(AiUsage {
+                prompt_tokens: 1_000,
+                completion_tokens: 200,
+                total_tokens: 1_200,
+                cached_tokens: Some(if served_from_cache { 1_000 } else { 400 }),
+            }),
+            truncated: false,
+            served_from_cache,
+        };
+
+        // A hit carries the original call's usage, none of it spent now.
+        let provider = MockProvider::new(vec![answer(true)]);
+        let runner = SessionRunner::new(&provider);
+        let res = runner.run(&mut DummySession).await.unwrap();
+        assert_eq!(res.usage.prompt_tokens, 0);
+        assert_eq!(res.usage.completion_tokens, 0);
+        assert_eq!(res.usage.cached_tokens.unwrap_or(0), 0);
+
+        // A provider call counts in full, its own prefix-cache hits included.
+        let provider = MockProvider::new(vec![answer(false)]);
+        let runner = SessionRunner::new(&provider);
+        let res = runner.run(&mut DummySession).await.unwrap();
+        assert_eq!(res.usage.prompt_tokens, 1_000);
+        assert_eq!(res.usage.completion_tokens, 200);
+        assert_eq!(res.usage.cached_tokens, Some(400));
+    }
+
+    #[tokio::test]
     async fn test_session_runner_forces_synthesis_on_max_turns() {
         let responses = vec![
             // Turn 1: tool call
@@ -718,6 +756,7 @@ mod tests {
                 }]),
                 usage: None,
                 truncated: false,
+                served_from_cache: false,
             },
             // Turn 2 (max turns): synthesized output
             AiResponse {
@@ -727,6 +766,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                served_from_cache: false,
             },
         ];
 
@@ -773,6 +813,7 @@ mod tests {
                         }]),
                         usage: None,
                         truncated: false,
+                        served_from_cache: false,
                     }),
                     2 => anyhow::bail!(
                         "Gemini candidate failed tool call (finish reason: UNEXPECTED_TOOL_CALL)"
@@ -784,6 +825,7 @@ mod tests {
                         tool_calls: None,
                         usage: None,
                         truncated: false,
+                        served_from_cache: false,
                     }),
                 }
             }

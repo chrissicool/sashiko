@@ -1391,6 +1391,7 @@ diff --git a/hw/net/virtio-net.c b/hw/net/virtio-net.c
                     tool_calls: None,
                     usage: None,
                     truncated: false,
+                    served_from_cache: false,
                 })
             }
 
@@ -1473,6 +1474,7 @@ diff --git a/hw/net/virtio-net.c b/hw/net/virtio-net.c
                     tool_calls: None,
                     usage: None,
                     truncated: false,
+                    served_from_cache: false,
                 })
             }
 

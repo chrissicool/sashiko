@@ -987,6 +987,7 @@ mod tests {
                 tool_calls: None,
                 usage: Some(AiUsage::default()),
                 truncated: false,
+                served_from_cache: false,
             })
         }
 

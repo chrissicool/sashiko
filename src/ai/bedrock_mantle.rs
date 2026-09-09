@@ -707,6 +707,7 @@ fn translate_response(response: ResponsesResponse) -> Result<AiResponse> {
         tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
         usage,
         truncated,
+        served_from_cache: false,
     })
 }
 
