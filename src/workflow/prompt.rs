@@ -47,6 +47,33 @@ pub struct PromptTemplate<S> {
 /// template and so cannot be named by an include directive.
 const DYNAMIC_INCLUDE_MARKER: &str = "@includes";
 
+/// Resolves `path` against `base_dir`, refusing anything that would read
+/// outside the prompt directory.
+///
+/// An inclusion path is not always written by a developer: the pre-screen stage
+/// lets the model name the subsystem guides it wants, and those names are joined
+/// onto the prompt directory before being read. A parent-directory component or
+/// an absolute path would leave the configured prompt set, so both are refused
+/// rather than read.
+fn resolve_within_base(base_dir: &Path, path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        anyhow::bail!(
+            "Out-of-bounds prompt include (absolute path): {}",
+            path.display()
+        );
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        anyhow::bail!(
+            "Out-of-bounds prompt include (parent traversal): {}",
+            path.display()
+        );
+    }
+    Ok(base_dir.join(path))
+}
+
 fn include_directive(path: &Path) -> String {
     format!("@include(\"{}\")", path.display())
 }
@@ -144,7 +171,7 @@ impl<S> PromptTemplate<S> {
                     // A directive naming a file that is not there resolves to
                     // nothing. It must still be consumed, or it reaches the
                     // model as literal text.
-                    let full_path = base_dir.join(path);
+                    let full_path = resolve_within_base(base_dir, path)?;
                     let block = if full_path.exists() {
                         let content = fs::read_to_string(&full_path)
                             .await
@@ -156,7 +183,7 @@ impl<S> PromptTemplate<S> {
                     (path, block)
                 }
                 InclusionDirective::Directory { path, filter } => {
-                    let dir_path = base_dir.join(path);
+                    let dir_path = resolve_within_base(base_dir, path)?;
                     if !dir_path.exists() {
                         place(&mut segments, &include_directive(path), String::new());
                         continue;
@@ -193,7 +220,7 @@ impl<S> PromptTemplate<S> {
         let mut dynamic = String::new();
         for dyn_inc in &self.dynamic_inclusions {
             for path in dyn_inc(state) {
-                let full_path = base_dir.join(&path);
+                let full_path = resolve_within_base(base_dir, &path)?;
                 if full_path.exists() {
                     let content = fs::read_to_string(&full_path)
                         .await
@@ -345,6 +372,41 @@ mod tests {
             expected
         );
         assert_eq!(template.render_for_log(&state), expected);
+    }
+
+    #[tokio::test]
+    async fn test_a_traversal_inclusion_is_refused() {
+        let temp_dir = tempdir().unwrap();
+        let base = temp_dir.path().join("base");
+        fs::create_dir_all(&base).await.unwrap();
+        // A real file outside the base: it must be refused even though it reads
+        // cleanly.
+        fs::write(temp_dir.path().join("secret.md"), "secret")
+            .await
+            .unwrap();
+
+        let template = PromptTemplate::<()>::new("body").include_file("../secret.md");
+        let err = template
+            .render_for_model(&(), &base)
+            .await
+            .expect_err("parent traversal must be refused");
+        assert!(err.to_string().contains("parent traversal"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_an_absolute_inclusion_is_refused() {
+        // Path::join discards the base when handed an absolute path, so an
+        // absolute inclusion would escape without a check of its own.
+        let temp_dir = tempdir().unwrap();
+        let outside = temp_dir.path().join("secret.md");
+        fs::write(&outside, "secret").await.unwrap();
+
+        let template = PromptTemplate::<()>::new("body").include_file(outside);
+        let err = template
+            .render_for_model(&(), temp_dir.path())
+            .await
+            .expect_err("absolute include must be refused");
+        assert!(err.to_string().contains("absolute path"), "{err}");
     }
 
     #[tokio::test]
