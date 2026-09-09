@@ -31,7 +31,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::Semaphore;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Clone, Debug)]
 pub struct WorkerOptions {
@@ -276,6 +276,29 @@ pub async fn run_git_review(
     .await
 }
 
+/// Resolve the baseline revision to a commit hash. An explicitly provided
+/// baseline that cannot be resolved falls back to HEAD with a warning rather
+/// than aborting; an unset baseline already defaults to HEAD, so a failure
+/// there is a genuine repository error and propagates. Resolution happens
+/// before any worktree/temp files exist, so no cleanup is needed.
+async fn resolve_baseline_sha(
+    repo_path: &Path,
+    baseline_arg: &str,
+    explicit: bool,
+) -> Result<String> {
+    match get_commit_hash(repo_path, baseline_arg).await {
+        Ok(sha) => Ok(sha),
+        Err(e) if explicit => {
+            warn!(
+                "Could not resolve baseline '{}' ({}); falling back to HEAD",
+                baseline_arg, e
+            );
+            get_commit_hash(repo_path, "HEAD").await
+        }
+        Err(e) => Err(e),
+    }
+}
+
 pub async fn run_worker(
     input: ReviewInput,
     options: WorkerOptions,
@@ -344,7 +367,8 @@ pub async fn run_worker(
             baseline_arg.clone(),
         )
     } else if let Some(path) = &options.reuse_worktree {
-        let baseline_sha = get_commit_hash(&repo_path, &baseline_arg).await?;
+        let baseline_sha =
+            resolve_baseline_sha(&repo_path, &baseline_arg, options.baseline.is_some()).await?;
         emit(
             progress,
             ProgressEvent::BaselineResolved {
@@ -358,7 +382,8 @@ pub async fn run_worker(
             baseline_sha,
         )
     } else if options.scratch_clone {
-        let baseline_sha = get_commit_hash(&repo_path, &baseline_arg).await?;
+        let baseline_sha =
+            resolve_baseline_sha(&repo_path, &baseline_arg, options.baseline.is_some()).await?;
         emit(
             progress,
             ProgressEvent::BaselineResolved {
@@ -380,7 +405,8 @@ pub async fn run_worker(
         );
         (worktree, baseline_sha)
     } else {
-        let baseline_sha = get_commit_hash(&repo_path, &baseline_arg).await?;
+        let baseline_sha =
+            resolve_baseline_sha(&repo_path, &baseline_arg, options.baseline.is_some()).await?;
         emit(
             progress,
             ProgressEvent::BaselineResolved {
