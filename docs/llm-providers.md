@@ -571,10 +571,12 @@ models. Sashiko retries an explicit unsupported-temperature error without
 the field and omits it on later requests to the same endpoint.
 
 `effort` in `[ai.openai_compat]` sets reasoning effort on a reasoning
-model, sent as the `reasoning_effort` request field. It is omitted
-when unset, so a compatible endpoint that does not implement the
-field is unaffected until you set it; one that does not recognize it
-may reject the request outright rather than ignore it.
+model, sent as the `reasoning_effort` request field. When `base_url`
+points at `openrouter.ai`, it is sent as OpenRouter's nested
+`reasoning.effort` shape instead. It is omitted when unset, so a
+compatible endpoint that does not implement the field is unaffected
+until you set it; one that does not recognize it may reject the request
+outright rather than ignore it.
 
 The valid levels belong to the model, not to the API. `"none"` is
 legal, and is what a gpt-5.6 chat completion carrying function tools
