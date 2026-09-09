@@ -314,7 +314,42 @@ fn parse_json_response(response: &AiResponse) -> Result<serde_json::Value, Valid
         let cands = find_json_candidates(raw_text);
         cands.into_iter().last().unwrap_or(serde_json::json!({}))
     });
-    Ok(parsed)
+    Ok(unwrap_content_envelope(parsed))
+}
+
+/// Unwrap a `{"content": "<json string>"}` tool-protocol envelope when the model
+/// nested its real answer inside it. Returns the inner object only when it parses
+/// as JSON and carries a recognised stage key (`concerns` or `findings`), so a
+/// legitimate `{"content": "..."}` text answer is never mistaken for an envelope.
+/// Otherwise returns the value unchanged.
+///
+/// Weaker CLI models (e.g. opencode/big-pickle) frequently emit the stage answer
+/// inside this envelope rather than as a bare object — sometimes with reasoning
+/// prose wrapped around it, which defeats the provider's own JSON parse and leaves
+/// us holding the envelope. Strong models occasionally nest the answer object
+/// directly under `content`. Either way stage validation would otherwise fail with
+/// a missing `concerns`/`findings` array.
+fn unwrap_content_envelope(v: Value) -> Value {
+    let Some(content) = v.get("content") else {
+        return v;
+    };
+    // Envelope carrying a stringified answer: `{"content": "{\"concerns\":...}"}`.
+    if let Some(s) = content.as_str() {
+        let cleaned = crate::utils::clean_json_string(s);
+        if let Ok(inner) = serde_json::from_str::<Value>(&cleaned)
+            && inner.is_object()
+            && (inner.get("concerns").is_some() || inner.get("findings").is_some())
+        {
+            return inner;
+        }
+    }
+    // Envelope carrying the answer object directly: `{"content": {"concerns":...}}`.
+    if content.is_object()
+        && (content.get("concerns").is_some() || content.get("findings").is_some())
+    {
+        return content.clone();
+    }
+    v
 }
 
 fn find_json_candidates(text: &str) -> Vec<Value> {
@@ -396,5 +431,84 @@ mod tests {
         let err = required_stage_arrays(&output).unwrap_err();
 
         assert!(err.contains("'dismissed_concerns'"));
+    }
+
+    #[test]
+    fn test_unwrap_content_envelope_recovers_nested_concerns() {
+        // big-pickle style: real answer nested inside the tool-protocol envelope.
+        let envelope = json!({
+            "content": "{\"concerns\":[{\"type\":\"uaf\"}],\"dismissed_concerns\":[]}"
+        });
+        let unwrapped = unwrap_content_envelope(envelope);
+        assert!(
+            unwrapped
+                .get("concerns")
+                .and_then(Value::as_array)
+                .is_some()
+        );
+        assert!(
+            unwrapped
+                .get("dismissed_concerns")
+                .and_then(Value::as_array)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_unwrap_content_envelope_recovers_via_candidates() {
+        // Reasoning prose wrapped around the envelope: find_json_candidates recovers
+        // the envelope, and unwrap exposes the concerns.
+        let raw = "Let me think about this.\n{\"content\": \"{\\\"concerns\\\":[],\\\"dismissed_concerns\\\":[]}\"}";
+        let cand = find_json_candidates(raw).into_iter().last().unwrap();
+        let unwrapped = unwrap_content_envelope(cand);
+        assert!(
+            unwrapped
+                .get("concerns")
+                .and_then(Value::as_array)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_unwrap_content_envelope_recovers_object_valued_content() {
+        // Strong-model variant: the answer object is nested directly under `content`
+        // (not stringified). Must be unwrapped so stage validation does not report a
+        // missing `concerns` array.
+        let envelope = json!({
+            "content": { "concerns": [{ "type": "uaf" }], "dismissed_concerns": [] }
+        });
+        let unwrapped = unwrap_content_envelope(envelope);
+        assert!(
+            unwrapped
+                .get("concerns")
+                .and_then(Value::as_array)
+                .is_some()
+        );
+        assert!(
+            unwrapped
+                .get("dismissed_concerns")
+                .and_then(Value::as_array)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_unwrap_content_envelope_leaves_findings() {
+        let envelope = json!({ "content": "{\"findings\":[1,2]}" });
+        let unwrapped = unwrap_content_envelope(envelope);
+        assert!(
+            unwrapped
+                .get("findings")
+                .and_then(Value::as_array)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_unwrap_content_envelope_preserves_text_content_answer() {
+        // A legitimate `{"content": "..."}` text answer (no stage keys) is left as-is.
+        let text = json!({ "content": "just some prose, not an envelope" });
+        let unwrapped = unwrap_content_envelope(text.clone());
+        assert_eq!(unwrapped, text);
     }
 }
