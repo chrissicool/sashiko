@@ -8,6 +8,7 @@
 target/
 archives/
 third_party/linux/
+third_party/openbsd/
 benchmarks/smoke-repo/
 review_trees/
 sashiko.log
