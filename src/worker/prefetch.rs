@@ -201,7 +201,7 @@ pub async fn prefetch_context(repository: &Path, target_sha: &str, diff: &str) -
             .arg("-z")
             .arg("-n")
             .arg("-I")
-            .arg("-P")
+            .arg("-E")
             .arg("-e")
             .arg(&regex_pattern)
             .arg(&snapshot.sha)
