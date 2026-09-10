@@ -97,7 +97,7 @@ impl LlmTool<SashikoToolContext> for GitGrepTool {
         if is_literal {
             cmd.arg("-F");
         } else {
-            cmd.arg("-P");
+            cmd.arg("-E");
         }
 
         cmd.arg("-e").arg(pattern).arg(revision);
