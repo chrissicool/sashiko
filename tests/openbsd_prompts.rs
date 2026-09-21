@@ -6,24 +6,23 @@
 //! anywhere else.
 
 use sashiko::workflow::PromptTemplate;
+use sashiko::workflows::openbsd_patch_review::{ANALYSIS_STAGES, CONSOLIDATION_STAGES};
 use std::path::PathBuf;
 
 /// The stage instruction files a review renders, named for the stage each one
-/// belongs to. Stated here because the workflow that names them does not exist
-/// yet; once it does, this list is read from its stage tables instead.
-const STAGE_NAMES: [&str; 11] = [
-    "goal",
-    "implementation",
-    "execution-flow",
-    "resources",
-    "locking",
-    "security",
-    "hardware",
-    "deduplication",
-    "conflict-resolution",
-    "verification",
-    "report",
-];
+/// belongs to.
+///
+/// Read from the workflow's own tables rather than restated here, so a stage
+/// added to the workflow cannot escape this check: the file it needs is
+/// required the moment the table names it, instead of leaving an unresolved
+/// directive in a live prompt.
+fn stage_names() -> Vec<&'static str> {
+    ANALYSIS_STAGES
+        .iter()
+        .map(|s| s.name)
+        .chain(CONSOLIDATION_STAGES.iter().map(|s| s.name))
+        .collect()
+}
 
 fn openbsd_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts/openbsd")
@@ -42,7 +41,7 @@ fn openbsd_prompt_set_is_complete() {
             missing.push(required.to_string());
         }
     }
-    for stage in STAGE_NAMES {
+    for stage in stage_names() {
         let rel = format!("stages/{stage}.md");
         if !base.join(&rel).is_file() {
             missing.push(rel);
@@ -57,7 +56,7 @@ fn openbsd_prompt_set_is_complete() {
 #[tokio::test]
 async fn openbsd_stage_prompts_load() {
     let base = openbsd_dir();
-    for stage in STAGE_NAMES {
+    for stage in stage_names() {
         let path = format!("stages/{stage}.md");
         let rendered = PromptTemplate::<()>::new(format!("@include(\"{path}\")"))
             .include_file(path)

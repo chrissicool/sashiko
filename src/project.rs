@@ -39,6 +39,9 @@ pub enum ProjectId {
     #[default]
     Linux,
     Sashiko,
+    // clap would spell this "open-bsd"; serde and FromStr read "openbsd".
+    #[value(name = "openbsd")]
+    OpenBsd,
 }
 
 impl ProjectId {
@@ -48,6 +51,7 @@ impl ProjectId {
         match self {
             ProjectId::Linux => "linux",
             ProjectId::Sashiko => "sashiko",
+            ProjectId::OpenBsd => "openbsd",
         }
     }
 
@@ -62,6 +66,7 @@ impl ProjectId {
         match self {
             ProjectId::Linux => "kernel",
             ProjectId::Sashiko => "sashiko",
+            ProjectId::OpenBsd => "openbsd",
         }
     }
 
@@ -73,6 +78,12 @@ impl ProjectId {
         match self {
             ProjectId::Linux => true,
             ProjectId::Sashiko => false,
+            // OpenBSD has no MAINTAINERS file; the tree is maintained by
+            // developers reachable on tech@ rather than by a per-subsystem
+            // index, so there is nothing to parse and everything downstream
+            // of one -- section attribution, maintainer access -- does not
+            // apply. Access comes from the [server.acl] lists instead.
+            ProjectId::OpenBsd => false,
         }
     }
 }
@@ -90,6 +101,7 @@ impl FromStr for ProjectId {
         match s.trim().to_ascii_lowercase().as_str() {
             "linux" => Ok(ProjectId::Linux),
             "sashiko" => Ok(ProjectId::Sashiko),
+            "openbsd" => Ok(ProjectId::OpenBsd),
             _ => Err(UnknownProject(s.to_string())),
         }
     }
@@ -123,7 +135,8 @@ impl ProjectId {
     /// Every project, for error messages and for tests that must cover them
     /// all. Adding a variant without adding it here fails the exhaustiveness
     /// test below.
-    pub const ALL: &'static [ProjectId] = &[ProjectId::Linux, ProjectId::Sashiko];
+    pub const ALL: &'static [ProjectId] =
+        &[ProjectId::Linux, ProjectId::Sashiko, ProjectId::OpenBsd];
 }
 
 #[cfg(test)]
@@ -137,10 +150,10 @@ mod tests {
         // checked against a match the compiler forces to stay exhaustive.
         for project in ProjectId::ALL {
             match project {
-                ProjectId::Linux | ProjectId::Sashiko => {}
+                ProjectId::Linux | ProjectId::Sashiko | ProjectId::OpenBsd => {}
             }
         }
-        assert_eq!(ProjectId::ALL.len(), 2);
+        assert_eq!(ProjectId::ALL.len(), 3);
     }
 
     #[test]
@@ -182,6 +195,7 @@ mod tests {
         // "simplification" to as_str() from silently pointing at nothing.
         assert_eq!(ProjectId::Linux.prompt_dir(), "kernel");
         assert_eq!(ProjectId::Sashiko.prompt_dir(), "sashiko");
+        assert_eq!(ProjectId::OpenBsd.prompt_dir(), "openbsd");
     }
 
     #[test]
