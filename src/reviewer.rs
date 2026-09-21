@@ -1904,8 +1904,13 @@ impl Reviewer {
                                             .as_str()
                                             .map(|s| s.to_string());
                                         let preexisting = f["preexisting"].as_bool();
+                                        // OpenBSD reports a pre-existing problem in the
+                                        // review itself, so it is kept here rather than
+                                        // handed to the bug database.
                                         if preexisting == Some(true)
                                             && !ctx.settings.linux_bug.enabled
+                                            && ctx.settings.project.kind.unwrap_or_default()
+                                                != crate::project::ProjectId::OpenBsd
                                         {
                                             continue;
                                         }
@@ -2047,6 +2052,9 @@ impl Reviewer {
                                             }
                                             crate::project::ProjectId::Sashiko => {
                                                 "sashiko:sashiko_patch_review"
+                                            }
+                                            crate::project::ProjectId::OpenBsd => {
+                                                "sashiko:openbsd_patch_review"
                                             }
                                         };
                                         let discovery_db = ctx.db.with_bug_actor(

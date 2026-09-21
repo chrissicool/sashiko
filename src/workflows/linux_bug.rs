@@ -35,7 +35,7 @@ use crate::ai::vector_search::{
 };
 use crate::ai::{AiProvider, AiResponse, AiResponseFormat, AiTool, ToolCall};
 use crate::db::{AttributedSubsystem, Bug, Database, NewBug, Severity};
-use crate::project::ProjectId;
+use crate::project::{ProjectId, openbsd_bug_pipeline_unsupported};
 use crate::toolbox::ToolBox;
 
 /// Named stages of the Linux kernel bug pipeline, in execution order.
@@ -165,6 +165,7 @@ impl LlmSession for VerifySession<'_> {
     fn system_prompt(&self) -> String {
         let current_date = chrono::Utc::now().format("%A, %B %d, %Y").to_string();
         match self.project {
+            ProjectId::OpenBsd => openbsd_bug_pipeline_unsupported(),
             ProjectId::Linux => format!(
                 "Establish this as an absolute fact: the current date is {current_date}. Your training data has a cutoff in the past, but you must base all relative time references strictly on this current date.\n\n\
                 You are an expert Linux kernel maintainer. Your task is to rigorously verify a candidate Linux kernel defect or vulnerability against the top-of-trunk of Linus Torvalds' main Linux kernel tree.\n\
@@ -202,6 +203,7 @@ impl LlmSession for VerifySession<'_> {
         };
 
         match self.project {
+            ProjectId::OpenBsd => openbsd_bug_pipeline_unsupported(),
             ProjectId::Linux => format!(
                 "{stage_heading}
 
@@ -326,6 +328,7 @@ impl LlmSession for NormalizeSession<'_> {
 
     fn system_prompt(&self) -> String {
         match self.project {
+            ProjectId::OpenBsd => openbsd_bug_pipeline_unsupported(),
             ProjectId::Linux => format!(
                 "You are an expert Linux kernel maintainer and technical editor. Your role is to normalize a candidate Linux kernel defect into canonical form.\n\
                 You must standardize the defect's title, describe the technical substance, and identify the verified affected source files and symbols.\n\
@@ -355,6 +358,7 @@ impl LlmSession for NormalizeSession<'_> {
             .unwrap_or_default();
 
         match self.project {
+            ProjectId::OpenBsd => openbsd_bug_pipeline_unsupported(),
             ProjectId::Linux => format!(
                 "{stage_heading}
 
@@ -532,6 +536,7 @@ pub fn extract_directory_subsystems_for_project(
     for file in files {
         let parts: Vec<&str> = file.split('/').filter(|p| !p.is_empty()).collect();
         let sub = match project {
+            ProjectId::OpenBsd => openbsd_bug_pipeline_unsupported(),
             ProjectId::Linux => {
                 if parts.len() >= 2 {
                     format!("{}/{}", parts[0], parts[1])
@@ -559,6 +564,7 @@ pub fn extract_directory_subsystems_for_project(
     }
     if subs.is_empty() {
         match project {
+            ProjectId::OpenBsd => openbsd_bug_pipeline_unsupported(),
             ProjectId::Linux => vec!["kernel".to_string()],
             ProjectId::Sashiko => vec!["sashiko".to_string()],
         }
@@ -659,6 +665,7 @@ impl LlmSession for DedupSession<'_> {
 
     fn system_prompt(&self) -> String {
         match self.project {
+            ProjectId::OpenBsd => openbsd_bug_pipeline_unsupported(),
             ProjectId::Linux => "You are an expert Linux kernel maintainer responsible for defect tracking and deduplication.\n\
         You will compare a newly verified Linux kernel bug against a list of known Linux kernel bugs in the codebase.\n\
         Determine if the newly verified bug is an identical duplicate (describing the same root cause in the same code path/function) of one of the candidate bugs.\n\
@@ -719,6 +726,7 @@ impl LlmSession for DedupSession<'_> {
         };
 
         let bug_header = match self.project {
+            ProjectId::OpenBsd => openbsd_bug_pipeline_unsupported(),
             ProjectId::Linux => "Newly Verified Linux Kernel Bug:",
             ProjectId::Sashiko => "Newly Verified Sashiko Bug:",
         };
@@ -808,6 +816,7 @@ impl LlmSession for TracingSession<'_> {
 
     fn system_prompt(&self) -> String {
         match self.project {
+            ProjectId::OpenBsd => openbsd_bug_pipeline_unsupported(),
             ProjectId::Linux => "You are an expert Linux kernel maintainer. Your task is to determine the exact commit that introduced a verified kernel defect.\n\
         Use available tools (git_blame, git_log, git_diff, git_show, git_read_files) to inspect history backwards and confirm which commit actually introduced the buggy logic rather than just refactoring lines.\n\
         EFFICIENCY LIMIT REQUIREMENT: You have a strict limit on tool calls; be extremely efficient instead of wandering the history.".to_string(),
@@ -912,6 +921,7 @@ impl LlmSession for SeveritySession<'_> {
 
     fn system_prompt(&self) -> String {
         let target_name = match self.project {
+            ProjectId::OpenBsd => openbsd_bug_pipeline_unsupported(),
             ProjectId::Linux => "the Linux kernel",
             ProjectId::Sashiko => "Sashiko",
         };
@@ -925,6 +935,7 @@ impl LlmSession for SeveritySession<'_> {
 
     fn initial_user_prompt(&self) -> String {
         let defect_header = match self.project {
+            ProjectId::OpenBsd => openbsd_bug_pipeline_unsupported(),
             ProjectId::Linux => "Verified Linux Kernel Defect:",
             ProjectId::Sashiko => "Verified Sashiko Defect:",
         };
@@ -995,6 +1006,7 @@ impl LlmSession for ReportSession<'_> {
 
     fn system_prompt(&self) -> String {
         match self.project {
+            ProjectId::OpenBsd => openbsd_bug_pipeline_unsupported(),
             ProjectId::Linux => r#"You are an expert Linux kernel maintainer drafting a comprehensive, standalone technical defect description suitable for submission to the Linux Kernel Mailing List (LKML).
 Maintainers demand technical rigor, exactness, and zero wasted prose.
 
@@ -1213,6 +1225,7 @@ unresolvable AB-BA deadlock.
         };
 
         let details_header = match self.project {
+            ProjectId::OpenBsd => openbsd_bug_pipeline_unsupported(),
             ProjectId::Linux => "Linux Kernel Defect Details:",
             ProjectId::Sashiko => "Sashiko Defect Details:",
         };
@@ -1373,6 +1386,7 @@ pub async fn process_issue_for_project(
         input.subsystems
     );
     let default_tool = match project {
+        ProjectId::OpenBsd => openbsd_bug_pipeline_unsupported(),
         ProjectId::Linux => "sashiko:linux_patch_review",
         ProjectId::Sashiko => "sashiko:sashiko_patch_review",
     };
@@ -1955,6 +1969,7 @@ pub async fn process_issue_worker_for_project(
     project: ProjectId,
 ) -> Result<BugOutcome> {
     let project_label = match project {
+        ProjectId::OpenBsd => openbsd_bug_pipeline_unsupported(),
         ProjectId::Linux => "Linux kernel",
         ProjectId::Sashiko => "Sashiko",
     };
@@ -1974,6 +1989,7 @@ pub async fn process_issue_worker_for_project(
         db.bug_tool().to_string()
     } else {
         match project {
+            ProjectId::OpenBsd => openbsd_bug_pipeline_unsupported(),
             ProjectId::Linux => "sashiko:linux_bug".to_string(),
             ProjectId::Sashiko => "sashiko:sashiko_bug".to_string(),
         }
@@ -3021,6 +3037,7 @@ impl LlmSession for VerifyUpstreamFixSession<'_> {
 
     fn system_prompt(&self) -> String {
         match self.project {
+            ProjectId::OpenBsd => openbsd_bug_pipeline_unsupported(),
             ProjectId::Linux => {
                 "You are an expert Linux kernel maintainer auditing whether a previously verified kernel bug has been fixed in Linus's upstream mainline tree.\n\
                 Do NOT give commits the benefit of the doubt: only mark a bug as \"fixed\" if you can point to a specific upstream commit that genuinely resolves the root cause of the defect or removes the vulnerable code path.\n\
@@ -3077,6 +3094,7 @@ impl LlmSession for VerifyUpstreamFixSession<'_> {
         };
 
         let (sha_label, bug_heading, tree_label) = match self.project {
+            ProjectId::OpenBsd => openbsd_bug_pipeline_unsupported(),
             ProjectId::Linux => (
                 "Current Linus Mainline SHA",
                 "Open Linux Kernel Bug",
@@ -3345,6 +3363,7 @@ pub async fn check_bug_fixed_upstream_with_candidates(
     };
 
     let fix_tool = match project {
+        ProjectId::OpenBsd => openbsd_bug_pipeline_unsupported(),
         ProjectId::Linux => "sashiko:linux_bug:fix_check",
         ProjectId::Sashiko => "sashiko:sashiko_bug:fix_check",
     };
