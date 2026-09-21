@@ -124,6 +124,9 @@ impl BugWorker {
     pub fn with_project(mut self, project: crate::project::ProjectId) -> Self {
         self.project = project;
         let bug_tool = match project {
+            crate::project::ProjectId::OpenBsd => {
+                crate::project::openbsd_bug_pipeline_unsupported()
+            }
             crate::project::ProjectId::Linux => "sashiko:linux_bug",
             crate::project::ProjectId::Sashiko => "sashiko:sashiko_bug",
         };
@@ -252,6 +255,9 @@ impl BugWorker {
                             self.project,
                         );
                         match proj {
+                            crate::project::ProjectId::OpenBsd => {
+                                crate::project::openbsd_bug_pipeline_unsupported()
+                            }
                             crate::project::ProjectId::Linux => untouched_linux.push(bug),
                             crate::project::ProjectId::Sashiko => untouched_sashiko.push(bug),
                         }
@@ -619,6 +625,9 @@ impl BugWorker {
                                 worker_project,
                             );
                         let bug_tool = match effective_project {
+                            crate::project::ProjectId::OpenBsd => {
+                                crate::project::openbsd_bug_pipeline_unsupported()
+                            }
                             crate::project::ProjectId::Linux => "sashiko:linux_bug",
                             crate::project::ProjectId::Sashiko => "sashiko:sashiko_bug",
                         };
