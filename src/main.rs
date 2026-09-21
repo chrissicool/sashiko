@@ -711,6 +711,14 @@ async fn run_daemon(
         return Err(reason.into());
     }
 
+    if settings.linux_bug.enabled && project == ProjectId::OpenBsd {
+        let reason = "linux_bug.enabled is not supported with project kind \"openbsd\": \
+                      OpenBSD reports a pre-existing problem in the review it came from \
+                      rather than recording it in the bug database";
+        error!("Refusing to start: {}", reason);
+        return Err(reason.into());
+    }
+
     if let Err(reason) = settings.validate_sign_in_delivery() {
         error!("Refusing to start: {}", reason);
         return Err(reason.into());
@@ -2680,6 +2688,7 @@ async fn handle_review_command(
         None
     };
 
+    let report_preexisting = report_preexisting || project.reports_preexisting_in_review();
     let result = run_git_review(
         repo_path,
         input.clone(),

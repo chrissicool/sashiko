@@ -56,6 +56,9 @@ use crate::workflow::{WorkflowEngine, WorkflowEnv, WorkflowEvent};
 use crate::workflows::linux_patch_review::{
     LinuxPatchReviewState, build_linux_patch_review_workflow_with_effort, linux_system_prompt,
 };
+use crate::workflows::openbsd_patch_review::{
+    build_openbsd_patch_review_workflow_with_effort, openbsd_system_prompt,
+};
 use crate::workflows::sashiko_patch_review::{
     build_sashiko_patch_review_workflow_with_effort, sashiko_system_prompt,
 };
@@ -207,7 +210,8 @@ impl Worker {
             stages: config.stages,
             custom_prompt: config.custom_prompt,
             skip_report: config.skip_report,
-            report_preexisting: config.report_preexisting,
+            report_preexisting: config.report_preexisting
+                || config.project.reports_preexisting_in_review(),
             effort: config.effort,
         }
     }
@@ -327,7 +331,8 @@ impl Worker {
         };
 
         let follow_up_series_context = match self.project {
-            ProjectId::Linux => build_follow_up_series_context(
+            // The generic builder: nothing in it is Linux-specific.
+            ProjectId::Linux | ProjectId::OpenBsd => build_follow_up_series_context(
                 self.series_range.as_deref(),
                 &patchset,
                 &target_commit_sha,
@@ -378,6 +383,7 @@ impl Worker {
             let sys_template = match self.project {
                 ProjectId::Linux => linux_system_prompt(true),
                 ProjectId::Sashiko => sashiko_system_prompt(true),
+                ProjectId::OpenBsd => openbsd_system_prompt(true),
             };
             let rendered_sys = sys_template.render_for_log(&state);
             self.global_history.push(AiMessage {
@@ -397,6 +403,11 @@ impl Worker {
                 self.effort,
             ),
             ProjectId::Sashiko => build_sashiko_patch_review_workflow_with_effort(
+                self.max_interactions,
+                self.temperature,
+                self.effort,
+            ),
+            ProjectId::OpenBsd => build_openbsd_patch_review_workflow_with_effort(
                 self.max_interactions,
                 self.temperature,
                 self.effort,
@@ -802,6 +813,20 @@ mod tests {
                 "post-verification",
                 "report",
                 "summary"
+            ]
+        );
+        assert_eq!(
+            crate::workflows::planned_stages_from(
+                ProjectId::OpenBsd,
+                &["goal", "implementation", "locking"]
+            ),
+            [
+                "goal",
+                "implementation",
+                "locking",
+                "verification",
+                "post-verification",
+                "report"
             ]
         );
         assert_eq!(

@@ -670,6 +670,13 @@ mod tests {
         let sashiko_config = EmailPolicyConfig::load("projects/sashiko/mailing_lists.toml")
             .expect("Production projects/sashiko/mailing_lists.toml failed to parse");
         assert!(sashiko_config.tracked_nntp_groups().is_empty());
+
+        // A missing file loads as the defaults, which do not mute, so this
+        // fails unless the shipped file is there and read.
+        let openbsd_config = EmailPolicyConfig::load("projects/openbsd/mailing_lists.toml")
+            .expect("Production projects/openbsd/mailing_lists.toml failed to parse");
+        assert!(openbsd_config.defaults.mute_all);
+        assert!(openbsd_config.tracked_nntp_groups().is_empty());
     }
 
     #[tokio::test]
