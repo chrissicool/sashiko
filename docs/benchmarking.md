@@ -33,6 +33,7 @@ cargo run --bin sashiko -- benchmark projects/linux/benchmarks/benchmark_tiny.js
 | `projects/linux/benchmarks/benchmark_missed.json` | Upstream fixes for bugs missed by Sashiko after public launch. |
 | `projects/linux/benchmarks/benchmark_preexisting.json` | Tests detection of pre-existing bugs. |
 | `projects/linux/benchmarks/benchmark_versioned.json` | Multi-version LKML patchset stories (`v1..vN`) testing prior-feedback verification, reviewer attribution, and false-positive suppression. |
+| `projects/openbsd/benchmarks/benchmark_openbsd_smoke.json` | OpenBSD kernel regressions (6 entries). |
 
 Each file contains entries with a `Commit` hash (or target patch `Message-ID` for
 versioned mbox entries), an optional `Fixed-by` reference, an optional
