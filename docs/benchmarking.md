@@ -45,7 +45,7 @@ cargo run --bin benchmark -- [OPTIONS]
 |------|-------------|
 | `-f, --file <PATH>` | Path to the benchmark JSON file (required). |
 | `-p, --port <PORT>` | Override the daemon port (defaults to Settings.toml value). |
-| `-r, --repo <URL>` | Override the kernel repository URL. |
+| `-r, --repo <PATH\|URL>` | Repository to fetch benchmark commits from. Defaults to `git.repository_path` from the settings file, which is the tree the daemon applies patches against. |
 | `--analyze-only` | Skip ingestion; only evaluate existing results in the database. |
 
 ## Output
