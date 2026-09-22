@@ -43,7 +43,7 @@ struct Args {
     #[arg(short, long)]
     port: Option<u16>,
 
-    /// Override the default repo URL (default: kernel.org linux.git)
+    /// Repository to fetch benchmark commits from (default: git.repository_path)
     #[arg(short, long)]
     repo: Option<String>,
 
@@ -117,9 +117,15 @@ async fn main() -> Result<()> {
 
     if !args.analyze_only {
         let port = args.port.unwrap_or(settings.server.port);
-        let repo_url = args.repo.clone().unwrap_or_else(|| {
-            "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git".to_string()
-        });
+        // The daemon applies every patch against the tree named by
+        // `git.repository_path`, so a commit it can review is already in that
+        // tree. Naming it here sends the fetch agent to the repository it
+        // already has, which it recognises as its own and skips fetching, and
+        // it means a benchmark run needs no repository argument at all.
+        let repo_url = args
+            .repo
+            .clone()
+            .unwrap_or_else(|| settings.git.repository_path.clone());
 
         let target_url = if settings.server.host.contains(':') {
             format!("http://[::1]:{}/api/submit", port)
