@@ -33,6 +33,7 @@ cargo run --bin sashiko -- benchmark benchmarks/benchmark_smoke.json
 | `benchmarks/benchmark.json` | Full benchmark suite (999 entries). |
 | `benchmarks/benchmark_missed.json` | Upstream fixes for bugs missed by Sashiko after public launch. |
 | `benchmarks/benchmark_preexisting.json` | Tests detection of pre-existing bugs. |
+| `benchmarks/benchmark_openbsd_smoke.json` | OpenBSD kernel regressions (6 entries). |
 
 Each file contains entries with a `Commit` hash, an optional `Fixed-by`
 reference, an optional `Subsystem`, and a `problem_description` that the AI
