@@ -47,7 +47,7 @@ sashiko benchmark [OPTIONS] <FILE>
 | Argument / Flag | Description |
 |-----------------|-------------|
 | `<FILE>` / `-f, --file <FILE>` | Path to the benchmark JSON file (required). |
-| `-r, --repo <PATH_OR_URL>` | Override the target git repository path or URL. |
+| `-r, --repo <PATH_OR_URL>` | Repository to fetch benchmark commits from. Defaults to `git.repository_path` from the settings file, which is the tree reviews apply patches against. |
 | `--db <PATH>` | Explicit SQLite database path to create or re-analyze. |
 | `--output-dir <DIR>` | Base directory for benchmark runs (default: `benchmarks/runs`). |
 | `--analyze-only` | Skip ingestion and reviews; re-evaluate an existing benchmark database. |

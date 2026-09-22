@@ -37,9 +37,6 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
 use tracing::{error, info, warn};
 
-const DEFAULT_KERNEL_REPO_URL: &str =
-    "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git";
-
 #[derive(Debug, Clone)]
 pub struct BenchmarkOptions {
     pub file: PathBuf,
@@ -727,7 +724,16 @@ async fn ingest_benchmark_commits(
         return Ok(());
     }
 
-    let repo_url = Some(repo_override.unwrap_or(DEFAULT_KERNEL_REPO_URL).to_string());
+    // Reviews apply every patch against the tree named by
+    // `git.repository_path`, so a commit they can review is already in that
+    // tree. Naming it here sends the fetch agent to the repository it
+    // already has, which it recognises as its own and skips fetching, and
+    // it means a benchmark run needs no repository argument at all.
+    let repo_url = Some(
+        repo_override
+            .map(str::to_string)
+            .unwrap_or_else(|| settings.git.repository_path.clone()),
+    );
     let repo_path = PathBuf::from(&settings.git.repository_path);
     let (tx, mut rx) = mpsc::channel::<Event>(to_fetch.len().saturating_mul(2).max(32));
     let (mut fetch_agent, _fetch_req_tx) =
