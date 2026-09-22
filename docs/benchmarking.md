@@ -30,6 +30,7 @@ cargo run --bin benchmark -- --file benchmarks/benchmark_small.json
 | `benchmarks/benchmark.json` | Full benchmark suite. |
 | `benchmarks/benchmark_preexisting.json` | Tests detection of pre-existing bugs. |
 | `benchmarks/benchmark_smoke.json` | CI smoke test set. |
+| `benchmarks/benchmark_openbsd_smoke.json` | OpenBSD kernel regressions. |
 
 Each file contains entries with a commit hash, a `Fixed-by` reference,
 and a `problem_description` that the AI judge uses to evaluate whether

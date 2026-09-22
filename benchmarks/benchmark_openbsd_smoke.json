@@ -1,0 +1,32 @@
+[
+    {
+        "Commit": "0afa2cf964719f148d35952723d19141564d497d",
+        "Fixed-by": "6bb594b93bf9bbe9bfd849ce7a781904a73706f2",
+        "subsystem": "netinet",
+        "problem_description": "Use-after-free of the listening socket's inpcb in the TCP SYN cache. In syn_cache_get(), the resetandabort error path stores the listen inpcb in both listeninp and inp, so the in_pcbunref(inp) call frees the listen socket that is still referenced through listeninp."
+    },
+    {
+        "Commit": "bda32853b08c72fc3eb0808fd3758afa7c71d447",
+        "Fixed-by": "5e82fd317c62f2fe0a3712d829f93a9e1b4a6c16",
+        "subsystem": "uvm",
+        "problem_description": "Page queue lock recursion in uvn_get(). uvm_pagefree() now acquires uvm_pageqlock internally, but the error path in uvn_get() still wraps its uvm_pagefree() call in uvm_lock_pageq()/uvm_unlock_pageq(), so that path recurses on the lock and panics."
+    },
+    {
+        "Commit": "a03640071eda2d9adf187fa6803898c423b3c9f8",
+        "Fixed-by": "8a75dc3b44a7c0c730fab22b30858010a52f3116",
+        "subsystem": "netinet6",
+        "problem_description": "NULL pointer dereference in nd6_rtrequest(). Iterator entries linked on nd6_list by the lockless llinfo traversal have ln_rt == NULL; nd6_rtrequest() takes TAILQ_LAST(&nd6_list) and moves it to the head to advance the LRU without checking for one, so it dereferences a NULL route."
+    },
+    {
+        "Commit": "f9943f26ca81e6f8271c07f1c3f5030065bbc224",
+        "Fixed-by": "a92ae5daa1eb82f3f984635dcde106d5abb8d502",
+        "subsystem": "uvm",
+        "problem_description": "NULL pointer dereference in uvmpd_scan(). The page list iterator is inserted with TAILQ_INSERT_AFTER() using the result of TAILQ_FIRST() without checking it for NULL, so an empty page list makes the insertion dereference a NULL page."
+    },
+    {
+        "Commit": "80bc9799356e3b392a8b535a1a90ac7f86265c7d",
+        "Fixed-by": "2b6fc957b059e1ed091db7ed54ddd1824047927d",
+        "subsystem": "netinet",
+        "problem_description": "Lock recursion on if_maddrlock. in_addmulti() takes if_maddrlock and then calls igmp_joingroup(), igmp_sendpkt() and ip_output(), where in_hasmulti() takes the same lock again. mld6_sendpkt() recurses the same way for IPv6."
+    }
+]
