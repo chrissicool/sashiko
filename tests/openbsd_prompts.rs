@@ -6,7 +6,9 @@
 //! anywhere else.
 
 use sashiko::workflow::PromptTemplate;
-use sashiko::workflows::openbsd_patch_review::{ANALYSIS_STAGES, CONSOLIDATION_STAGES};
+use sashiko::workflows::openbsd_patch_review::{
+    ANALYSIS_STAGES, CONSOLIDATION_STAGES, is_stage_exclusive_guide,
+};
 use std::path::PathBuf;
 
 /// The stage instruction files a review renders, named for the stage each one
@@ -78,6 +80,56 @@ async fn openbsd_stage_prompts_load() {
         assert!(
             !rendered.contains("Linux"),
             "OpenBSD stage {stage} rendered Linux text: {rendered}"
+        );
+    }
+}
+
+/// The index and the guide directory agree in both directions.
+///
+/// A row naming a file that is not there selects nothing: the include resolves
+/// to empty and the review runs without the guidance it asked for. A guide with
+/// no row cannot be selected, because pre-screening is the only path that
+/// offers one. The exception is a guide a stage attaches itself: the pre-screen
+/// drops those selections, so a row for one would offer a choice that is
+/// discarded.
+#[test]
+fn openbsd_subsystem_index_matches_the_guides() {
+    let dir = openbsd_dir().join("subsystem");
+    let index = std::fs::read_to_string(dir.join("subsystem.md")).expect("subsystem index");
+
+    let mut listed: Vec<String> = Vec::new();
+    for line in index.lines() {
+        let row = line.trim();
+        if !row.starts_with('|') || !row.ends_with(".md |") {
+            continue;
+        }
+        let file = row
+            .trim_end_matches('|')
+            .trim_end()
+            .rsplit(' ')
+            .next()
+            .expect("a row ends with its file")
+            .to_string();
+        assert!(
+            dir.join(&file).is_file(),
+            "the index names a guide that is not there: {file}"
+        );
+        listed.push(file);
+    }
+    assert!(!listed.is_empty(), "the index lists no guides at all");
+
+    for entry in std::fs::read_dir(&dir).expect("subsystem directory") {
+        let name = entry
+            .expect("entry")
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+        if name == "subsystem.md" || !name.ends_with(".md") {
+            continue;
+        }
+        assert!(
+            listed.contains(&name) || is_stage_exclusive_guide(&name),
+            "{name} is in neither the index nor a stage table, so nothing can load it"
         );
     }
 }
