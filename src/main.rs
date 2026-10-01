@@ -678,7 +678,7 @@ async fn run_daemon(
                                 article_id,
                                 source,
                                 metadata: None,
-                                patch: None,
+                                patches: Vec::new(),
                                 baseline: None,
                                 failed_error: Some(error),
                                 skip_filters: None,
@@ -736,12 +736,13 @@ async fn run_daemon(
                             body: message.clone(),
                         };
 
-                        let patch = Some(sashiko::patch::Patch {
+                        let patches = vec![sashiko::patch::Patch {
                             message_id,
                             body: message,
                             diff,
                             part_index: index,
-                        });
+                            subject: None,
+                        }];
 
                         let source = if group.starts_with("git-import") {
                             MessageSource::GitImport
@@ -755,7 +756,7 @@ async fn run_daemon(
                                 article_id,
                                 source,
                                 metadata: Some(metadata),
-                                patch,
+                                patches,
                                 baseline: base_commit,
                                 failed_error: None,
                                 skip_filters: None,
@@ -824,7 +825,7 @@ async fn run_daemon(
                                                 }
                                                 Some(m)
                                             },
-                                            patch: patch_opt,
+                                            patches: patch_opt,
                                             baseline: baseline_clone,
                                             failed_error: None,
                                             skip_filters: skip_subjects_clone,
@@ -888,7 +889,7 @@ async fn run_daemon(
                                         article_id,
                                         source: MessageSource::Nntp,
                                         metadata: Some(metadata),
-                                        patch: patch_opt,
+                                        patches: patch_opt,
                                         baseline,
                                         failed_error: None,
                                         skip_filters: None,
@@ -952,7 +953,12 @@ async fn run_daemon(
             let patch_ids = sashiko::prerequisites::calculate_git_patch_id_batch(
                 buffer
                     .iter()
-                    .map(|article| article.patch.as_ref().map(|patch| patch.diff.as_str()))
+                    // A stable patch ID names one changeset. A mail carrying
+                    // several gets none, rather than one ID standing for all.
+                    .map(|article| match article.patches.as_slice() {
+                        [patch] => Some(patch.diff.as_str()),
+                        _ => None,
+                    })
                     .collect(),
             )
             .await;
@@ -961,8 +967,8 @@ async fn run_daemon(
                     Ok(git_patch_id) => git_patch_id,
                     Err(e) => {
                         let message_id = article
-                            .patch
-                            .as_ref()
+                            .patches
+                            .first()
                             .map_or(article.article_id.as_str(), |patch| {
                                 patch.message_id.as_str()
                             });
@@ -2920,7 +2926,7 @@ async fn process_parsed_article(
         article_id,
         source,
         metadata,
-        patch,
+        patches,
         baseline,
         failed_error,
         skip_filters,
@@ -2957,7 +2963,7 @@ async fn process_parsed_article(
         }
     };
 
-    let mut patch_opt = patch;
+    let mut patch_list = patches;
 
     let author_email = sashiko::patch::extract_email(&metadata.author);
 
@@ -2969,7 +2975,7 @@ async fn process_parsed_article(
             );
         }
         metadata.is_patch_or_cover = false;
-        patch_opt = None;
+        patch_list.clear();
     }
 
     // Resolve baseline ID if provided.  A baseline that does not name an
@@ -3122,7 +3128,7 @@ async fn process_parsed_article(
     // Subsystem Identification and Linking
     let mut subsystems = identify_subsystems(&metadata.to, &metadata.cc, subsystem_mapping);
 
-    if let Some(p) = patch_opt.as_ref() {
+    for p in &patch_list {
         let files = sashiko::baseline::extract_files_from_diff(&p.diff);
         let path_subsystems = identify_subsystems_from_paths(&files, subsystem_mapping);
         subsystems.extend(path_subsystems);
@@ -3135,10 +3141,10 @@ async fn process_parsed_article(
     // the kernel trusts with that code. Only these decide who may later read
     // the series' review transcripts, so they are kept apart all the way down
     // to their own table rather than merged into the labels here.
-    let maintainer_sections: Vec<sashiko::db::AttributedSubsystem> = patch_opt
-        .as_ref()
-        .map(|p| sashiko::maintainers::sections_for_diff(&p.diff))
-        .unwrap_or_default()
+    let maintainer_sections: Vec<sashiko::db::AttributedSubsystem> = patch_list
+        .iter()
+        .flat_map(|p| sashiko::maintainers::sections_for_diff(&p.diff))
+        .collect::<Vec<_>>()
         .into_iter()
         .map(sashiko::db::AttributedSubsystem::from_maintainers)
         .collect();
@@ -3404,7 +3410,49 @@ async fn process_parsed_article(
                     );
                 }
 
-                if let Some(patch) = patch_opt {
+                // A mail carrying several changesets yields one patch per
+                // changeset, under an id no mail ever had. Give each its row in
+                // messages first, because patches.message_id is a foreign key
+                // there and the insert is refused without it.
+                for patch in &patch_list {
+                    if patch.message_id == metadata.message_id {
+                        continue;
+                    }
+                    if let Err(e) = worker_db
+                        .create_part_message(
+                            &patch.message_id,
+                            patch.subject.as_deref(),
+                            &patch.body,
+                            &sashiko::db::PartMessageParent {
+                                thread_id,
+                                message_id: &metadata.message_id,
+                                author: &metadata.author,
+                                date: metadata.date,
+                                to: &metadata.to,
+                                cc: &metadata.cc,
+                                mailing_list: Some(&group),
+                            },
+                        )
+                        .await
+                    {
+                        // Without its message row the part's patch insert is
+                        // refused too, so fail the patchset here, where the
+                        // error still names the cause.
+                        let err_msg = format!(
+                            "Failed to record part {} of {}: {}",
+                            patch.part_index, metadata.message_id, e
+                        );
+                        error!("{}", err_msg);
+                        let target_id = cover_letter_id.as_deref().unwrap_or(&root_msg_id);
+                        fail_fetching_patchset_logged(worker_db, target_id, &err_msg).await;
+                        if target_id != root_msg_id {
+                            fail_fetching_patchset_logged(worker_db, &root_msg_id, &err_msg).await;
+                        }
+                        return ProcessStatus::Error;
+                    }
+                }
+
+                for patch in patch_list {
                     match worker_db
                         .create_patch_with_git_patch_id(
                             patchset_id,
