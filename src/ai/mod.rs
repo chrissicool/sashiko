@@ -438,7 +438,7 @@ pub async fn create_provider_cached(
     {
         let cache_path = response_cache_path(database, &crate::utils::data_home()?);
         if let Some(parent) = cache_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
         let cached = cache::CachingAiProvider::new(
             provider,
@@ -1411,5 +1411,23 @@ mod tests {
         assert_eq!(u1.completion_tokens, 150);
         assert_eq!(u1.total_tokens, 500);
         assert_eq!(u1.cached_tokens, Some(100));
+    }
+
+    #[cfg(feature = "cache")]
+    #[tokio::test]
+    async fn test_create_provider_cached_creates_parent_directory() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let nested_db = temp.path().join("nested").join("dir").join("sashiko.db");
+        let nested_db_str = nested_db.to_string_lossy().to_string();
+
+        let mut settings = Settings::new().expect("Failed to load settings");
+        settings.ai.provider = "gemini".to_string();
+        settings.ai.model = "gemini-1.5-flash".to_string();
+        settings.ai.response_cache = true;
+
+        let provider = create_provider_cached(&settings.ai, Some(&nested_db_str)).await?;
+        assert_eq!(provider.get_capabilities().model_name, "gemini-1.5-flash");
+        assert!(nested_db.parent().unwrap().exists());
+        Ok(())
     }
 }
