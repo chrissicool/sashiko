@@ -189,7 +189,7 @@ pub struct ParsedArticle {
     pub article_id: String,
     pub source: MessageSource,
     pub metadata: Option<PatchsetMetadata>,
-    pub patch: Option<Patch>,
+    pub patches: Vec<Patch>,
     pub baseline: Option<String>,
     pub failed_error: Option<String>,
     pub skip_filters: Option<Vec<String>>,

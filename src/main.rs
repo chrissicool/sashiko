@@ -593,7 +593,7 @@ async fn run_daemon(
                                 article_id,
                                 source,
                                 metadata: None,
-                                patch: None,
+                                patches: Vec::new(),
                                 baseline: None,
                                 failed_error: Some(error),
                                 skip_filters: None,
@@ -651,12 +651,12 @@ async fn run_daemon(
                             body: message.clone(),
                         };
 
-                        let patch = Some(sashiko::patch::Patch {
+                        let patches = vec![sashiko::patch::Patch {
                             message_id,
                             body: message,
                             diff,
                             part_index: index,
-                        });
+                        }];
 
                         let source = if group.starts_with("git-import") {
                             MessageSource::GitImport
@@ -670,7 +670,7 @@ async fn run_daemon(
                                 article_id,
                                 source,
                                 metadata: Some(metadata),
-                                patch,
+                                patches,
                                 baseline: base_commit,
                                 failed_error: None,
                                 skip_filters: None,
@@ -739,7 +739,7 @@ async fn run_daemon(
                                                 }
                                                 Some(m)
                                             },
-                                            patch: patch_opt,
+                                            patches: patch_opt,
                                             baseline: baseline_clone,
                                             failed_error: None,
                                             skip_filters: skip_subjects_clone,
@@ -803,7 +803,7 @@ async fn run_daemon(
                                         article_id,
                                         source: MessageSource::Nntp,
                                         metadata: Some(metadata),
-                                        patch: patch_opt,
+                                        patches: patch_opt,
                                         baseline,
                                         failed_error: None,
                                         skip_filters: None,
@@ -867,7 +867,12 @@ async fn run_daemon(
             let patch_ids = sashiko::prerequisites::calculate_git_patch_id_batch(
                 buffer
                     .iter()
-                    .map(|article| article.patch.as_ref().map(|patch| patch.diff.as_str()))
+                    // A stable patch ID names one changeset. A mail carrying
+                    // several gets none, rather than one ID standing for all.
+                    .map(|article| match article.patches.as_slice() {
+                        [patch] => Some(patch.diff.as_str()),
+                        _ => None,
+                    })
                     .collect(),
             )
             .await;
@@ -876,8 +881,8 @@ async fn run_daemon(
                     Ok(git_patch_id) => git_patch_id,
                     Err(e) => {
                         let message_id = article
-                            .patch
-                            .as_ref()
+                            .patches
+                            .first()
                             .map_or(article.article_id.as_str(), |patch| {
                                 patch.message_id.as_str()
                             });
@@ -1022,6 +1027,15 @@ async fn run_daemon(
     } else {
         None
     };
+
+    if settings.linux_bug.enabled && project == sashiko::project::ProjectId::OpenBsd {
+        return Err(
+            "linux_bug.enabled is not supported with project kind \"openbsd\": \
+             OpenBSD reports a pre-existing problem in the review it came from \
+             rather than recording it in the bug database"
+                .into(),
+        );
+    }
 
     let bug_worker_handle = if settings.linux_bug.enabled {
         let provider =
@@ -2601,7 +2615,7 @@ async fn process_parsed_article(
         article_id,
         source,
         metadata,
-        patch,
+        patches,
         baseline,
         failed_error,
         skip_filters,
@@ -2636,7 +2650,7 @@ async fn process_parsed_article(
         }
     };
 
-    let mut patch_opt = patch;
+    let mut patch_list = patches;
 
     let author_email = sashiko::patch::extract_email(&metadata.author);
 
@@ -2648,7 +2662,7 @@ async fn process_parsed_article(
             );
         }
         metadata.is_patch_or_cover = false;
-        patch_opt = None;
+        patch_list.clear();
     }
 
     // Resolve baseline ID if provided.  A baseline that does not name an
@@ -2782,7 +2796,7 @@ async fn process_parsed_article(
     // Subsystem Identification and Linking
     let mut subsystems = identify_subsystems(&metadata.to, &metadata.cc, subsystem_mapping);
 
-    if let Some(p) = patch_opt.as_ref() {
+    for p in &patch_list {
         let files = sashiko::baseline::extract_files_from_diff(&p.diff);
         let path_subsystems = identify_subsystems_from_paths(&files, subsystem_mapping);
         subsystems.extend(path_subsystems);
@@ -2795,10 +2809,10 @@ async fn process_parsed_article(
     // the kernel trusts with that code. Only these decide who may later read
     // the series' review transcripts, so they are kept apart all the way down
     // to their own table rather than merged into the labels here.
-    let maintainer_sections: Vec<sashiko::db::AttributedSubsystem> = patch_opt
-        .as_ref()
-        .map(|p| sashiko::maintainers::sections_for_diff(&p.diff))
-        .unwrap_or_default()
+    let maintainer_sections: Vec<sashiko::db::AttributedSubsystem> = patch_list
+        .iter()
+        .flat_map(|p| sashiko::maintainers::sections_for_diff(&p.diff))
+        .collect::<Vec<_>>()
         .into_iter()
         .map(sashiko::db::AttributedSubsystem::from_maintainers)
         .collect();
@@ -3064,7 +3078,7 @@ async fn process_parsed_article(
                     );
                 }
 
-                if let Some(patch) = patch_opt {
+                for patch in patch_list {
                     match worker_db
                         .create_patch_with_git_patch_id(
                             patchset_id,

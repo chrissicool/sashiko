@@ -191,7 +191,7 @@ async fn patches_from_mbox(raw: Vec<u8>) -> Result<Vec<PrerequisitePatch>> {
             messages
                 .into_iter()
                 .filter_map(|message| parse_email(&message).ok())
-                .filter(|(metadata, patch)| metadata.is_patch_or_cover && patch.is_some())
+                .filter(|(metadata, patches)| metadata.is_patch_or_cover && !patches.is_empty())
                 .collect::<Vec<_>>(),
         )
     })
@@ -201,14 +201,14 @@ async fn patches_from_mbox(raw: Vec<u8>) -> Result<Vec<PrerequisitePatch>> {
     let patch_ids = calculate_git_patch_id_batch(
         parsed
             .iter()
-            .map(|(_, patch)| patch.as_ref().map(|patch| patch.diff.as_str()))
+            .map(|(_, patches)| patches.first().map(|patch| patch.diff.as_str()))
             .collect(),
     )
     .await;
     let mut patches = Vec::new();
     let mut seen = HashSet::new();
-    for ((metadata, patch), git_patch_id) in parsed.into_iter().zip(patch_ids) {
-        let Some(patch) = patch else {
+    for ((metadata, message_patches), git_patch_id) in parsed.into_iter().zip(patch_ids) {
+        let Some(patch) = message_patches.into_iter().next() else {
             continue;
         };
         let Some(git_patch_id) = git_patch_id? else {

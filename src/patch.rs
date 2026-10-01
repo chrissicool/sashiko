@@ -88,7 +88,7 @@ pub fn extract_received_date(raw_email: &[u8]) -> Option<i64> {
 }
 
 #[cfg(feature = "server")]
-pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)> {
+pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Vec<Patch>)> {
     let received_date = extract_received_date(raw_email);
 
     let message = MessageParser::default()
@@ -265,6 +265,43 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
     let is_patch_or_cover = (!is_reply && (has_patch_tag || has_diff || is_series_metadata))
         || (has_unquoted_diff && !is_forward);
 
+    // A body may carry more than one changeset: tech@ takes a batch of patches
+    // in a single mail as readily as one per mail. Each becomes its own patch,
+    // so each is reviewed on its own terms rather than fused into one diff.
+    let changesets = if has_diff {
+        split_changesets(&body)
+    } else {
+        Vec::new()
+    };
+    let split_total = u32::try_from(changesets.len()).unwrap_or(u32::MAX);
+    // A split body is a series that arrived in one message, so it is numbered
+    // like one. A single changeset leaves the subject's own numbering alone.
+    let total = if split_total > 1 { split_total } else { total };
+
+    let patches = if index == 0 {
+        Vec::new() // a cover letter carries no patch of its own
+    } else if split_total > 1 {
+        changesets
+            .into_iter()
+            .enumerate()
+            .map(|(n, diff)| Patch {
+                message_id: format!("{}#{}", message_id, n + 1),
+                body: body.clone(),
+                diff,
+                part_index: u32::try_from(n + 1).unwrap_or(u32::MAX),
+            })
+            .collect()
+    } else if has_diff {
+        vec![Patch {
+            message_id: message_id.clone(),
+            body: body.clone(),
+            diff,
+            part_index: index,
+        }]
+    } else {
+        Vec::new()
+    };
+
     let metadata = PatchsetMetadata {
         message_id: message_id.clone(),
         subject,
@@ -282,18 +319,7 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
         body: body.clone(),
     };
 
-    let patch = if has_diff && index != 0 {
-        Some(Patch {
-            message_id,
-            body,
-            diff,
-            part_index: index,
-        })
-    } else {
-        None
-    };
-
-    Ok((metadata, patch))
+    Ok((metadata, patches))
 }
 
 /// A line that only ever appears inside a diff, so it continues the block the
@@ -835,7 +861,7 @@ Index: sys/kern/vfs_subr.c\n\
             "Reply carrying a fresh unquoted diff SHOULD be a patchset"
         );
         assert!(
-            patch.is_some(),
+            !patch.is_empty(),
             "A patch should be extracted from the reply"
         );
     }
@@ -877,7 +903,7 @@ Index: sys/kern/vfs_subr.c\n\
         let raw = b"Message-ID: <789>\r\nSubject: [PATCH 0/5] fix bug\r\n\r\nCover letter body";
         let (meta, patch) = parse_email(raw).unwrap();
         assert!(meta.is_patch_or_cover);
-        assert!(patch.is_none());
+        assert!(patch.is_empty());
     }
 
     #[cfg(feature = "server")]
@@ -887,7 +913,7 @@ Index: sys/kern/vfs_subr.c\n\
         let (meta, patch) = parse_email(raw).unwrap();
         assert!(meta.is_patch_or_cover);
         assert!(
-            patch.is_none(),
+            patch.is_empty(),
             "Cover letter (index 0) with diff should NOT be a patch"
         );
     }
