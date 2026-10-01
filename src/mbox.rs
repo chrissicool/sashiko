@@ -48,50 +48,7 @@ pub fn split_mbox(raw: &[u8]) -> Vec<Vec<u8>> {
     emails
 }
 
-/// mbox separator lines normally contain a timestamp in traditional
-/// UNIX ctime output format:
-///
-/// "From <sender> DDD MMM [D]D HH:MM:SS YYYY"
-///
-/// Requiring "From ", the space delimiters, a valid day string,
-/// and HH:MM:SS colons avoids splitting on ordinary body text or
-/// email headers with minimal overhead.
-///
-/// Note that when changing this function, we also need to update the copy
-/// in sashiko-cli. See the comments in sashiko-cli for more details.
-pub fn is_mbox_separator(line: &[u8]) -> bool {
-    if !line.starts_with(b"From ") {
-        return false;
-    }
-
-    let mut line = line;
-    while let [rest @ .., b'\r' | b'\n'] = line {
-        line = rest;
-    }
-
-    let len = line.len();
-
-    if len < 30 {
-        return false;
-    }
-
-    // Check colons in HH:MM:SS and the space before YYYY
-    if line[len - 8] != b':' || line[len - 11] != b':' || line[len - 5] != b' ' {
-        return false;
-    }
-
-    const DAYS: [&[u8]; 7] = [
-        b"Mon ", b"Tue ", b"Wed ", b"Thu ", b"Fri ", b"Sat ", b"Sun ",
-    ];
-
-    // 2-digit / space-padded day (e.g. "From <sender> Thu Jan  1 00:00:00 1970")
-    if len >= 31 && line[len - 25] == b' ' && DAYS.contains(&&line[len - 24..len - 20]) {
-        return true;
-    }
-
-    // 1-digit day (e.g. "From <sender> Mon Jan 1 00:00:00 2023")
-    line[len - 24] == b' ' && DAYS.contains(&&line[len - 23..len - 19])
-}
+pub use crate::patch::is_mbox_separator;
 
 #[derive(Clone)]
 pub(crate) struct LoreMboxClient {
