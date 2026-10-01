@@ -542,15 +542,18 @@ impl BugWorker {
     }
 
     pub async fn run(&self) {
+        let concurrency = self.settings.concurrency.max(1);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
         let lease_ttl_seconds = clamp_lease_ttl_seconds(self.settings.lease_ttl_seconds);
         let max_attempts = self.settings.max_attempts.max(1);
         let fix_check_enabled = self.settings.fix_check_enabled;
         let fix_check_interval = self.settings.fix_check_interval_seconds;
 
         info!(
-            "Starting Bug Worker as {} (project {}, lease {}s renewed every {}s, {} attempts max, fix check enabled: {}, interval {}s)...",
+            "Starting Bug Worker as {} (project {}, concurrency {}, lease {}s renewed every {}s, {} attempts max, fix check enabled: {}, interval {}s)...",
             self.worker_id,
             self.project.as_str(),
+            concurrency,
             lease_ttl_seconds,
             ((lease_ttl_seconds as u64) / 3).clamp(1, BUG_LEASE_RENEW_INTERVAL_SECONDS),
             max_attempts,
@@ -587,6 +590,13 @@ impl BugWorker {
                 }));
             }
 
+            let Ok(Ok(permit)) =
+                tokio::time::timeout(Duration::from_secs(5), semaphore.clone().acquire_owned())
+                    .await
+            else {
+                continue;
+            };
+
             let claim_id = new_claim_id(&self.worker_id);
             let claim_started = tokio::time::Instant::now();
             match self
@@ -601,6 +611,7 @@ impl BugWorker {
                     let worker_project = self.project;
 
                     tokio::spawn(async move {
+                        let _permit = permit;
                         let effective_project =
                             crate::workflows::linux_bug::infer_project_from_bug_or_tool(
                                 Some(&bug.bugid),
@@ -711,6 +722,7 @@ impl BugWorker {
                     });
                 }
                 Ok(None) => {
+                    drop(permit);
                     // Nothing left to claim, so this is the cheapest moment to
                     // retire the bugs that have run out of attempts.
                     if let Err(e) = self.db.abandon_exhausted_bugs(max_attempts).await {
@@ -719,6 +731,7 @@ impl BugWorker {
                     sleep(Duration::from_secs(5)).await;
                 }
                 Err(e) => {
+                    drop(permit);
                     error!("Database error while claiming a bug for analysis: {}", e);
                     sleep(Duration::from_secs(10)).await;
                 }
@@ -917,6 +930,7 @@ mod tests {
             max_attempts: 3,
             fix_check_interval_seconds: 60,
             fix_check_batch_size: 10,
+            ..Default::default()
         });
         assert_eq!(disabled_worker.check_open_bugs_upstream().await, 0);
 
@@ -932,6 +946,7 @@ mod tests {
             max_attempts: 3,
             fix_check_interval_seconds: 60,
             fix_check_batch_size: 10,
+            ..Default::default()
         });
 
         let checked = worker.check_open_bugs_upstream().await;
@@ -1114,6 +1129,7 @@ mod tests {
             max_attempts: 3,
             fix_check_interval_seconds: 60,
             fix_check_batch_size: 2,
+            ..Default::default()
         });
 
         // Sweep 1: all 8 untouched bugs advance without LLM, plus 2 of the 4
@@ -1136,5 +1152,131 @@ mod tests {
             let b = db.get_bug(*id).await.unwrap().unwrap();
             assert_eq!(b.verified_on_sha().as_deref(), Some(sha2.as_str()));
         }
+    }
+
+    struct GatedProvider {
+        active: std::sync::atomic::AtomicUsize,
+        max_active: std::sync::atomic::AtomicUsize,
+        two_active_notify: tokio::sync::Notify,
+        release_gate: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl AiProvider for GatedProvider {
+        async fn generate_content(
+            &self,
+            _req: crate::ai::AiRequest,
+        ) -> anyhow::Result<crate::ai::AiResponse> {
+            let cur = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(cur, Ordering::SeqCst);
+            if cur >= 2 {
+                self.two_active_notify.notify_one();
+            }
+            self.release_gate.notified().await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            anyhow::bail!("simulated provider failure after gate release")
+        }
+
+        fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+            crate::ai::ProviderCapabilities {
+                model_name: "gated-mock".to_string(),
+                context_window_size: 8192,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bug_worker_run_bounds_concurrent_claims_and_analyses() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            Database::new(&crate::settings::DatabaseSettings {
+                url: ":memory:".into(),
+                token: String::new(),
+            })
+            .await
+            .unwrap(),
+        );
+        db.migrate().await.unwrap();
+
+        let mut bug_ids = Vec::new();
+        for i in 0..5 {
+            let id = db
+                .create_bug(&crate::db::NewBug {
+                    bugid: format!("linux-bounded-{i}"),
+                    title: format!("pending bug {i}"),
+                    lifecycle_status: crate::db::BugLifecycleStatus::New,
+                    pipeline_state: crate::db::BugPipelineState::Pending,
+                    assignee: None,
+                    reporter: "sashiko".to_string(),
+                    reported_at: 1000 + i,
+                    discovered_in_patchset_id: None,
+                    discovered_in_patch_id: None,
+                    discovered_in_commit: None,
+                    source_ref: None,
+                    vector_json: None,
+                    duplicate_of_id: None,
+                    subsystems: vec![],
+                })
+                .await
+                .unwrap();
+            bug_ids.push(id);
+        }
+
+        let provider = Arc::new(GatedProvider {
+            active: std::sync::atomic::AtomicUsize::new(0),
+            max_active: std::sync::atomic::AtomicUsize::new(0),
+            two_active_notify: tokio::sync::Notify::new(),
+            release_gate: tokio::sync::Notify::new(),
+        });
+        let two_active = provider.two_active_notify.notified();
+
+        let worker = BugWorker::new(
+            db.clone(),
+            provider.clone(),
+            dir.path().to_string_lossy().to_string(),
+        )
+        .with_settings(crate::settings::LinuxBugSettings {
+            enabled: true,
+            concurrency: 2,
+            fix_check_enabled: false,
+            lease_ttl_seconds: 60,
+            max_attempts: 1,
+            fix_check_interval_seconds: 0,
+            fix_check_batch_size: 10,
+        });
+
+        let handle = tokio::spawn(async move {
+            worker.run().await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), two_active)
+            .await
+            .expect("two worker tasks should reach generate_content");
+
+        // Give the worker loop a moment to attempt any additional claims; because
+        // both semaphore permits are held, the remaining 3 bugs must stay Pending.
+        sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(provider.active.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.max_active.load(Ordering::SeqCst), 2);
+
+        let mut running_count = 0;
+        let mut pending_count = 0;
+        for id in &bug_ids {
+            let b = db.get_bug(*id).await.unwrap().unwrap();
+            match b.pipeline_state {
+                crate::db::BugPipelineState::Running => running_count += 1,
+                crate::db::BugPipelineState::Pending => pending_count += 1,
+                other => panic!("unexpected pipeline_state while gated: {other:?}"),
+            }
+        }
+        assert_eq!(
+            running_count, 2,
+            "only 2 bugs should be claimed while gated"
+        );
+        assert_eq!(pending_count, 3, "remaining 3 bugs must remain Pending");
+
+        handle.abort();
+        provider.release_gate.notify_waiters();
     }
 }

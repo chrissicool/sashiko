@@ -279,6 +279,7 @@ reviews are ignored and the background bug worker is not started.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | bool | `false` | Enable pre-existing bug tracking, the `/api/bug/analyze` endpoint, and the background `BugWorker`. |
+| `concurrency` | integer | `4` | Maximum number of concurrent bug analyses run by the background `BugWorker`. |
 | `fix_check_enabled` | bool | `false` | Enable periodic verification of whether open bugs have been fixed in the upstream mainline branch (`master` for Linux, `main` for Sashiko). |
 | `lease_ttl_seconds` | integer | `300` | How long a worker's claim on a bug stays valid without renewal. If the worker dies, the bug becomes claimable again once this elapses. |
 | `max_attempts` | integer | `3` | How many analysis attempts a bug gets before it is abandoned. Abandoned bugs are never retried automatically. |
