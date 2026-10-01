@@ -75,8 +75,16 @@ pub fn in_dir(directory: impl AsRef<Path>) -> std::process::Command {
 }
 
 /// Builds an asynchronous git command that runs in `directory`.
+///
+/// `kill_on_drop(true)` is enabled by default so that cancelling or timing out
+/// an awaiting future terminates the underlying `git` child process instead of
+/// leaking an orphan (matching the explicit `kill_on_drop(true)` already used
+/// by `git_ops` fetches and `worker::prefetch`). Callers that need a child to
+/// outlive the handle may override this with `command.kill_on_drop(false)`.
 pub fn in_dir_async(directory: impl AsRef<Path>) -> tokio::process::Command {
-    git_command!(tokio::process::Command, Some(directory.as_ref()))
+    let mut command = git_command!(tokio::process::Command, Some(directory.as_ref()));
+    command.kill_on_drop(true);
+    command
 }
 
 /// Builds an asynchronous git command that is not anchored anywhere.
@@ -84,8 +92,15 @@ pub fn in_dir_async(directory: impl AsRef<Path>) -> tokio::process::Command {
 /// This is for the few operations that name every path they touch as an
 /// argument, such as cloning into a directory that does not exist yet. Use
 /// [`in_dir_async`] for anything that works on an existing repository.
+///
+/// `kill_on_drop(true)` is enabled by default so that cancelling or timing out
+/// an awaiting future terminates the underlying `git` child process instead of
+/// leaking an orphan. Callers that need a child to outlive the handle may
+/// override this with `command.kill_on_drop(false)`.
 pub fn detached_async() -> tokio::process::Command {
-    git_command!(tokio::process::Command, None::<&Path>)
+    let mut command = git_command!(tokio::process::Command, None::<&Path>);
+    command.kill_on_drop(true);
+    command
 }
 
 #[cfg(test)]
@@ -125,6 +140,7 @@ mod tests {
             assert!(removed.contains(variable), "{variable} is still inherited");
         }
         assert_eq!(command.as_std().get_current_dir(), Some(Path::new("/tmp")));
+        assert!(command.get_kill_on_drop());
     }
 
     #[test]
@@ -135,6 +151,7 @@ mod tests {
             assert!(removed.contains(variable), "{variable} is still inherited");
         }
         assert_eq!(command.as_std().get_current_dir(), None);
+        assert!(command.get_kill_on_drop());
     }
 
     fn resolved_git_dir(command: &mut std::process::Command) -> PathBuf {
