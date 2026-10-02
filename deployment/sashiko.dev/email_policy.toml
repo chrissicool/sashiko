@@ -358,3 +358,8 @@ cc = ["linux-security-module@vger.kernel.org"]
 lists = ["intel-wired-lan@lists.osuosl.org"]
 reply_to_author = true
 cc =  ["intel-wired-lan@lists.osuosl.org"]
+
+[subsystems.linux-gpio]
+lists = ["linux-gpio@vger.kernel.org"]
+reply_to_author = true
+cc = ["linux-gpio@vger.kernel.org"]
