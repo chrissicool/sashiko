@@ -12,7 +12,7 @@ Migrations live in `src/migrations/NNN_name.sql` and are applied sequentially in
 - **Tracking Mechanism**: Schema version is stored in SQLite's `PRAGMA user_version`
   integer, *not* in a schema migrations table.
 - **Transactional Application**: Each migration step (`if current_version < N`)
-  *must* open a transaction (`let tx = self.conn.transaction().await?`), run
+  *must* open a transaction (`let tx = self.begin_transaction().await?`), run
   `tx.execute_batch(...)`, update `tx.execute("PRAGMA user_version = N", ())`,
   and commit atomically.
 - **Defect to Catch**:
@@ -81,10 +81,27 @@ a durable queue polled by background workers (`lock_pending_email`,
    letter ordering, and singleton root protection?
 4. **Positional Row Indexing**: When changing `SELECT` column lists, are all
    `row.get::<T>(idx)` positional indices updated to match?
-5. **`libsql` Transaction Handle Sharing (`with_connection((*tx).clone())`)**:
-   In `libsql`, `Transaction` implements `Deref<Target = Connection>`, and
-   `Connection::clone()` is an `Arc<dyn Conn>` clone of the *exact same*
-   underlying SQLite connection handle where `BEGIN` is active. Therefore,
-   `self.with_connection((*tx).clone())` executes all queries inside `tx` and
-   participates in `tx.commit()` / `tx.rollback()`; do NOT flag it as spawning a
-   separate connection outside the transaction.
+5. **`libsql` Transaction Serialization (`begin_transaction` / `begin_immediate_transaction`)**:
+   In `libsql`, `Connection::clone()` clones an `Arc` to the *exact same*
+   underlying `sqlite3*` connection handle. Because `Arc<Database>` is shared
+   across concurrent in-process Tokio tasks (`Ingestor`, `EmailWorker`,
+   `PatchworkWorker`, `ForgeWorker`, `BugWorker`, `Compressor`, HTTP handlers),
+   every explicit transaction **must** be opened via `self.begin_transaction()`
+   or `self.begin_immediate_transaction()`, which acquires `self.tx_lock` and
+   runs on `self.tx_conn` wrapped in `DatabaseTransaction`.
+   - **Defect to Catch**: Calling `self.conn.transaction()`,
+     `self.conn.transaction_with_behavior(...)`, or raw `BEGIN` / `COMMIT`
+     statements directly on `self.conn` causes concurrent tasks to collide on
+     the same `sqlite3*` handle (`cannot start a transaction within a
+     transaction`) and triggers `libsql`'s `Drop` `.unwrap()` panic (`cannot
+     rollback - no transaction is active`). Furthermore, because `libsql`'s
+     `Transaction::drop` calls `do_rollback().unwrap()` and
+     `libsql::Transaction::commit` drops its inner transaction before returning
+     an error, transaction handles must remain wrapped in `DatabaseTransaction`
+     across all `.await` points and early `?` returns so drop-time rollbacks are
+     guarded with `catch_unwind`.
+   - Note: Inside an active `DatabaseTransaction`, `Transaction` implements
+     `Deref<Target = Connection>`, so `self.with_connection((*tx).clone())`
+     executes all queries on `tx`'s connection handle and participates in
+     `tx.commit()` / `tx.rollback()`; do NOT flag `with_connection((*tx).clone())`
+     as spawning a separate connection outside the transaction.

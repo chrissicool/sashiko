@@ -21,25 +21,45 @@ Sashiko's concurrency model spans **two levels**:
 
 ---
 
-## 1. Cross-process database contention (`sashiko.db`)
+## 1. Database concurrency and background worker supervision (`sashiko.db`)
 
 Because child review workers open their own connections to `sashiko.db` while
-the main daemon is simultaneously ingesting patches and serving API requests:
+the main daemon simultaneously runs `Ingestor`, `EmailWorker`,
+`PatchworkWorker`, `ForgeWorker`, `BugWorker`, `Compressor`, and HTTP API
+handlers sharing an `Arc<Database>`:
 
 ### Invariants
 
-1. **Keep write transactions short**: Never hold a SQLite transaction open
+1. **In-process transaction serialization (`begin_transaction` / `begin_immediate_transaction`)**:
+   In `libsql`, `Connection::clone()` shares the same underlying `sqlite3*`
+   handle. Never call `self.conn.transaction()`,
+   `self.conn.transaction_with_behavior(...)`, or raw `BEGIN` / `COMMIT`
+   statements on `self.conn`. Always use `self.begin_transaction()` or
+   `self.begin_immediate_transaction()`, which serialize transactions via
+   `self.tx_lock` on the dedicated `self.tx_conn` connection and guard drop-time
+   rollbacks via `DatabaseTransaction` across all `.await` points and early `?`
+   returns.
+2. **Keep write transactions short**: Never hold a SQLite transaction open
    across network I/O, LLM API calls, or subprocess execution. SQLite (even in
    WAL mode) allows only one writer at a time; holding a write lock during an
    LLM turn blocks all other workers and the API server with `SQLITE_BUSY`.
-2. **Busy timeout and WAL mode**: Every database connection opened (in both the
+3. **Busy timeout and WAL mode**: Every database connection opened (in both the
    daemon and CLI/worker subprocesses) must configure `PRAGMA journal_mode=WAL`
    and a non-zero `busy_timeout` so concurrent writers wait briefly rather than
    failing immediately.
-3. **Atomic state claims (`UPDATE ... WHERE status = ...`)**: When claiming a
+4. **Atomic state claims (`UPDATE ... WHERE status = ...`)**: When claiming a
    pending review or outbox item, use conditional updates or `RETURNING` clauses
    to prevent two workers from claiming the same task concurrently. A separate
    `SELECT` followed by an unconditional `UPDATE` is a TOCTOU race.
+5. **Supervise long-lived background workers (`spawn_supervised_worker`) and bound network calls**:
+   Long-running daemon workers (`EmailWorker`, `PatchworkWorker`, `ForgeWorker`,
+   `BugWorker`, `Compressor`) must be spawned through `spawn_supervised_worker`
+   in `src/main.rs` so an unexpected panic in a worker loop is logged and
+   restarted rather than silently killing background processing for the rest of
+   the daemon's lifetime. External network calls inside worker loops (such as
+   SMTP delivery in `EmailWorker`) must also be wrapped in explicit
+   `tokio::time::timeout` deadlines so a hung remote endpoint cannot stall the
+   worker loop indefinitely.
 
 ---
 
