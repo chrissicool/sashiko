@@ -435,26 +435,26 @@ async fn test_stats_reviews_endpoint() {
 
     // Insert 1005 reviews.
     // 5 Failed first, then 1000 Reviewed.
-    server.db.begin_transaction().await.unwrap();
+    let tx = server.db.begin_immediate_transaction().await.unwrap();
     for i in 1..=5 {
-        server.db.conn.execute(
+        tx.execute(
             &format!("INSERT INTO reviews (id, patchset_id, status, created_at) VALUES ({}, 1, 'Failed', {})", i, 1234567890 + i),
             ()
         ).await.unwrap();
     }
     for i in 6..=1005 {
         let int_id = format!("int-{}", i);
-        server.db.conn.execute(
+        tx.execute(
             &format!("INSERT INTO ai_interactions (id, tokens_in, tokens_out, tokens_cached) VALUES ('{}', 10, 20, 5)", int_id),
             ()
         ).await.unwrap();
 
-        server.db.conn.execute(
+        tx.execute(
             &format!("INSERT INTO reviews (id, patchset_id, status, interaction_id, created_at) VALUES ({}, 1, 'Reviewed', '{}', {})", i, int_id, 1234567890 + i),
             ()
         ).await.unwrap();
     }
-    server.db.commit_transaction().await.unwrap();
+    tx.commit().await.unwrap();
 
     let resp = reqwest::get(format!("{}/api/stats/reviews", server.base_url))
         .await
@@ -493,9 +493,9 @@ async fn test_stats_tools_endpoint() {
         .await
         .unwrap();
 
-    server.db.begin_transaction().await.unwrap();
+    let tx = server.db.begin_immediate_transaction().await.unwrap();
     for i in 1..=1005 {
-        server.db.conn.execute(
+        tx.execute(
             &format!("INSERT INTO reviews (id, patchset_id, status, created_at) VALUES ({}, 1, 'Reviewed', {})", i, 1234567890 + i),
             ()
         ).await.unwrap();
@@ -503,7 +503,7 @@ async fn test_stats_tools_endpoint() {
 
     // Tool usages for reviews 1..5 (should be excluded)
     for i in 1..=5 {
-        server.db.conn.execute(
+        tx.execute(
             &format!("INSERT INTO tool_usages (review_id, tool_name, output_length) VALUES ({}, 'old_tool', 100)", i),
             ()
         ).await.unwrap();
@@ -511,12 +511,12 @@ async fn test_stats_tools_endpoint() {
 
     // Tool usages for reviews 6..10 (should be included)
     for i in 6..=10 {
-        server.db.conn.execute(
+        tx.execute(
             &format!("INSERT INTO tool_usages (review_id, tool_name, output_length) VALUES ({}, 'new_tool', 200)", i),
             ()
         ).await.unwrap();
     }
-    server.db.commit_transaction().await.unwrap();
+    tx.commit().await.unwrap();
 
     let resp = reqwest::get(format!("{}/api/stats/tools", server.base_url))
         .await

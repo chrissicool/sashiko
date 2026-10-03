@@ -182,10 +182,91 @@ async fn write_patch_if_unchanged(
 #[cfg(feature = "server")]
 pub struct Database {
     pub conn: libsql::Connection,
+    tx_conn: libsql::Connection,
+    tx_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     bug_actor: String,
     bug_tool: String,
     bug_model: Option<String>,
     bug_claim: Option<BugAnalysisClaim>,
+}
+
+/// Guards an open transaction on the transaction `libsql::Connection` so
+/// concurrent tasks cannot start a nested transaction before the active one
+/// finishes, and suppresses `libsql`'s drop-time rollback `.unwrap()` panic.
+#[cfg(feature = "server")]
+pub struct DatabaseTransaction {
+    tx: Option<libsql::Transaction>,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+#[cfg(feature = "server")]
+impl std::ops::Deref for DatabaseTransaction {
+    type Target = libsql::Transaction;
+
+    fn deref(&self) -> &Self::Target {
+        self.tx
+            .as_ref()
+            .expect("transaction accessed after completion")
+    }
+}
+
+#[cfg(feature = "server")]
+impl DatabaseTransaction {
+    fn drop_quietly(tx: libsql::Transaction) {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(tx))).is_err() {
+            warn!("Suppressed libsql transaction rollback panic during drop");
+        }
+    }
+
+    /// Commits the transaction while keeping `self.tx` inside `self` across `.await`.
+    ///
+    /// We intentionally execute `COMMIT` directly instead of calling
+    /// `libsql::Transaction::commit(self)`:
+    /// 1. `libsql::Transaction::commit(self)` takes `local::Transaction` out of its
+    ///    `Option` and drops it *inside* `commit()` before returning `Err`, so a
+    ///    failed `COMMIT` triggers `local::Transaction::drop`'s `do_rollback().unwrap()`
+    ///    panic before the caller can intercept it.
+    /// 2. `local::Transaction::drop` checks `if self.conn.is_autocommit() { return; }`
+    ///    (`sqlite3_get_autocommit`) on its first line. Once `COMMIT` succeeds,
+    ///    SQLite returns to autocommit mode (`tx.is_autocommit() == true`), so
+    ///    dropping `self.tx` in `DatabaseTransaction::drop` is a no-op that never
+    ///    runs `ROLLBACK` or panics.
+    pub async fn commit(self) -> Result<()> {
+        if let Some(tx) = self.tx.as_ref() {
+            if let Err(err) = tx.execute("COMMIT", ()).await {
+                if !tx.is_autocommit() {
+                    let _ = tx.execute("ROLLBACK", ()).await;
+                }
+                return Err(err.into());
+            }
+            debug_assert!(tx.is_autocommit());
+        }
+        Ok(())
+    }
+
+    /// Rolls back the transaction while keeping `self.tx` inside `self` across `.await`.
+    ///
+    /// Once `ROLLBACK` succeeds, `tx.is_autocommit()` (`sqlite3_get_autocommit`)
+    /// is `true`, so `local::Transaction::drop` returns immediately without
+    /// issuing a second `ROLLBACK` or panicking.
+    pub async fn rollback(self) -> Result<()> {
+        if let Some(tx) = self.tx.as_ref()
+            && !tx.is_autocommit()
+        {
+            tx.execute("ROLLBACK", ()).await?;
+            debug_assert!(tx.is_autocommit());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "server")]
+impl Drop for DatabaseTransaction {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            Self::drop_quietly(tx);
+        }
+    }
 }
 
 /// Ownership of one analysis attempt, separate from its audit attribution.
@@ -1164,6 +1245,7 @@ pub enum AssigneeFilter<'a> {
     Is(&'a str),
 }
 
+/// Lifetime in seconds for sign-in link JWTs and pending sign-in link emails.
 /// What an outbox row is for.
 ///
 /// Review notifications and transactional mail share a transport but differ in
@@ -1277,6 +1359,8 @@ impl Database {
     pub fn with_bug_actor(&self, author: &str, tool: &str, model: Option<String>) -> Self {
         Self {
             conn: self.conn.clone(),
+            tx_conn: self.tx_conn.clone(),
+            tx_lock: self.tx_lock.clone(),
             bug_actor: author.into(),
             bug_tool: tool.into(),
             bug_model: model,
@@ -1287,7 +1371,9 @@ impl Database {
     /// Keeps attribution attached to writes performed inside a transaction.
     fn with_connection(&self, conn: libsql::Connection) -> Self {
         Self {
-            conn,
+            conn: conn.clone(),
+            tx_conn: conn,
+            tx_lock: self.tx_lock.clone(),
             bug_actor: self.bug_actor.clone(),
             bug_tool: self.bug_tool.clone(),
             bug_model: self.bug_model.clone(),
@@ -1297,16 +1383,45 @@ impl Database {
 
     /// Binds analysis writes to the exact attempt that claimed this bug.
     pub fn with_bug_claim(&self, bug_id: i64, owner: &str) -> Self {
-        let mut scoped = self.with_connection(self.conn.clone());
-        scoped.bug_claim = Some(BugAnalysisClaim {
-            bug_id,
-            owner: owner.into(),
-        });
-        scoped
+        Self {
+            conn: self.conn.clone(),
+            tx_conn: self.tx_conn.clone(),
+            tx_lock: self.tx_lock.clone(),
+            bug_actor: self.bug_actor.clone(),
+            bug_tool: self.bug_tool.clone(),
+            bug_model: self.bug_model.clone(),
+            bug_claim: Some(BugAnalysisClaim {
+                bug_id,
+                owner: owner.into(),
+            }),
+        }
+    }
+
+    /// Opens a transaction after acquiring the connection's transaction lock.
+    pub async fn begin_transaction(&self) -> Result<DatabaseTransaction> {
+        let guard = self.tx_lock.clone().lock_owned().await;
+        let tx = self.tx_conn.transaction().await?;
+        Ok(DatabaseTransaction {
+            tx: Some(tx),
+            _guard: guard,
+        })
+    }
+
+    /// Opens an IMMEDIATE write transaction after acquiring the connection's transaction lock.
+    pub async fn begin_immediate_transaction(&self) -> Result<DatabaseTransaction> {
+        let guard = self.tx_lock.clone().lock_owned().await;
+        let tx = self
+            .tx_conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await?;
+        Ok(DatabaseTransaction {
+            tx: Some(tx),
+            _guard: guard,
+        })
     }
 
     /// Checks ownership under the same write lock as the ensuing mutation.
-    async fn begin_bug_write(&self, bug_id: i64) -> Result<libsql::Transaction> {
+    async fn begin_bug_write(&self, bug_id: i64) -> Result<DatabaseTransaction> {
         if self
             .bug_claim
             .as_ref()
@@ -1314,10 +1429,7 @@ impl Database {
         {
             bail!("Analysis claim belongs to a different bug");
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
-            .await?;
+        let tx = self.begin_immediate_transaction().await?;
         if let Some(claim) = &self.bug_claim {
             let held = {
                 let mut rows = tx
@@ -1605,7 +1717,9 @@ impl Database {
             crate::utils::redact_secret(&settings.url)
         );
 
-        let db = if settings.url.starts_with("libsql://") || settings.url.starts_with("https://") {
+        let is_remote =
+            settings.url.starts_with("libsql://") || settings.url.starts_with("https://");
+        let db = if is_remote {
             Builder::new_remote(settings.url.clone(), settings.token.clone())
                 .build()
                 .await?
@@ -1617,23 +1731,40 @@ impl Database {
 
         // Enable WAL mode for better concurrency
         // PRAGMA journal_mode returns a row (the new mode), so we must use query() instead of execute()
-        let _ = conn
-            .query("PRAGMA journal_mode=WAL;", ())
+        conn.query("PRAGMA journal_mode=WAL;", ())
             .await?
             .next()
-            .await;
-        let _ = conn
-            .query("PRAGMA busy_timeout = 5000;", ())
+            .await?;
+        conn.query("PRAGMA busy_timeout = 5000;", ())
             .await?
             .next()
-            .await;
+            .await?;
         // Foreign keys are off by default in SQLite and must be re-enabled per
         // connection. Without this every ON DELETE CASCADE in the schema is
         // inert and orphaned child rows accumulate silently.
         conn.execute("PRAGMA foreign_keys = ON;", ()).await?;
 
+        // Open a dedicated second connection for explicit transactions on
+        // file-backed SQLite databases so active read cursors on `conn` can
+        // never block `COMMIT` with `SQL statements in progress` or collide
+        // with transaction state on the same `sqlite3*` handle.
+        let tx_conn = if !is_remote && !settings.url.contains(":memory:") {
+            let tx_conn = db.connect()?;
+            tx_conn
+                .query("PRAGMA busy_timeout = 5000;", ())
+                .await?
+                .next()
+                .await?;
+            tx_conn.execute("PRAGMA foreign_keys = ON;", ()).await?;
+            tx_conn
+        } else {
+            conn.clone()
+        };
+
         Ok(Self {
             conn,
+            tx_conn,
+            tx_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             bug_actor: "system".into(),
             bug_tool: "sashiko".into(),
             bug_model: None,
@@ -1660,7 +1791,7 @@ impl Database {
 
         if current_version < 2 {
             info!("Applying database migration version 2 (bugs)...");
-            let tx = self.conn.transaction().await?;
+            let tx = self.begin_transaction().await?;
             tx.execute_batch(include_str!("migrations/002_bugs.sql"))
                 .await?;
             tx.execute("PRAGMA user_version = 2", ()).await?;
@@ -1669,7 +1800,7 @@ impl Database {
 
         if current_version < 3 {
             info!("Applying database migration version 3 (email outbox kind)...");
-            let tx = self.conn.transaction().await?;
+            let tx = self.begin_transaction().await?;
             tx.execute_batch(include_str!("migrations/003_email_outbox_kind.sql"))
                 .await?;
             tx.execute("PRAGMA user_version = 3", ()).await?;
@@ -1689,7 +1820,7 @@ impl Database {
         };
         if has_legacy_linux_bugs {
             info!("Dropping legacy linux_bug* tables and applying bugs schema...");
-            let tx = self.conn.transaction().await?;
+            let tx = self.begin_transaction().await?;
             tx.execute_batch(
                 "DROP TABLE IF EXISTS linux_bug_vectors;
                  DROP TABLE IF EXISTS linux_bug_reviews;
@@ -1715,7 +1846,7 @@ impl Database {
         };
         if !has_bugs {
             info!("Applying database migration (bugs)...");
-            let tx = self.conn.transaction().await?;
+            let tx = self.begin_transaction().await?;
             tx.execute_batch(include_str!("migrations/002_bugs.sql"))
                 .await?;
             tx.commit().await?;
@@ -1727,7 +1858,7 @@ impl Database {
         // intermediate branch state.
         if current_version < 4 {
             info!("Applying database migration version 4 (retire folded bug pipelines)...");
-            let tx = self.conn.transaction().await?;
+            let tx = self.begin_transaction().await?;
             tx.execute_batch(include_str!(
                 "migrations/004_retire_folded_bug_pipelines.sql"
             ))
@@ -1750,7 +1881,7 @@ impl Database {
 
         if current_version < 6 {
             info!("Applying database migration version 6 (repair borrowed series names)...");
-            let tx = self.conn.transaction().await?;
+            let tx = self.begin_transaction().await?;
             Self::repair_borrowed_series_names(&tx).await?;
             tx.execute("PRAGMA user_version = 6", ()).await?;
             tx.commit().await?;
@@ -1758,7 +1889,7 @@ impl Database {
 
         if current_version < 7 {
             info!("Applying database migration version 7 (fold shadow cover rows)...");
-            let tx = self.conn.transaction().await?;
+            let tx = self.begin_transaction().await?;
             tx.execute_batch(include_str!("migrations/007_fold_shadow_cover_rows.sql"))
                 .await?;
             tx.execute("PRAGMA user_version = 7", ()).await?;
@@ -1767,7 +1898,7 @@ impl Database {
 
         if current_version < 8 {
             info!("Applying database migration version 8 (meta table)...");
-            let tx = self.conn.transaction().await?;
+            let tx = self.begin_transaction().await?;
             tx.execute_batch(include_str!("migrations/008_meta_table.sql"))
                 .await?;
             tx.execute("PRAGMA user_version = 8", ()).await?;
@@ -1776,7 +1907,7 @@ impl Database {
 
         if current_version < 9 {
             info!("Applying database migration version 9 (patchset maintainer sections)...");
-            let tx = self.conn.transaction().await?;
+            let tx = self.begin_transaction().await?;
             tx.execute_batch(include_str!(
                 "migrations/009_patchset_maintainer_sections.sql"
             ))
@@ -1787,7 +1918,7 @@ impl Database {
 
         if current_version < 10 {
             info!("Applying database migration version 10 (forge outbox)...");
-            let tx = self.conn.transaction().await?;
+            let tx = self.begin_transaction().await?;
             tx.execute_batch(include_str!("migrations/010_forge_outbox.sql"))
                 .await?;
             tx.execute("PRAGMA user_version = 10", ()).await?;
@@ -1796,7 +1927,7 @@ impl Database {
 
         if current_version < 11 {
             info!("Applying database migration version 11 (index patchsets mr_number)...");
-            let tx = self.conn.transaction().await?;
+            let tx = self.begin_transaction().await?;
             tx.execute_batch(include_str!("migrations/011_index_patchsets_mr_number.sql"))
                 .await?;
             tx.execute("PRAGMA user_version = 11", ()).await?;
@@ -1836,7 +1967,7 @@ impl Database {
 
         if current_version < 13 {
             info!("Applying database migration version 13 (index bugs fix check)...");
-            let tx = self.conn.transaction().await?;
+            let tx = self.begin_transaction().await?;
             tx.execute_batch(include_str!("migrations/013_index_bugs_fix_check.sql"))
                 .await?;
             tx.execute("PRAGMA user_version = 13", ()).await?;
@@ -2195,11 +2326,11 @@ impl Database {
         bug: &NewBug,
         enrichment: Option<&NewBugEnrichment>,
     ) -> Result<i64> {
-        let tx = self.conn.transaction().await?;
+        let tx = self.begin_transaction().await?;
         let scoped = self.with_connection((*tx).clone());
         let id = scoped.insert_bug(bug).await?;
         if let Some(enrichment) = enrichment {
-            scoped.add_bug_enrichment(id, enrichment).await?;
+            scoped.insert_bug_enrichment(id, enrichment).await?;
         }
         tx.commit().await?;
         Ok(id)
@@ -3147,7 +3278,7 @@ impl Database {
         status: BugLifecycleStatus,
         reason: Option<&str>,
     ) -> Result<()> {
-        let tx = self.conn.transaction().await?;
+        let tx = self.begin_transaction().await?;
         let now = chrono::Utc::now().timestamp();
         tx.execute("UPDATE bugs SET lifecycle_status = ?, updated_at = ?, audit_author = ?, audit_tool = ?, audit_model = ? WHERE id = ?",
             libsql::params![status.as_str(), now, self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), id]).await?;
@@ -3180,7 +3311,7 @@ impl Database {
     ) -> Result<bool> {
         let assignee = assignee.map(str::trim).filter(|s| !s.is_empty());
         let now = chrono::Utc::now().timestamp();
-        let tx = self.conn.transaction().await?;
+        let tx = self.begin_transaction().await?;
         let updated = tx
             .execute(
                 "UPDATE bugs
@@ -3525,7 +3656,7 @@ impl Database {
         id: i64,
         subsystems: &[AttributedSubsystem],
     ) -> Result<()> {
-        let tx = self.conn.transaction().await?;
+        let tx = self.begin_transaction().await?;
         self.with_connection((*tx).clone())
             .replace_bug_subsystems(id, subsystems)
             .await?;
@@ -3919,10 +4050,7 @@ impl Database {
 
         for chunk in bugs.chunks(SUB_BATCH_SIZE) {
             let now = chrono::Utc::now().timestamp();
-            let tx = self
-                .conn
-                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
-                .await?;
+            let tx = self.begin_immediate_transaction().await?;
             let tx_db = self.with_connection((*tx).clone());
             for bug in chunk {
                 let updated = tx_db
@@ -3981,10 +4109,7 @@ impl Database {
 
         for chunk in bug_ids.chunks(SUB_BATCH_SIZE) {
             let now = chrono::Utc::now().timestamp();
-            let tx = self
-                .conn
-                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
-                .await?;
+            let tx = self.begin_immediate_transaction().await?;
             for &id in chunk {
                 let updated = tx
                     .execute(
@@ -4038,7 +4163,7 @@ impl Database {
         id: i64,
         params: UpstreamFixCheckParams<'_>,
     ) -> Result<bool> {
-        let tx = self.conn.transaction().await?;
+        let tx = self.begin_transaction().await?;
         // In libsql, Transaction derefs to Connection and Connection::clone()
         // clones an Arc to the same underlying sqlite3 connection handle where
         // tx is active, so all queries in write_upstream_fix_check execute
@@ -5186,16 +5311,6 @@ impl Database {
         Ok(json!(stats))
     }
 
-    pub async fn begin_transaction(&self) -> Result<()> {
-        self.conn.execute("BEGIN IMMEDIATE", ()).await?;
-        Ok(())
-    }
-
-    pub async fn commit_transaction(&self) -> Result<()> {
-        self.conn.execute("COMMIT", ()).await?;
-        Ok(())
-    }
-
     // People & Recipients
     pub async fn ensure_person(&self, name: Option<&str>, email: &str) -> Result<i64> {
         let email = email.trim();
@@ -5491,10 +5606,7 @@ impl Database {
         references_hdr: Option<&str>,
     ) -> Result<()> {
         let compressed_body = crate::compression::compress_string_if_needed(body);
-        let tx = self
-            .conn
-            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
-            .await?;
+        let tx = self.begin_immediate_transaction().await?;
 
         // Check for thread merge (Thread split resolution)
         let old_thread_id = {
@@ -6528,7 +6640,7 @@ impl Database {
 
             // If we have multiple matches, merge others into target_id
             if matches.len() > 1 {
-                let tx = self.conn.transaction().await?;
+                let tx = self.begin_transaction().await?;
                 for merge_from in matches.iter().skip(1) {
                     let merge_from_id = merge_from.id;
                     info!("Merging patchset {} into {}", merge_from_id, target_id);
@@ -6959,10 +7071,7 @@ impl Database {
             // Clone the prepared value before taking the write lock. A large
             // compressed diff should not add memory-copy time to the lock.
             let diff_to_write = compressed_diff.clone();
-            let tx = self
-                .conn
-                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
-                .await?;
+            let tx = self.begin_immediate_transaction().await?;
             match Self::write_patch_transaction(
                 tx,
                 old_patch,
@@ -6983,7 +7092,7 @@ impl Database {
     }
 
     async fn write_patch_transaction(
-        tx: libsql::Transaction,
+        tx: DatabaseTransaction,
         old_patch: Option<StoredPatchState>,
         patchset_id: i64,
         message_id: &str,
@@ -9130,7 +9239,7 @@ impl Database {
             let mut rows = self
                 .conn
                 .query(
-                    "SELECT 1 FROM patchsets WHERE cover_letter_message_id = ? AND status NOT IN ('Failed', 'Cancelled', 'Failed To Apply', 'FailedToApply') LIMIT 1",
+                    "SELECT 1 FROM patchsets WHERE cover_letter_message_id = ? AND status NOT IN ('Cancelled', 'Failed To Apply', 'FailedToApply') LIMIT 1",
                     libsql::params![clid.clone()],
                 )
                 .await?;
@@ -9141,7 +9250,7 @@ impl Database {
             let mut p_rows = self
                 .conn
                 .query(
-                    "SELECT 1 FROM patches p JOIN patchsets ps ON p.patchset_id = ps.id WHERE p.message_id = ? AND ps.status NOT IN ('Failed', 'Cancelled', 'Failed To Apply', 'FailedToApply') LIMIT 1",
+                    "SELECT 1 FROM patches p JOIN patchsets ps ON p.patchset_id = ps.id WHERE p.message_id = ? AND ps.status NOT IN ('Cancelled', 'Failed To Apply', 'FailedToApply') LIMIT 1",
                     libsql::params![clid.clone()],
                 )
                 .await?;
@@ -9403,10 +9512,7 @@ impl Database {
     }
 
     pub async fn lock_pending_email(&self) -> Result<Option<EmailOutboxRow>> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
-            .await?;
+        let tx = self.begin_immediate_transaction().await?;
         tx.execute(
             "UPDATE email_outbox
              SET status = 'Cancelled',
@@ -9422,14 +9528,13 @@ impl Database {
         )
         .await?;
 
-        let now = chrono::Utc::now().timestamp();
         let claimed = {
             let mut rows = tx.query(
                 "UPDATE email_outbox 
                  SET status = 'Sending', locked_at = ? 
                  WHERE id = (SELECT id FROM email_outbox WHERE status = 'Pending' LIMIT 1)
                  RETURNING id, patch_id, kind, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, locked_at, error_log, created_at",
-                libsql::params![now]
+                libsql::params![chrono::Utc::now().timestamp()]
             ).await?;
 
             if let Some(row) = rows.next().await? {
@@ -9537,10 +9642,7 @@ impl Database {
     }
 
     pub async fn lock_pending_patchwork(&self) -> Result<Option<PatchworkOutboxRow>> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
-            .await?;
+        let tx = self.begin_immediate_transaction().await?;
         tx.execute(
             "UPDATE patchwork_outbox
              SET status = 'Cancelled',
@@ -9740,10 +9842,7 @@ impl Database {
     }
 
     pub async fn lock_pending_forge_outbox(&self) -> Result<Option<ForgeOutboxRow>> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
-            .await?;
+        let tx = self.begin_immediate_transaction().await?;
         tx.execute(
             "UPDATE forge_outbox
              SET status = 'Cancelled',
@@ -16050,7 +16149,7 @@ mod tests {
 
     /// Runs the repair exactly as migration 6 does, until it settles.
     async fn run_borrowed_name_repair(db: &Database) {
-        let tx = db.conn.transaction().await.unwrap();
+        let tx = db.begin_transaction().await.unwrap();
         Database::repair_borrowed_series_names(&tx).await.unwrap();
         tx.commit().await.unwrap();
     }
@@ -21699,6 +21798,198 @@ mod tests {
             row.get::<i64>(0).unwrap(),
             0,
             "migration 10 must not re-execute 009_patchset_maintainer_sections.sql"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_transactions_do_not_collide() {
+        let db = Arc::new(setup_db().await);
+        let mut handles = Vec::new();
+
+        for i in 0..24 {
+            let db_clone = db.clone();
+            handles.push(tokio::spawn(async move {
+                let root_msg_id = format!("git-commit-{i:04}");
+                db_clone
+                    .create_fetching_patchset(
+                        &root_msg_id,
+                        "(placeholder)",
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("create_fetching_patchset failed under concurrency");
+
+                let tid = db_clone
+                    .ensure_thread_for_message(&root_msg_id, 1700000000 + i)
+                    .await
+                    .expect("ensure_thread_for_message failed under concurrency");
+
+                db_clone
+                    .create_message_with_references(
+                        &root_msg_id,
+                        tid,
+                        None,
+                        "Author <author@example.com>",
+                        &format!("[PATCH] subject {i}"),
+                        1700000000 + i,
+                        "commit body",
+                        "",
+                        "",
+                        None,
+                        Some("git"),
+                        None,
+                    )
+                    .await
+                    .expect("create_message_with_references failed under concurrency");
+
+                let ps_id = db_clone
+                    .create_patchset(
+                        tid,
+                        Some(&root_msg_id),
+                        &root_msg_id,
+                        &format!("[PATCH] subject {i}"),
+                        "Author <author@example.com>",
+                        1700000000 + i,
+                        1,
+                        1,
+                        "",
+                        "",
+                        None,
+                        1,
+                        None,
+                        false,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("create_patchset failed under concurrency")
+                    .expect("expected patchset id");
+
+                db_clone
+                    .create_patch_with_git_patch_id(
+                        ps_id,
+                        &root_msg_id,
+                        1,
+                        "diff --git a/foo.c b/foo.c\n",
+                        None,
+                    )
+                    .await
+                    .expect("create_patch_with_git_patch_id failed under concurrency");
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM patchsets WHERE status = 'Pending'",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), 24);
+    }
+
+    #[tokio::test]
+    async fn test_transaction_commit_with_open_read_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cursor_isolation.db");
+        let settings = DatabaseSettings {
+            url: db_path.to_string_lossy().to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        for i in 0..5 {
+            db.conn
+                .execute(
+                    "INSERT INTO email_outbox (kind, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, created_at)
+                     VALUES ('review_notification', 'Pending', '[\"user@example.com\"]', '[]', ?, ?, '', 'body', 1700000000)",
+                    libsql::params![format!("Subject {i}"), format!("<msg-{i}>")],
+                )
+                .await
+                .unwrap();
+        }
+
+        // Hold an active stepped read cursor open on `db.conn` across `.await`
+        // while `lock_pending_email` opens and commits a write transaction on
+        // `db.tx_conn`.
+        let mut cursor = db
+            .conn
+            .query("SELECT id FROM email_outbox ORDER BY id ASC", ())
+            .await
+            .unwrap();
+        let first = cursor.next().await.unwrap();
+        assert!(first.is_some());
+
+        let claimed = db
+            .lock_pending_email()
+            .await
+            .expect("lock_pending_email must not fail while a read cursor is open on conn");
+        assert!(claimed.is_some());
+
+        let second = cursor.next().await.unwrap();
+        assert!(second.is_some());
+    }
+
+    fn collect_rust_sources(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+        let entries = std::fs::read_dir(dir).expect("readable source directory");
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rust_sources(&path, found);
+            } else if path.extension() == Some(std::ffi::OsStr::new("rs")) {
+                found.push(path);
+            }
+        }
+    }
+
+    /// Every explicit SQLite transaction must go through `Database::begin_transaction`
+    /// or `Database::begin_immediate_transaction` on `tx_conn` under `tx_lock`.
+    #[test]
+    fn test_no_unserialized_database_transactions() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        for dir in ["src", "tests"] {
+            let root = manifest_dir.join(dir);
+            collect_rust_sources(&root, &mut files);
+        }
+        assert!(!files.is_empty(), "no sources found under {manifest_dir:?}");
+
+        let forbidden = [
+            concat!(".conn", ".transaction("),
+            concat!(".conn", ".transaction_with_behavior("),
+            concat!(".execute(\"BEGIN", " IMMEDIATE"),
+            concat!(".execute(\"BEGIN", " TRANSACTION"),
+        ];
+
+        let mut offenders = Vec::new();
+        for path in files {
+            let content = std::fs::read_to_string(&path).expect("readable source file");
+            for pattern in forbidden {
+                if content.contains(pattern) {
+                    offenders.push(format!("{} (contains `{pattern}`)", path.display()));
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "Unserialized database transactions detected. Always use \
+             Database::begin_transaction or Database::begin_immediate_transaction \
+             instead of opening transactions on conn or running raw BEGIN statements. \
+             Offenders: {}",
+            offenders.join(", ")
         );
     }
 }

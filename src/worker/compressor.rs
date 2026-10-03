@@ -92,11 +92,10 @@ async fn compress_messages(db: &Database, limit: i32) -> Result<usize> {
     })
     .await?;
 
-    db.begin_transaction().await?;
+    let tx = db.begin_immediate_transaction().await?;
     let mut success = true;
     for (id, val) in compressed {
-        if let Err(e) = db
-            .conn
+        if let Err(e) = tx
             .execute(
                 "UPDATE messages SET body = ? WHERE id = ?",
                 libsql::params![val, id],
@@ -109,9 +108,9 @@ async fn compress_messages(db: &Database, limit: i32) -> Result<usize> {
         }
     }
     if success {
-        db.commit_transaction().await?;
+        tx.commit().await?;
     } else {
-        let _ = db.conn.execute("ROLLBACK", ()).await;
+        let _ = tx.rollback().await;
     }
     Ok(count)
 }
@@ -142,11 +141,10 @@ async fn compress_patches(db: &Database, limit: i32) -> Result<usize> {
     })
     .await?;
 
-    db.begin_transaction().await?;
+    let tx = db.begin_immediate_transaction().await?;
     let mut success = true;
     for (id, val) in compressed {
-        if let Err(e) = db
-            .conn
+        if let Err(e) = tx
             .execute(
                 "UPDATE patches SET diff = ? WHERE id = ?",
                 libsql::params![val, id],
@@ -159,9 +157,9 @@ async fn compress_patches(db: &Database, limit: i32) -> Result<usize> {
         }
     }
     if success {
-        db.commit_transaction().await?;
+        tx.commit().await?;
     } else {
-        let _ = db.conn.execute("ROLLBACK", ()).await;
+        let _ = tx.rollback().await;
     }
     Ok(count)
 }
@@ -192,11 +190,10 @@ async fn compress_patchsets(db: &Database, limit: i32) -> Result<usize> {
     })
     .await?;
 
-    db.begin_transaction().await?;
+    let tx = db.begin_immediate_transaction().await?;
     let mut success = true;
     for (id, val) in compressed {
-        if let Err(e) = db
-            .conn
+        if let Err(e) = tx
             .execute(
                 "UPDATE patchsets SET baseline_logs = ? WHERE id = ?",
                 libsql::params![val, id],
@@ -209,9 +206,9 @@ async fn compress_patchsets(db: &Database, limit: i32) -> Result<usize> {
         }
     }
     if success {
-        db.commit_transaction().await?;
+        tx.commit().await?;
     } else {
-        let _ = db.conn.execute("ROLLBACK", ()).await;
+        let _ = tx.rollback().await;
     }
     Ok(count)
 }
@@ -242,11 +239,10 @@ async fn compress_reviews(db: &Database, limit: i32) -> Result<usize> {
         })
         .await?;
 
-        db.begin_transaction().await?;
+        let tx = db.begin_immediate_transaction().await?;
         let mut success = true;
         for (id, val) in compressed {
-            if let Err(e) = db
-                .conn
+            if let Err(e) = tx
                 .execute(
                     "UPDATE reviews SET logs = ? WHERE id = ?",
                     libsql::params![val, id],
@@ -259,9 +255,9 @@ async fn compress_reviews(db: &Database, limit: i32) -> Result<usize> {
             }
         }
         if success {
-            db.commit_transaction().await?;
+            tx.commit().await?;
         } else {
-            let _ = db.conn.execute("ROLLBACK", ()).await;
+            let _ = tx.rollback().await;
         }
     }
 
@@ -288,11 +284,10 @@ async fn compress_reviews(db: &Database, limit: i32) -> Result<usize> {
         })
         .await?;
 
-        db.begin_transaction().await?;
+        let tx = db.begin_immediate_transaction().await?;
         let mut success = true;
         for (id, val) in compressed {
-            if let Err(e) = db
-                .conn
+            if let Err(e) = tx
                 .execute(
                     "UPDATE reviews SET inline_review = ? WHERE id = ?",
                     libsql::params![val, id],
@@ -305,9 +300,9 @@ async fn compress_reviews(db: &Database, limit: i32) -> Result<usize> {
             }
         }
         if success {
-            db.commit_transaction().await?;
+            tx.commit().await?;
         } else {
-            let _ = db.conn.execute("ROLLBACK", ()).await;
+            let _ = tx.rollback().await;
         }
     }
 
@@ -351,11 +346,10 @@ async fn compress_ai_interactions(db: &Database, limit: i32) -> Result<usize> {
     })
     .await?;
 
-    db.begin_transaction().await?;
+    let tx = db.begin_immediate_transaction().await?;
     let mut success = true;
     for (id, new_input, new_output) in compressed {
-        if let Err(e) = db
-            .conn
+        if let Err(e) = tx
             .execute(
                 "UPDATE ai_interactions SET input_context = ?, output_raw = ? WHERE id = ?",
                 libsql::params![new_input, new_output, id],
@@ -368,9 +362,9 @@ async fn compress_ai_interactions(db: &Database, limit: i32) -> Result<usize> {
         }
     }
     if success {
-        db.commit_transaction().await?;
+        tx.commit().await?;
     } else {
-        let _ = db.conn.execute("ROLLBACK", ()).await;
+        let _ = tx.rollback().await;
     }
 
     Ok(count)
