@@ -941,24 +941,57 @@ async fn run_daemon(
 
     // Start Ingestor (feeds raw_tx)
     let ingestor_handle = if should_start_nntp_ingestor(&settings) {
-        let ingestor = Ingestor::new(
-            settings.clone(),
-            db.clone(),
-            raw_tx.clone(),
-            cli.download,
-            cli.track,
-        );
-        tokio::spawn(async move {
-            if let Err(e) = ingestor.run().await {
-                error!("Ingestor fatal error: {}", e);
-            }
-        })
+        if cli.track {
+            let ingestor_settings = settings.clone();
+            let ingestor_db = db.clone();
+            let ingestor_tx = raw_tx.clone();
+            let initial_download = cli.download;
+            let first_run = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            spawn_supervised_worker("Ingestor", move || {
+                let download = if first_run.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    initial_download
+                } else {
+                    None
+                };
+                let ingestor = Ingestor::new(
+                    ingestor_settings.clone(),
+                    ingestor_db.clone(),
+                    ingestor_tx.clone(),
+                    download,
+                    true,
+                );
+                async move {
+                    if let Err(e) = ingestor.run().await {
+                        error!("Ingestor fatal error: {}", e);
+                    }
+                }
+            })
+        } else {
+            let ingestor = Ingestor::new(
+                settings.clone(),
+                db.clone(),
+                raw_tx.clone(),
+                cli.download,
+                false,
+            );
+            tokio::spawn(async move {
+                if let Err(e) = ingestor.run().await {
+                    error!("Ingestor fatal error: {}", e);
+                }
+            })
+        }
     } else {
         info!("Lore/NNTP ingestor is disabled (no NNTP config or disabled by forge).");
         tokio::spawn(async move {
             std::future::pending::<()>().await;
         })
     };
+
+    let email_worker_heartbeat = settings.smtp.as_ref().map(|_| {
+        Arc::new(std::sync::atomic::AtomicI64::new(
+            chrono::Utc::now().timestamp(),
+        ))
+    });
 
     // Start Web API
     let api_settings = Arc::new(settings.clone());
@@ -972,6 +1005,7 @@ async fn run_daemon(
         smtp_enabled: settings.smtp.is_some(),
         dry_run: settings.smtp.as_ref().map(|s| s.dry_run).unwrap_or(false),
         local_token,
+        email_worker_heartbeat: email_worker_heartbeat.clone(),
     };
     let api_handle = tokio::spawn(async move {
         if let Err(e) =
@@ -984,14 +1018,21 @@ async fn run_daemon(
 
     // Start Email Worker
     let email_handle = if let Some(smtp_settings) = settings.smtp.clone() {
-        let email_worker = sashiko::worker::email::EmailWorker::new(
+        let mut email_worker = sashiko::worker::email::EmailWorker::new(
             db.clone(),
             smtp_settings,
             settings.server.log_sign_in_links,
         );
+        if let Some(hb) = email_worker_heartbeat {
+            email_worker = email_worker.with_heartbeat(hb);
+        }
+        let email_worker = Arc::new(email_worker);
 
-        Some(tokio::spawn(async move {
-            email_worker.run().await;
+        Some(spawn_supervised_worker("EmailWorker", move || {
+            let worker = Arc::clone(&email_worker);
+            async move {
+                worker.run().await;
+            }
         }))
     } else {
         None
@@ -1001,24 +1042,30 @@ async fn run_daemon(
     let patchwork_handle = {
         let pw_policy_path = settings.review.email_policy_path.clone();
         let pw_max_retries = settings.review.max_retries;
-        let patchwork_worker = sashiko::worker::patchwork::PatchworkWorker::new(
+        let patchwork_worker = Arc::new(sashiko::worker::patchwork::PatchworkWorker::new(
             db.clone(),
             pw_policy_path,
             pw_max_retries,
-        );
-        tokio::spawn(async move {
-            patchwork_worker.run().await;
+        ));
+        spawn_supervised_worker("PatchworkWorker", move || {
+            let worker = Arc::clone(&patchwork_worker);
+            async move {
+                worker.run().await;
+            }
         })
     };
 
     let forge_handle = if settings.forge.enabled {
-        let forge_worker = sashiko::worker::forge::ForgeWorker::new(
+        let forge_worker = Arc::new(sashiko::worker::forge::ForgeWorker::new(
             db.clone(),
             settings.forge.clone(),
             settings.review.max_retries,
-        );
-        Some(tokio::spawn(async move {
-            forge_worker.run().await;
+        ));
+        Some(spawn_supervised_worker("ForgeWorker", move || {
+            let worker = Arc::clone(&forge_worker);
+            async move {
+                worker.run().await;
+            }
         }))
     } else {
         None
@@ -1027,15 +1074,20 @@ async fn run_daemon(
     let bug_worker_handle = if settings.linux_bug.enabled {
         let provider =
             sashiko::ai::create_provider(&settings).expect("Provider setup failed for bug worker");
-        let bug_worker = sashiko::worker::bug_worker::BugWorker::new(
-            db.clone(),
-            provider,
-            settings.git.repository_path.clone(),
-        )
-        .with_project(project)
-        .with_settings(settings.linux_bug.clone());
-        Some(tokio::spawn(async move {
-            bug_worker.run().await;
+        let bug_worker = Arc::new(
+            sashiko::worker::bug_worker::BugWorker::new(
+                db.clone(),
+                provider,
+                settings.git.repository_path.clone(),
+            )
+            .with_project(project)
+            .with_settings(settings.linux_bug.clone()),
+        );
+        Some(spawn_supervised_worker("BugWorker", move || {
+            let worker = Arc::clone(&bug_worker);
+            async move {
+                worker.run().await;
+            }
         }))
     } else {
         info!("Bug worker disabled via settings (linux_bug.enabled = false).");
@@ -1043,7 +1095,13 @@ async fn run_daemon(
     };
     // Initialize custom remotes
     // Start Background Compressor Worker
-    let compressor_handle = tokio::spawn(sashiko::worker::compressor::run_compressor(db.clone()));
+    let compressor_db = db.clone();
+    let compressor_handle = spawn_supervised_worker("Compressor", move || {
+        let db = Arc::clone(&compressor_db);
+        async move {
+            sashiko::worker::compressor::run_compressor(db).await;
+        }
+    });
     let repo_path = std::path::PathBuf::from(&settings.git.repository_path);
 
     // Clean up stale worktree directories on disk first
@@ -1104,47 +1162,62 @@ async fn run_daemon(
 
     // Start Git Sync Worker
     let sync_handle = {
-        let sync_worker = sashiko::worker::sync::GitSyncWorker::new(repo_path.clone());
-        tokio::spawn(async move {
-            sync_worker.run().await;
+        let sync_worker = Arc::new(sashiko::worker::sync::GitSyncWorker::new(repo_path.clone()));
+        spawn_supervised_worker("GitSyncWorker", move || {
+            let worker = Arc::clone(&sync_worker);
+            async move {
+                worker.run().await;
+            }
         })
     };
 
     // Start Repack Worker
     let repack_handle = {
-        let repack_worker = sashiko::worker::repack::RepackWorker::new(repo_path.clone());
-        tokio::spawn(async move {
-            repack_worker.run().await;
+        let repack_worker = Arc::new(sashiko::worker::repack::RepackWorker::new(
+            repo_path.clone(),
+        ));
+        spawn_supervised_worker("RepackWorker", move || {
+            let worker = Arc::clone(&repack_worker);
+            async move {
+                worker.run().await;
+            }
         })
     };
 
     // Start Reviewer Service
-    let reviewer = Reviewer::new(db.clone(), settings.clone()).await;
-    let reviewer_handle = tokio::spawn(async move {
-        reviewer.start().await;
+    let reviewer = Arc::new(Reviewer::new(db.clone(), settings.clone()).await);
+    let reviewer_handle = spawn_supervised_worker("Reviewer", move || {
+        let reviewer = Arc::clone(&reviewer);
+        async move {
+            reviewer.start().await;
+        }
     });
 
     let metrics_db = db.clone();
     let metrics_repo_path = repo_path.clone();
-    let metrics_handle = tokio::spawn(async move {
-        loop {
-            if let Ok(pending) = metrics_db.count_pending_patches().await {
-                sashiko::metrics::set_pending_patches(pending);
+    let metrics_handle = spawn_supervised_worker("MetricsWorker", move || {
+        let metrics_db = Arc::clone(&metrics_db);
+        let metrics_repo_path = metrics_repo_path.clone();
+        async move {
+            loop {
+                if let Ok(pending) = metrics_db.count_pending_patches().await {
+                    sashiko::metrics::set_pending_patches(pending);
+                }
+                if let Ok(reviewing) = metrics_db.count_reviewing_patches().await {
+                    sashiko::metrics::set_reviewing_patches(reviewing);
+                }
+                if let Ok(messages) = metrics_db.count_messages(None, None).await {
+                    sashiko::metrics::set_messages(messages);
+                }
+                if let Ok(patchsets) = metrics_db.count_patchsets(None, None).await {
+                    sashiko::metrics::set_patchsets(patchsets);
+                }
+                match sashiko::git_ops::pack_stats(&metrics_repo_path).await {
+                    Ok((packs, bytes)) => sashiko::metrics::set_repo_packs(packs, bytes),
+                    Err(e) => warn!("Failed to count packs in the review repository: {}", e),
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
             }
-            if let Ok(reviewing) = metrics_db.count_reviewing_patches().await {
-                sashiko::metrics::set_reviewing_patches(reviewing);
-            }
-            if let Ok(messages) = metrics_db.count_messages(None, None).await {
-                sashiko::metrics::set_messages(messages);
-            }
-            if let Ok(patchsets) = metrics_db.count_patchsets(None, None).await {
-                sashiko::metrics::set_patchsets(patchsets);
-            }
-            match sashiko::git_ops::pack_stats(&metrics_repo_path).await {
-                Ok((packs, bytes)) => sashiko::metrics::set_repo_packs(packs, bytes),
-                Err(e) => warn!("Failed to count packs in the review repository: {}", e),
-            }
-            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
         }
     });
 
@@ -1202,6 +1275,61 @@ async fn run_daemon(
 
     info!("Shutdown complete.");
     std::process::exit(0);
+}
+
+#[cfg(feature = "server")]
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+#[cfg(feature = "server")]
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[cfg(feature = "server")]
+fn spawn_supervised_worker<F, Fut>(name: &'static str, make_fut: F) -> tokio::task::JoinHandle<()>
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    spawn_supervised_worker_with_backoff(name, tokio::time::Duration::from_secs(5), make_fut)
+}
+
+#[cfg(feature = "server")]
+fn spawn_supervised_worker_with_backoff<F, Fut>(
+    name: &'static str,
+    backoff: tokio::time::Duration,
+    mut make_fut: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        loop {
+            let handle = tokio::spawn(make_fut());
+            let _abort_guard = AbortOnDrop(handle.abort_handle());
+            match handle.await {
+                Ok(()) => {
+                    warn!(
+                        "{name} exited unexpectedly; restarting in {}ms...",
+                        backoff.as_millis()
+                    );
+                }
+                Err(join_err) if join_err.is_cancelled() => {
+                    break;
+                }
+                Err(join_err) => {
+                    error!(
+                        "{name} panicked ({join_err}); restarting in {}ms...",
+                        backoff.as_millis()
+                    );
+                }
+            }
+            tokio::time::sleep(backoff).await;
+        }
+    })
 }
 
 /// Publishes the credential local tooling presents to this process.
@@ -4821,5 +4949,41 @@ mod tests {
             ),
             "!502: Fix MR display prefix"
         );
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn test_spawn_supervised_worker_restarts_after_panic() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let done_tx = Arc::new(std::sync::Mutex::new(Some(done_tx)));
+
+        let attempts_clone = Arc::clone(&attempts);
+        let done_tx_clone = Arc::clone(&done_tx);
+        let supervisor = spawn_supervised_worker_with_backoff(
+            "TestWorker",
+            tokio::time::Duration::from_millis(10),
+            move || {
+                let attempts = Arc::clone(&attempts_clone);
+                let done_tx = Arc::clone(&done_tx_clone);
+                async move {
+                    let run = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if run == 0 {
+                        panic!("simulated worker panic");
+                    }
+                    if let Some(tx) = done_tx.lock().unwrap().take() {
+                        let _ = tx.send(run);
+                    }
+                    std::future::pending::<()>().await;
+                }
+            },
+        );
+
+        let recovered_run = tokio::time::timeout(tokio::time::Duration::from_secs(2), done_rx)
+            .await
+            .expect("supervised worker did not restart in time")
+            .unwrap();
+        assert_eq!(recovered_run, 1);
+        supervisor.abort();
     }
 }

@@ -113,6 +113,7 @@ pub struct Reviewer {
     baseline_registry: Arc<BaselineRegistry>,
     quota_manager: Arc<QuotaManager>,
     provider: Arc<dyn AiProvider>,
+    initialized: std::sync::atomic::AtomicBool,
 }
 
 impl Reviewer {
@@ -157,6 +158,7 @@ impl Reviewer {
             baseline_registry,
             quota_manager: Arc::new(QuotaManager::new()),
             provider,
+            initialized: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -176,28 +178,42 @@ impl Reviewer {
             );
         }
 
-        // Ensure Context Cache
-        let worktree_dir = PathBuf::from(&self.settings.review.worktree_dir);
-        if worktree_dir.exists() {
-            info!(
-                "Cleaning up previous worktree directory: {:?}",
-                worktree_dir
-            );
-            if let Err(e) = std::fs::remove_dir_all(&worktree_dir) {
-                error!("Failed to cleanup worktree directory: {}", e);
-            }
-        }
-        if let Err(e) = std::fs::create_dir_all(&worktree_dir) {
-            error!("Failed to create worktree directory: {}", e);
-        }
-
-        match self.db.reset_reviewing_status().await {
-            Ok(count) => {
-                if count > 0 {
-                    info!("Recovered {} interrupted reviews (reset to Pending)", count);
+        // Only wipe previous worktrees and reset in-flight review statuses on
+        // the initial daemon startup. If `Reviewer::start` is restarted by the
+        // worker supervisor after a panic, detached review tasks spawned before
+        // the panic may still be using their worktrees under `worktree_dir`.
+        if !self
+            .initialized
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let worktree_dir = PathBuf::from(&self.settings.review.worktree_dir);
+            if let Err(e) = tokio::task::spawn_blocking(move || {
+                if worktree_dir.exists() {
+                    info!(
+                        "Cleaning up previous worktree directory: {:?}",
+                        worktree_dir
+                    );
+                    if let Err(e) = std::fs::remove_dir_all(&worktree_dir) {
+                        error!("Failed to cleanup worktree directory: {}", e);
+                    }
                 }
+                if let Err(e) = std::fs::create_dir_all(&worktree_dir) {
+                    error!("Failed to create worktree directory: {}", e);
+                }
+            })
+            .await
+            {
+                error!("Worktree directory initialization task failed: {}", e);
             }
-            Err(e) => error!("Failed to reset reviewing status: {}", e),
+
+            match self.db.reset_reviewing_status().await {
+                Ok(count) => {
+                    if count > 0 {
+                        info!("Recovered {} interrupted reviews (reset to Pending)", count);
+                    }
+                }
+                Err(e) => error!("Failed to reset reviewing status: {}", e),
+            }
         }
 
         loop {

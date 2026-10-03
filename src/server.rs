@@ -233,6 +233,8 @@ pub struct ServerOptions {
     /// Absent when the token could not be written, in which case local tools
     /// authenticate the same way anyone else does.
     pub local_token: Option<crate::auth::LocalToken>,
+    /// Shared UNIX timestamp updated on each iteration of `EmailWorker::run`.
+    pub email_worker_heartbeat: Option<Arc<std::sync::atomic::AtomicI64>>,
 }
 
 pub struct AppState {
@@ -246,6 +248,7 @@ pub struct AppState {
     pub smtp_enabled: bool,
     pub dry_run: bool,
     pub local_token: Option<crate::auth::LocalToken>,
+    pub email_worker_heartbeat: Option<Arc<std::sync::atomic::AtomicI64>>,
     pub sign_in_link_rate_limiter: SignInLinkRateLimiter,
     stats_timeline_cache: AsyncMapCache<Option<i64>, serde_json::Value>,
     stats_reviews_cache: AsyncCache<serde_json::Value>,
@@ -298,6 +301,7 @@ pub fn build_router(
         smtp_enabled: options.smtp_enabled,
         dry_run: options.dry_run,
         local_token: options.local_token,
+        email_worker_heartbeat: options.email_worker_heartbeat,
         sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
         stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
         stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
@@ -311,6 +315,7 @@ pub fn build_router(
 
     Router::new()
         .route("/health", get(health_check))
+        .route("/api/health", get(health_check))
         .route("/api/config", get(get_config))
         .route("/api/lists", get(list_mailing_lists))
         .route("/api/patchsets", get(list_patchsets))
@@ -1667,7 +1672,20 @@ async fn rerun_patch(
     Ok(Json(serde_json::json!({ "status": "accepted" })))
 }
 
-async fn health_check() -> StatusCode {
+const EMAIL_WORKER_STALE_SECONDS: i64 = 300;
+
+async fn health_check(State(state): State<Arc<AppState>>) -> StatusCode {
+    if let Some(hb) = &state.email_worker_heartbeat {
+        let last = hb.load(std::sync::atomic::Ordering::Relaxed);
+        let now = chrono::Utc::now().timestamp();
+        if last > 0 && now.saturating_sub(last) > EMAIL_WORKER_STALE_SECONDS {
+            error!(
+                "Health check failed: EmailWorker heartbeat is stale ({}s old)",
+                now.saturating_sub(last)
+            );
+            return StatusCode::SERVICE_UNAVAILABLE;
+        }
+    }
     StatusCode::OK
 }
 
@@ -3377,6 +3395,7 @@ mod tests {
             smtp_enabled: false,
             dry_run: true,
             local_token: None,
+            email_worker_heartbeat: None,
             sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
             stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
             stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
@@ -3770,6 +3789,7 @@ mod tests {
                 smtp_enabled: false,
                 dry_run: true,
                 local_token: None,
+                email_worker_heartbeat: None,
                 sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
                 stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
                 stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
@@ -3836,6 +3856,7 @@ mod tests {
                 smtp_enabled: false,
                 dry_run: true,
                 local_token,
+                email_worker_heartbeat: None,
                 sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
                 stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
                 stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
@@ -3978,6 +3999,7 @@ mod tests {
             messages_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
             bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
             local_token: None,
+            email_worker_heartbeat: None,
         });
         let index = crate::maintainers::MaintainersIndex::from_reader(
             b"Maintainers List\n================\n\nSECTION A\nM:\tAlice <a@example.org>\nF:\ta/\n\nSECTION B\nM:\tBob <b@example.org>\nF:\tb/\n".as_slice()
@@ -4276,6 +4298,57 @@ F:	net/
             &acl,
             Some(&index)
         ));
+    }
+
+    #[tokio::test]
+    async fn test_health_check_email_worker_heartbeat() {
+        let mut settings = crate::settings::Settings::new().unwrap();
+        settings.database.url = ":memory:".to_string();
+        let db = Arc::new(Database::new(&settings.database).await.unwrap());
+        db.migrate().await.unwrap();
+        let settings = Arc::new(settings);
+
+        let now = chrono::Utc::now().timestamp();
+        let hb = Arc::new(std::sync::atomic::AtomicI64::new(now));
+
+        let (event_tx, _event_rx) = mpsc::channel(10);
+        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
+        let app = build_router(
+            settings,
+            db,
+            event_tx,
+            fetch_tx,
+            ServerOptions {
+                smtp_enabled: true,
+                email_worker_heartbeat: Some(hb.clone()),
+                ..Default::default()
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let health_url = format!("http://{}/health", addr);
+
+        // Fresh heartbeat -> 200 OK
+        let resp = client.get(&health_url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Stale heartbeat (> 300s old) -> 503 SERVICE_UNAVAILABLE
+        hb.store(
+            now - EMAIL_WORKER_STALE_SECONDS - 10,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let resp = client.get(&health_url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
 

@@ -2,21 +2,27 @@ use crate::settings::SmtpSettings;
 use lettre::message::header::ContentType;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
+const SMTP_SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
+const SMTP_SEND_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub struct EmailWorker {
-    db: std::sync::Arc<crate::db::Database>,
+    db: Arc<crate::db::Database>,
     settings: SmtpSettings,
     /// Mirrors server.log_sign_in_links, so that the one switch governs every
     /// place a link could reach the log.
     log_sign_in_links: bool,
+    heartbeat: Option<Arc<AtomicI64>>,
 }
 
 impl EmailWorker {
     pub fn new(
-        db: std::sync::Arc<crate::db::Database>,
+        db: Arc<crate::db::Database>,
         settings: SmtpSettings,
         log_sign_in_links: bool,
     ) -> Self {
@@ -24,6 +30,18 @@ impl EmailWorker {
             db,
             settings,
             log_sign_in_links,
+            heartbeat: None,
+        }
+    }
+
+    pub fn with_heartbeat(mut self, heartbeat: Arc<AtomicI64>) -> Self {
+        self.heartbeat = Some(heartbeat);
+        self
+    }
+
+    fn record_heartbeat(&self) {
+        if let Some(hb) = &self.heartbeat {
+            hb.store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
         }
     }
 
@@ -44,7 +62,19 @@ impl EmailWorker {
                         email.id,
                         email.patch_id
                     );
-                    match self.send_email(&email).await {
+                    let send_result = match tokio::time::timeout(
+                        SMTP_SEND_TIMEOUT,
+                        self.send_email(&email),
+                    )
+                    .await
+                    {
+                        Ok(res) => res,
+                        Err(_) => Err(anyhow::anyhow!(
+                            "SMTP delivery timed out after {}s",
+                            SMTP_SEND_TIMEOUT.as_secs()
+                        )),
+                    };
+                    match send_result {
                         Ok(_) => {
                             info!("Successfully sent email ID {}", email.id);
                             if let Err(e) = self.db.mark_email_sent(email.id).await {
@@ -60,8 +90,10 @@ impl EmailWorker {
                             }
                         }
                     }
+                    self.record_heartbeat();
                 }
                 Ok(None) => {
+                    self.record_heartbeat();
                     // No pending emails, sleep
                     sleep(Duration::from_secs(5)).await;
                 }
@@ -151,7 +183,8 @@ impl EmailWorker {
 
         let mut mailer_builder =
             AsyncSmtpTransport::<Tokio1Executor>::relay(&self.settings.server)?
-                .port(self.settings.port);
+                .port(self.settings.port)
+                .timeout(Some(SMTP_SOCKET_TIMEOUT));
 
         if let (Some(user), Some(pass)) = (&self.settings.username, &self.settings.password) {
             let creds = Credentials::new(user.to_string(), pass.to_string());
