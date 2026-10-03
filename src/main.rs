@@ -471,6 +471,13 @@ async fn run_daemon(
     let db = Arc::new(Database::new(&settings.database).await?);
     db.migrate().await?;
     db.ensure_project_stamp(project).await?;
+    match db.fail_interrupted_fetching_patchsets().await {
+        Ok(count) if count > 0 => {
+            info!("Marked {} interrupted Fetching patchsets as Failed", count);
+        }
+        Ok(_) => {}
+        Err(e) => error!("Failed to clean up interrupted Fetching patchsets: {}", e),
+    }
 
     // Load and initialize authoritative immutable MAINTAINERS index when the
     // reviewed project uses kernel MAINTAINERS.
@@ -2675,6 +2682,16 @@ enum ProcessStatus {
 }
 
 #[cfg(feature = "server")]
+async fn fail_fetching_patchset_logged(worker_db: &Database, root_msg_id: &str, err_msg: &str) {
+    if let Err(e) = worker_db.fail_fetching_patchset(root_msg_id, err_msg).await {
+        error!(
+            "Failed to mark fetching patchset {} as Failed: {}",
+            root_msg_id, e
+        );
+    }
+}
+
+#[cfg(feature = "server")]
 async fn process_parsed_article(
     worker_db: &Database,
     article: ParsedArticle,
@@ -2700,7 +2717,7 @@ async fn process_parsed_article(
         receipt: _,
     } = article;
 
-    let root_msg_id = resolve_root_msg_id(source, &article_id);
+    let mut root_msg_id = resolve_root_msg_id(source, &article_id);
 
     // Handle ingestion failure
     if let Some(err) = failed_error {
@@ -2714,10 +2731,12 @@ async fn process_parsed_article(
     let mut metadata = match metadata {
         Some(m) => m,
         None => {
-            error!(
+            let err_msg = format!(
                 "Missing metadata for article {} (group: {})",
                 article_id, group
             );
+            error!("{}", err_msg);
+            fail_fetching_patchset_logged(worker_db, &root_msg_id, &err_msg).await;
             return ProcessStatus::Error;
         }
     };
@@ -2762,67 +2781,79 @@ async fn process_parsed_article(
     };
 
     // 1. Thread Resolution
-    let (thread_id, is_git_import, git_import_total) =
-        if let Some(rest) = group.strip_prefix("git-import:") {
-            // format is "count:range"
-            let parts: Vec<&str> = rest.splitn(2, ':').collect();
-            let (total_count, range) = if parts.len() == 2 {
-                (parts[0].parse::<u32>().unwrap_or(0), parts[1])
-            } else {
-                (0, rest)
-            };
-
-            let safe_range = range.replace(['/', ':', ' ', '.'], "_");
-            let root_msg_id = format!("git-import-{}@sashiko.local", safe_range);
-            match worker_db
-                .ensure_thread_for_message(&root_msg_id, metadata.date)
-                .await
-            {
-                Ok(tid) => (tid, true, total_count),
-                Err(e) => {
-                    error!("Failed to ensure thread for git import {}: {}", range, e);
-                    return ProcessStatus::Error;
-                }
-            }
-        } else if group == "git-fetch" || group == "api-submit" {
-            // Group these by article_id (which is the range or single SHA/local_id)
-            // For singletons, the message itself is the root.
-            match worker_db
-                .ensure_thread_for_message(&root_msg_id, metadata.date)
-                .await
-            {
-                Ok(tid) => (tid, false, 0),
-                Err(e) => {
-                    error!("Failed to ensure thread for group {}: {}", group, e);
-                    return ProcessStatus::Error;
-                }
-            }
-        } else if let Some(ref reply_to) = metadata.in_reply_to {
-            match worker_db
-                .ensure_thread_for_message(reply_to, metadata.date)
-                .await
-            {
-                Ok(tid) => (tid, false, 0),
-                Err(e) => {
-                    error!("Failed to ensure thread for parent {}: {}", reply_to, e);
-                    return ProcessStatus::Error;
-                }
-            }
+    let (thread_id, is_git_import, git_import_total) = if let Some(rest) =
+        group.strip_prefix("git-import:")
+    {
+        // format is "count:range"
+        let parts: Vec<&str> = rest.splitn(2, ':').collect();
+        let (total_count, range) = if parts.len() == 2 {
+            (parts[0].parse::<u32>().unwrap_or(0), parts[1])
         } else {
-            match worker_db
-                .ensure_thread_for_message(&metadata.message_id, metadata.date)
-                .await
-            {
-                Ok(tid) => (tid, false, 0),
-                Err(e) => {
-                    error!(
-                        "Failed to ensure thread for self {}: {}",
-                        metadata.message_id, e
-                    );
-                    return ProcessStatus::Error;
-                }
-            }
+            (0, rest)
         };
+
+        let safe_range = range.replace(['/', ':', ' ', '.'], "_");
+        root_msg_id = format!("git-import-{}@sashiko.local", safe_range);
+        match worker_db
+            .ensure_thread_for_message(&root_msg_id, metadata.date)
+            .await
+        {
+            Ok(tid) => (tid, true, total_count),
+            Err(e) => {
+                let err_msg = format!("Failed to ensure thread for git import {}: {}", range, e);
+                error!("{}", err_msg);
+                fail_fetching_patchset_logged(worker_db, &root_msg_id, &err_msg).await;
+                return ProcessStatus::Error;
+            }
+        }
+    } else if group == "git-fetch" || group == "api-submit" {
+        // Group these by article_id (which is the range or single SHA/local_id)
+        // For singletons, the message itself is the root.
+        match worker_db
+            .ensure_thread_for_message(&root_msg_id, metadata.date)
+            .await
+        {
+            Ok(tid) => (tid, false, 0),
+            Err(e) => {
+                let err_msg = format!("Failed to ensure thread for group {}: {}", group, e);
+                error!("{}", err_msg);
+                fail_fetching_patchset_logged(worker_db, &root_msg_id, &err_msg).await;
+                return ProcessStatus::Error;
+            }
+        }
+    } else if let Some(ref reply_to) = metadata.in_reply_to {
+        match worker_db
+            .ensure_thread_for_message(reply_to, metadata.date)
+            .await
+        {
+            Ok(tid) => (tid, false, 0),
+            Err(e) => {
+                let err_msg = format!("Failed to ensure thread for parent {}: {}", reply_to, e);
+                error!("{}", err_msg);
+                fail_fetching_patchset_logged(worker_db, &root_msg_id, &err_msg).await;
+                if reply_to != &root_msg_id {
+                    fail_fetching_patchset_logged(worker_db, reply_to, &err_msg).await;
+                }
+                return ProcessStatus::Error;
+            }
+        }
+    } else {
+        match worker_db
+            .ensure_thread_for_message(&metadata.message_id, metadata.date)
+            .await
+        {
+            Ok(tid) => (tid, false, 0),
+            Err(e) => {
+                let err_msg = format!(
+                    "Failed to ensure thread for self {}: {}",
+                    metadata.message_id, e
+                );
+                error!("{}", err_msg);
+                fail_fetching_patchset_logged(worker_db, &root_msg_id, &err_msg).await;
+                return ProcessStatus::Error;
+            }
+        }
+    };
 
     let is_git_hash = article_id.len() == 40 && article_id.chars().all(|c| c.is_ascii_hexdigit());
     // Only optimize storage (skip body) if it's a bulk git import where we have the archives
@@ -2861,7 +2892,14 @@ async fn process_parsed_article(
         )
         .await
     {
-        error!("Failed to create message: {}", e);
+        let err_msg = format!("Failed to create message: {}", e);
+        error!("{}", err_msg);
+        fail_fetching_patchset_logged(worker_db, &root_msg_id, &err_msg).await;
+        if let Some(ref reply_to) = metadata.in_reply_to
+            && reply_to != &root_msg_id
+        {
+            fail_fetching_patchset_logged(worker_db, reply_to, &err_msg).await;
+        }
         return ProcessStatus::Error;
     }
 
@@ -3171,7 +3209,14 @@ async fn process_parsed_article(
                             }
                         }
                         Err(e) => {
-                            error!("Failed to save patch: {}", e);
+                            let err_msg = format!("Failed to save patch: {}", e);
+                            error!("{}", err_msg);
+                            let target_id = cover_letter_id.as_deref().unwrap_or(&root_msg_id);
+                            fail_fetching_patchset_logged(worker_db, target_id, &err_msg).await;
+                            if target_id != root_msg_id {
+                                fail_fetching_patchset_logged(worker_db, &root_msg_id, &err_msg)
+                                    .await;
+                            }
                             return ProcessStatus::Error;
                         }
                     }
@@ -3184,7 +3229,13 @@ async fn process_parsed_article(
                 ProcessStatus::Ingested
             }
             Err(e) => {
-                error!("Failed to save patchset: {}", e);
+                let err_msg = format!("Failed to save patchset: {}", e);
+                error!("{}", err_msg);
+                let target_id = cover_letter_id.as_deref().unwrap_or(&root_msg_id);
+                fail_fetching_patchset_logged(worker_db, target_id, &err_msg).await;
+                if target_id != root_msg_id {
+                    fail_fetching_patchset_logged(worker_db, &root_msg_id, &err_msg).await;
+                }
                 ProcessStatus::Error
             }
         }

@@ -5918,7 +5918,7 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT cover_letter_message_id, total_parts, subject_index, subject, status FROM patchsets WHERE id = ?",
+                "SELECT cover_letter_message_id, total_parts, subject_index, subject, status, received_parts FROM patchsets WHERE id = ?",
                 libsql::params![patchset_id],
             )
             .await?;
@@ -5930,6 +5930,7 @@ impl Database {
         let existing_subject_index = row.get::<Option<u32>>(2)?.unwrap_or(9999);
         let existing_subject = row.get::<Option<String>>(3)?.unwrap_or_default();
         let existing_status = row.get::<Option<String>>(4)?.unwrap_or_default();
+        let existing_received = row.get::<Option<u32>>(5)?.unwrap_or(0);
 
         if current.as_deref() == Some(identity) {
             return Ok(());
@@ -5963,7 +5964,8 @@ impl Database {
                     Some(curr_idx) => {
                         if !is_own_part_id || part_index == 0 {
                             let is_placeholder = existing_subject == "(placeholder)"
-                                || existing_status == "Fetching";
+                                || existing_status == "Fetching"
+                                || (existing_status == "Failed" && existing_received == 0);
                             if !is_placeholder && existing_total == 1 && existing_subject_index == 1
                             {
                                 let mut m_rows = self
@@ -6277,8 +6279,9 @@ impl Database {
                     }
                 }
 
-                let is_placeholder =
-                    existing_subject == "(placeholder)" || existing_status == "Fetching";
+                let is_placeholder = existing_subject == "(placeholder)"
+                    || existing_status == "Fetching"
+                    || (existing_status == "Failed" && existing_received == 0);
 
                 let existing_version = crate::patch::parse_subject_version(&existing_subject);
                 let same_thread = existing_thread_id == Some(thread_id);
@@ -6385,10 +6388,15 @@ impl Database {
                         .await?;
                 }
 
-                self.conn.execute(
-                    "UPDATE patchsets SET status = 'Incomplete' WHERE id = ? AND status = 'Fetching'",
-                    libsql::params![id],
-                ).await?;
+                self.conn
+                    .execute(
+                        "UPDATE patchsets
+                         SET status = 'Incomplete', failed_reason = NULL
+                         WHERE id = ?
+                           AND (status = 'Fetching' OR (status = 'Failed' AND COALESCE(received_parts, 0) = 0))",
+                        libsql::params![id],
+                    )
+                    .await?;
 
                 self.conn.execute(
                     "UPDATE patchsets SET status = 'Pending' WHERE id = ? AND received_parts >= total_parts AND status IN ('Incomplete', 'Fetching')",
@@ -6613,8 +6621,9 @@ impl Database {
                 && thread_compatible
                 && (!index_collision || is_same_series_redelivery)
             {
-                let is_placeholder =
-                    existing_subject == "(placeholder)" || existing_status == "Fetching";
+                let is_placeholder = existing_subject == "(placeholder)"
+                    || existing_status == "Fetching"
+                    || (existing_status == "Failed" && existing_received == 0);
                 matches.push(CandidateMatch {
                     id,
                     subject: existing_subject,
@@ -6956,10 +6965,15 @@ impl Database {
             )
             .await?;
 
-            self.conn.execute(
-                "UPDATE patchsets SET status = 'Incomplete' WHERE id = ? AND status = 'Fetching'",
-                libsql::params![target_id],
-            ).await?;
+            self.conn
+                .execute(
+                    "UPDATE patchsets
+                     SET status = 'Incomplete', failed_reason = NULL
+                     WHERE id = ?
+                       AND (status = 'Fetching' OR (status = 'Failed' AND COALESCE(received_parts, 0) = 0))",
+                    libsql::params![target_id],
+                )
+                .await?;
 
             self.conn.execute(
                 "UPDATE patchsets SET status = 'Pending' WHERE id = ? AND received_parts >= total_parts AND status IN ('Incomplete', 'Fetching')",
@@ -9239,7 +9253,7 @@ impl Database {
             let mut rows = self
                 .conn
                 .query(
-                    "SELECT 1 FROM patchsets WHERE cover_letter_message_id = ? AND status NOT IN ('Cancelled', 'Failed To Apply', 'FailedToApply') LIMIT 1",
+                    "SELECT 1 FROM patchsets WHERE cover_letter_message_id = ? AND status NOT IN ('Failed', 'Cancelled', 'Failed To Apply', 'FailedToApply') LIMIT 1",
                     libsql::params![clid.clone()],
                 )
                 .await?;
@@ -9250,7 +9264,7 @@ impl Database {
             let mut p_rows = self
                 .conn
                 .query(
-                    "SELECT 1 FROM patches p JOIN patchsets ps ON p.patchset_id = ps.id WHERE p.message_id = ? AND ps.status NOT IN ('Cancelled', 'Failed To Apply', 'FailedToApply') LIMIT 1",
+                    "SELECT 1 FROM patches p JOIN patchsets ps ON p.patchset_id = ps.id WHERE p.message_id = ? AND ps.status NOT IN ('Failed', 'Cancelled', 'Failed To Apply', 'FailedToApply') LIMIT 1",
                     libsql::params![clid.clone()],
                 )
                 .await?;
@@ -9377,6 +9391,37 @@ impl Database {
             }
         }
         Ok(())
+    }
+
+    pub async fn fail_fetching_patchset(&self, root_msg_id: &str, error: &str) -> Result<()> {
+        let candidates = Self::get_msgid_candidates(root_msg_id);
+        for clid in candidates {
+            let res = self
+                .conn
+                .execute(
+                    "UPDATE patchsets SET status = 'Failed', failed_reason = ?
+                     WHERE cover_letter_message_id = ?
+                       AND (status = 'Fetching' OR (status = 'Incomplete' AND COALESCE(received_parts, 0) = 0))",
+                    libsql::params![error, clid],
+                )
+                .await?;
+            if res > 0 {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn fail_interrupted_fetching_patchsets(&self) -> Result<u64> {
+        let count = self
+            .conn
+            .execute(
+                "UPDATE patchsets SET status = 'Failed', failed_reason = 'Interrupted before fetch completed'
+                 WHERE status = 'Fetching' OR (status = 'Incomplete' AND COALESCE(received_parts, 0) = 0)",
+                (),
+            )
+            .await?;
+        Ok(count)
     }
 
     pub async fn update_patchset_baseline_info(
@@ -21897,6 +21942,106 @@ mod tests {
             .unwrap();
         let row = rows.next().await.unwrap().unwrap();
         assert_eq!(row.get::<i64>(0).unwrap(), 24);
+    }
+
+    #[tokio::test]
+    async fn test_fail_fetching_and_interrupted_patchsets() {
+        let db = setup_db().await;
+
+        db.create_fetching_patchset(
+            "msg-fetching-1",
+            "(placeholder)",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_fetching_patchset(
+            "msg-fetching-2",
+            "(placeholder)",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(db.has_patchset_by_msgid("msg-fetching-1").await.unwrap());
+        assert!(db.has_patchset_by_msgid("msg-fetching-2").await.unwrap());
+
+        db.fail_fetching_patchset("msg-fetching-1", "Failed to create message")
+            .await
+            .unwrap();
+
+        assert!(
+            !db.has_patchset_by_msgid("msg-fetching-1").await.unwrap(),
+            "Failed fetching patchset should allow retry via has_patchset_by_msgid"
+        );
+        assert!(db.has_patchset_by_msgid("msg-fetching-2").await.unwrap());
+
+        let cleaned = db.fail_interrupted_fetching_patchsets().await.unwrap();
+        assert_eq!(cleaned, 1);
+        assert!(
+            !db.has_patchset_by_msgid("msg-fetching-2").await.unwrap(),
+            "Interrupted fetching patchset should allow retry after startup cleanup"
+        );
+
+        // Re-ingesting a Failed singleton without calling create_fetching_patchset
+        // (e.g. via NNTP retry) must reopen the patchset and transition it to Pending.
+        let tid = db
+            .ensure_thread_for_message("msg-fetching-1", 1700000100)
+            .await
+            .unwrap();
+        let ps_id = db
+            .create_patchset(
+                tid,
+                Some("msg-fetching-1"),
+                "msg-fetching-1",
+                "[PATCH] retried singleton",
+                "Author <author@example.com>",
+                1700000100,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("expected patchset id");
+        db.create_patch_with_git_patch_id(
+            ps_id,
+            "msg-fetching-1",
+            1,
+            "diff --git a/a.c b/a.c\n",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT status, failed_reason FROM patchsets WHERE id = ?",
+                libsql::params![ps_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "Pending");
+        assert!(row.get::<Option<String>>(1).unwrap().is_none());
     }
 
     #[tokio::test]
