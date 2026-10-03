@@ -1246,6 +1246,8 @@ pub enum AssigneeFilter<'a> {
 }
 
 /// Lifetime in seconds for sign-in link JWTs and pending sign-in link emails.
+pub const SIGN_IN_LINK_LIFETIME_SECONDS: i64 = 1800;
+
 /// What an outbox row is for.
 ///
 /// Review notifications and transactional mail share a transport but differ in
@@ -9573,13 +9575,27 @@ impl Database {
         )
         .await?;
 
+        let now = chrono::Utc::now().timestamp();
+        let expired_before = now - SIGN_IN_LINK_LIFETIME_SECONDS;
+        tx.execute(
+            "UPDATE email_outbox
+             SET status = 'Cancelled',
+                 error_log = 'Cancelled because sign-in link expired before delivery',
+                 locked_at = NULL
+             WHERE status = 'Pending'
+               AND kind = 'sign_in_link'
+               AND created_at < ?",
+            libsql::params![expired_before],
+        )
+        .await?;
+
         let claimed = {
             let mut rows = tx.query(
                 "UPDATE email_outbox 
                  SET status = 'Sending', locked_at = ? 
                  WHERE id = (SELECT id FROM email_outbox WHERE status = 'Pending' LIMIT 1)
                  RETURNING id, patch_id, kind, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, locked_at, error_log, created_at",
-                libsql::params![chrono::Utc::now().timestamp()]
+                libsql::params![now]
             ).await?;
 
             if let Some(row) = rows.next().await? {
@@ -22042,6 +22058,57 @@ mod tests {
         let row = rows.next().await.unwrap().unwrap();
         assert_eq!(row.get::<String>(0).unwrap(), "Pending");
         assert!(row.get::<Option<String>>(1).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_lock_pending_email_cancels_expired_sign_in_links() {
+        let db = setup_db().await;
+        let now = chrono::Utc::now().timestamp();
+
+        // Expired sign-in link (older than SIGN_IN_LINK_LIFETIME_SECONDS).
+        db.conn
+            .execute(
+                "INSERT INTO email_outbox (kind, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, created_at)
+                 VALUES ('sign_in_link', 'Pending', '[\"old@example.com\"]', '[]', 'Sign in to Sashiko', '<msg1>', '', 'body1', ?)",
+                libsql::params![now - SIGN_IN_LINK_LIFETIME_SECONDS - 10],
+            )
+            .await
+            .unwrap();
+
+        // Fresh sign-in link.
+        db.conn
+            .execute(
+                "INSERT INTO email_outbox (kind, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, created_at)
+                 VALUES ('sign_in_link', 'Pending', '[\"fresh@example.com\"]', '[]', 'Sign in to Sashiko', '<msg2>', '', 'body2', ?)",
+                libsql::params![now - 60],
+            )
+            .await
+            .unwrap();
+
+        let claimed = db
+            .lock_pending_email()
+            .await
+            .unwrap()
+            .expect("expected fresh sign-in link to be claimed");
+        assert_eq!(claimed.to_addresses, "[\"fresh@example.com\"]");
+        assert_eq!(claimed.kind, EmailKind::SignInLink);
+
+        assert!(db.lock_pending_email().await.unwrap().is_none());
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT status, error_log FROM email_outbox WHERE to_addresses = '[\"old@example.com\"]'",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "Cancelled");
+        assert_eq!(
+            row.get::<String>(1).unwrap(),
+            "Cancelled because sign-in link expired before delivery"
+        );
     }
 
     #[tokio::test]

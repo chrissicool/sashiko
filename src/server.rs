@@ -4413,7 +4413,7 @@ fn is_sign_in_eligible(
             || maintainers.is_some_and(|m| m.subsystems_for_address(email).is_some()))
 }
 
-const SIGN_IN_LINK_LIFETIME_SECONDS: i64 = 1800;
+use crate::db::SIGN_IN_LINK_LIFETIME_SECONDS;
 
 async fn request_link(
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
