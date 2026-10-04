@@ -10,6 +10,8 @@ use tracing::{error, info, warn};
 
 const SMTP_SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 const SMTP_SEND_TIMEOUT: Duration = Duration::from_secs(60);
+const SMTP_MAX_ATTEMPTS: u32 = 3;
+const SMTP_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
 
 pub struct EmailWorker {
     db: Arc<crate::db::Database>,
@@ -62,18 +64,36 @@ impl EmailWorker {
                         email.id,
                         email.patch_id
                     );
-                    let send_result = match tokio::time::timeout(
-                        SMTP_SEND_TIMEOUT,
-                        self.send_email(&email),
-                    )
-                    .await
-                    {
-                        Ok(res) => res,
-                        Err(_) => Err(anyhow::anyhow!(
-                            "SMTP delivery timed out after {}s",
-                            SMTP_SEND_TIMEOUT.as_secs()
-                        )),
-                    };
+                    let mut send_result = Ok(());
+                    for attempt in 1..=SMTP_MAX_ATTEMPTS {
+                        send_result =
+                            match tokio::time::timeout(SMTP_SEND_TIMEOUT, self.send_email(&email))
+                                .await
+                            {
+                                Ok(res) => res,
+                                Err(_) => Err(anyhow::anyhow!(
+                                    "SMTP delivery timed out after {}s",
+                                    SMTP_SEND_TIMEOUT.as_secs()
+                                )),
+                            };
+                        match &send_result {
+                            Ok(()) => break,
+                            Err(e) if attempt < SMTP_MAX_ATTEMPTS && is_transient_smtp_error(e) => {
+                                let delay = SMTP_RETRY_BASE_DELAY * attempt;
+                                warn!(
+                                    "Transient SMTP failure sending email ID {} (attempt {}/{}): {}; retrying in {}s",
+                                    email.id,
+                                    attempt,
+                                    SMTP_MAX_ATTEMPTS,
+                                    e,
+                                    delay.as_secs()
+                                );
+                                self.record_heartbeat();
+                                sleep(delay).await;
+                            }
+                            Err(_) => break,
+                        }
+                    }
                     match send_result {
                         Ok(_) => {
                             info!("Successfully sent email ID {}", email.id);
@@ -125,61 +145,7 @@ impl EmailWorker {
             return Ok(());
         }
 
-        let from = parse_lenient(&self.settings.sender_address)?;
-        let mut builder = Message::builder()
-            .from(from.clone())
-            .subject(&email_row.subject);
-
-        if email_row.kind == crate::db::EmailKind::SignInLink {
-            // Mail a person receives because they just asked for it must not
-            // provoke a vacation autoresponder, and should be filable.
-            builder = builder
-                .header(AutoSubmitted("auto-generated".to_string()))
-                .header(ListId(format!("<sashiko-auth.{}>", from.email.domain())));
-        }
-
-        if let Some(reply_to) = &self.settings.reply_to {
-            match reply_to.parse() {
-                Ok(addr) => builder = builder.reply_to(addr),
-                Err(e) => warn!("Failed to parse reply_to address '{}': {}", reply_to, e),
-            }
-        }
-
-        let to_addresses: Vec<String> = serde_json::from_str(&email_row.to_addresses)?;
-        for to in to_addresses {
-            match parse_lenient(&to) {
-                Ok(addr) => builder = builder.to(addr),
-                Err(e) => warn!("Failed to parse 'to' address '{}': {}", to, e),
-            }
-        }
-
-        let cc_addresses: Vec<String> = serde_json::from_str(&email_row.cc_addresses)?;
-        for cc in cc_addresses {
-            match parse_lenient(&cc) {
-                Ok(addr) => builder = builder.cc(addr),
-                Err(e) => warn!("Failed to parse 'cc' address '{}': {}", cc, e),
-            }
-        }
-
-        if !email_row.in_reply_to.is_empty() {
-            builder = builder.header(lettre::message::header::InReplyTo::from(format!(
-                "<{}>",
-                email_row.in_reply_to
-            )));
-        }
-
-        if !email_row.references_hdr.is_empty() {
-            let refs: Vec<String> = email_row
-                .references_hdr
-                .split_whitespace()
-                .map(|part| format!("<{}>", part))
-                .collect();
-            builder = builder.references(refs.join(" "));
-        }
-
-        let msg = builder
-            .header(ContentType::TEXT_PLAIN)
-            .body(email_row.body.clone())?;
+        let msg = build_email_message(&self.settings, email_row)?;
 
         let mut mailer_builder =
             AsyncSmtpTransport::<Tokio1Executor>::relay(&self.settings.server)?
@@ -197,6 +163,69 @@ impl EmailWorker {
 
         Ok(())
     }
+}
+
+fn build_email_message(
+    settings: &SmtpSettings,
+    email_row: &crate::db::EmailOutboxRow,
+) -> anyhow::Result<Message> {
+    let from = parse_lenient(&settings.sender_address)?;
+    let message_id = format!("<sashiko-outbox-{}@{}>", email_row.id, from.email.domain());
+    let mut builder = Message::builder()
+        .message_id(Some(message_id))
+        .from(from.clone())
+        .subject(&email_row.subject);
+
+    if email_row.kind == crate::db::EmailKind::SignInLink {
+        // Mail a person receives because they just asked for it must not
+        // provoke a vacation autoresponder, and should be filable.
+        builder = builder
+            .header(AutoSubmitted("auto-generated".to_string()))
+            .header(ListId(format!("<sashiko-auth.{}>", from.email.domain())));
+    }
+
+    if let Some(reply_to) = &settings.reply_to {
+        match reply_to.parse() {
+            Ok(addr) => builder = builder.reply_to(addr),
+            Err(e) => warn!("Failed to parse reply_to address '{}': {}", reply_to, e),
+        }
+    }
+
+    let to_addresses: Vec<String> = serde_json::from_str(&email_row.to_addresses)?;
+    for to in to_addresses {
+        match parse_lenient(&to) {
+            Ok(addr) => builder = builder.to(addr),
+            Err(e) => warn!("Failed to parse 'to' address '{}': {}", to, e),
+        }
+    }
+
+    let cc_addresses: Vec<String> = serde_json::from_str(&email_row.cc_addresses)?;
+    for cc in cc_addresses {
+        match parse_lenient(&cc) {
+            Ok(addr) => builder = builder.cc(addr),
+            Err(e) => warn!("Failed to parse 'cc' address '{}': {}", cc, e),
+        }
+    }
+
+    if !email_row.in_reply_to.is_empty() {
+        builder = builder.header(lettre::message::header::InReplyTo::from(format!(
+            "<{}>",
+            email_row.in_reply_to
+        )));
+    }
+
+    if !email_row.references_hdr.is_empty() {
+        let refs: Vec<String> = email_row
+            .references_hdr
+            .split_whitespace()
+            .map(|part| format!("<{}>", part))
+            .collect();
+        builder = builder.references(refs.join(" "));
+    }
+
+    Ok(builder
+        .header(ContentType::TEXT_PLAIN)
+        .body(email_row.body.clone())?)
 }
 
 /// Headers lettre does not model, declared here so the builder can carry them.
@@ -232,6 +261,21 @@ text_header!(
     "List-Id",
     "Gives recipients something stable to filter transactional mail on."
 );
+
+/// Returns true only when the failure is a transient SMTP 4xx rejection or a
+/// pre-session connection establishment error where the server has definitely
+/// not accepted the message. Post-connection socket/delivery timeouts and
+/// mid-stream network errors are not retried because they can occur after the
+/// DATA payload was already accepted by the remote MTA.
+fn is_transient_smtp_error(err: &anyhow::Error) -> bool {
+    if let Some(smtp_err) = err.downcast_ref::<lettre::transport::smtp::Error>()
+        && smtp_err.is_transient()
+    {
+        return true;
+    }
+    let msg = err.to_string();
+    msg.starts_with("transient error (4") || msg.starts_with("Connection error")
+}
 
 fn parse_lenient(s: &str) -> anyhow::Result<lettre::message::Mailbox> {
     if let Some(start) = s.find('<')
@@ -285,5 +329,72 @@ mod tests {
         assert!(parsed.is_ok(), "Failed to parse: {:?}", parsed.err());
         // We will see what format!() returns for plain email
         info!("Plain email formatted: {}", parsed.as_ref().unwrap());
+    }
+
+    #[test]
+    fn test_is_transient_smtp_error_classification() {
+        let transient_454 = anyhow::anyhow!(
+            "transient error (454): 4.7.0 Temporary authentication failure: generic failure"
+        );
+        assert!(is_transient_smtp_error(&transient_454));
+
+        let conn_err = anyhow::anyhow!("Connection error: connection refused");
+        assert!(is_transient_smtp_error(&conn_err));
+
+        let timeout_err = anyhow::anyhow!("SMTP delivery timed out after 60s");
+        assert!(!is_transient_smtp_error(&timeout_err));
+
+        let net_err = anyhow::anyhow!("network error: connection reset by peer");
+        assert!(!is_transient_smtp_error(&net_err));
+
+        let permanent_550 = anyhow::anyhow!("permanent error (550): 5.1.1 User unknown");
+        assert!(!is_transient_smtp_error(&permanent_550));
+
+        let parse_err = parse_lenient("not-an-email").unwrap_err();
+        assert!(!is_transient_smtp_error(&parse_err));
+    }
+
+    #[test]
+    fn test_build_email_message_sets_deterministic_message_id() {
+        let settings = SmtpSettings {
+            server: "smtp.example.com".to_string(),
+            port: 587,
+            username: None,
+            password: None,
+            sender_address: "Sashiko Bot <sashiko@linux.dev>".to_string(),
+            reply_to: None,
+            dry_run: true,
+        };
+        let row = crate::db::EmailOutboxRow {
+            id: 160058,
+            patch_id: Some(42),
+            kind: crate::db::EmailKind::ReviewNotification,
+            status: "Sending".to_string(),
+            to_addresses: "[\"dev@example.com\"]".to_string(),
+            cc_addresses: "[]".to_string(),
+            subject: "Re: [PATCH] test".to_string(),
+            in_reply_to: "orig-msg@example.com".to_string(),
+            references_hdr: "orig-msg@example.com".to_string(),
+            body: "Review body".to_string(),
+            locked_at: Some(1000),
+            error_log: None,
+            created_at: 1000,
+        };
+
+        let msg1 = String::from_utf8(build_email_message(&settings, &row).unwrap().formatted())
+            .expect("valid utf8");
+        let msg2 = String::from_utf8(build_email_message(&settings, &row).unwrap().formatted())
+            .expect("valid utf8");
+
+        assert!(
+            msg1.contains("Message-ID: <sashiko-outbox-160058@linux.dev>\r\n"),
+            "missing deterministic Message-ID in formatted message:\n{}",
+            msg1
+        );
+        assert!(
+            msg2.contains("Message-ID: <sashiko-outbox-160058@linux.dev>\r\n"),
+            "missing deterministic Message-ID on retry build:\n{}",
+            msg2
+        );
     }
 }
