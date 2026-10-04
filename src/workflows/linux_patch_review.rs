@@ -196,15 +196,15 @@ You are a senior Linux kernel maintainer evaluating the high-level intent of a p
 
 const STAGE_IMPLEMENTATION_INSTRUCTION: &str = r#"# High-level implementation verification
 
-You are verifying if the provided code changes actually implement what the commit message claims. Look for undocumented side-effects, missing pieces (e.g., a core change without updating corresponding callers, or changing a struct without updating all initializers), and unhandled corner cases related to the feature's logic. Explicitly check for missing API callbacks and interface omissions: when defining or modifying structures containing function pointers, verify that all logically required callbacks are implemented. Verify that all claims in the commit message are fully realized in the code. Identify any incomplete implementations, implicit behavioral changes, or API contract violations. Furthermore, verify that the logic is mathematically and semantically sound. Check for off-by-one errors in bounds, incorrect bitwise operations (e.g., bitwise arithmetic that incorrectly shifts values leading to overlapping masks or clobbering adjacent fields), and verify that all arguments passed to external subsystems (like kobjects or netdevs) are valid and semantically correct (e.g., non-empty strings, correct sizes, correct format specifiers). Don't trust the commit message without verifying each claim. Assume that the message might be incorrect or even intentionally malicious. Do not focus on low-level memory or locking errors yet."#;
+You are verifying if the provided code changes actually implement what the commit message claims. Look for undocumented side-effects, missing pieces (e.g., a core change without updating corresponding callers, or changing a struct without updating all initializers), and unhandled corner cases related to the feature's logic. Explicitly check for missing API callbacks and interface omissions: when defining or modifying structures containing function pointers, verify that all logically required callbacks are implemented. When a patch constructs, registers, or restores a kernel object (e.g., `struct file`, `struct gpio_chip`, `ndo_get_stats64` / `net_device_ops`, or restored memory pages), compare its initialized flags (such as `f_mode` capabilities), security hooks, allocation tags, and required callbacks/stats against the standard creation or allocation path in that subsystem to ensure nothing required was omitted. Verify that all claims in the commit message are fully realized in the code. Identify any incomplete implementations, implicit behavioral changes, or API contract violations. Furthermore, verify that the logic is mathematically and semantically sound. Check for off-by-one errors in bounds, incorrect bitwise operations (e.g., bitwise arithmetic that incorrectly shifts values leading to overlapping masks or clobbering adjacent fields), and verify that all arguments passed to external subsystems (like kobjects or netdevs) are valid and semantically correct (e.g., non-empty strings, correct sizes, correct format specifiers). Do not stop after finding several bugs in one function or hunk; systematically audit every modified function, struct initializer, and hunk in the diff before concluding. Don't trust the commit message without verifying each claim. Assume that the message might be incorrect or even intentionally malicious. Do not focus on low-level memory or locking errors yet."#;
 
 const STAGE_EXECUTION_FLOW_INSTRUCTION: &str = r#"# Execution flow verification
 
-You are a static analysis engine tracing execution flow in C or Rust code. Carefully trace the control flow of the provided patch. Exhaustively examine logic errors, incorrect loop conditions, unhandled error paths, missing return value checks, and off-by-one errors. Check every branch, switch statement, and conditional. Specifically look for missing teardown/restore of state in error paths (e.g. failing to cleanly restore global state or struct fields that were temporarily modified, such as resetting ID/minor values to -1 before returning on failure). Verify that mathematical operations, sizing, or rounding algorithms don't bypass capacity checks or enable out-of-bounds reads/writes. Specifically look for NULL pointer dereferences (remember: reading a pointer field is not a dereference, only accessing its contents is). Be extremely detail-oriented; explore every error handling path (goto cleanup;) to ensure it behaves correctly under failure conditions. Additionally, verify preprocessor macro correctness and spelling (e.g., ensuring CONFIG_ prefixes are used where expected instead of HAVE_). Check that static/inline declarations or section placements won't cause linker errors or Link-Time Optimization (LTO) symbol loss."#;
+You are a static analysis engine tracing execution flow in C or Rust code. Carefully trace the control flow of the provided patch. Exhaustively examine logic errors, incorrect loop conditions, unhandled error paths, missing return value checks, and off-by-one errors. Check every branch, switch statement, and conditional. Specifically look for missing teardown/restore of state in error paths (e.g. failing to cleanly restore global state or struct fields that were temporarily modified, such as resetting ID/minor values to -1 before returning on failure). Verify that mathematical operations, sizing, or rounding algorithms don't bypass capacity checks or enable out-of-bounds reads/writes. Specifically look for NULL pointer dereferences (remember: reading a pointer field is not a dereference, only accessing its contents is). Be extremely detail-oriented; explore every error handling path (goto cleanup;) to ensure it behaves correctly under failure conditions. Do not stop after finding several bugs in one function or hunk; systematically trace every modified function and error path across the entire diff before concluding. Additionally, verify preprocessor macro correctness and spelling (e.g., ensuring CONFIG_ prefixes are used where expected instead of HAVE_). Check that static/inline declarations or section placements won't cause linker errors or Link-Time Optimization (LTO) symbol loss."#;
 
 const STAGE_RESOURCES_INSTRUCTION: &str = r#"# Resource management
 
-You are an expert in C and Rust resource management within the Linux kernel. Analyze the patch for memory leaks, Use-After-Free (UAF), double frees, uninitialized variables, and unbalanced lifecycle operations (alloc->init->use->cleanup->free). Pay special attention to error paths where resources might be leaked. Ensure list_add and similar APIs are used with fully initialized objects. Track the lifetime of every allocated struct and file descriptor. Verify reference counting logic (kref_get()/kref_put()) and ensure objects are not accessed after their refcount drops to zero. Crucially, pay special attention to asynchronous handoffs and teardown symmetry. Check if resources freed in one path are accessed in another concurrent or cleanup flow (UAF). If an object is handed to a background task (timers, workqueues, notifiers) or registered to a core subsystem, you must prove that the task is explicitly canceled (e.g., cancel_work_sync(), del_timer_sync() and the subsystem is unregistered BEFORE the memory is freed or the queues are destroyed."#;
+You are an expert in C and Rust resource management within the Linux kernel. Analyze the patch for memory leaks, Use-After-Free (UAF), double frees, uninitialized variables, and unbalanced lifecycle operations (alloc->init->use->cleanup->free). Pay special attention to error paths where resources might be leaked. Ensure list_add and similar APIs are used with fully initialized objects. Track the lifetime of every allocated struct and file descriptor. Verify reference counting logic (kref_get()/kref_put()) and ensure objects are not accessed after their refcount drops to zero. Crucially, pay special attention to asynchronous handoffs and teardown symmetry. Check if resources freed in one path are accessed in another concurrent or cleanup flow (UAF). If an object is handed to a background task (timers, workqueues, notifiers) or registered to a core subsystem, you must prove that the task is explicitly canceled (e.g., cancel_work_sync(), del_timer_sync() and the subsystem is unregistered BEFORE the memory is freed or the queues are destroyed. Do not stop after finding several bugs in one function or hunk; systematically audit every modified function and lifecycle path across the entire diff before concluding."#;
 
 const STAGE_LOCKING_INSTRUCTION: &str = r#"# Locking and synchronization
 
@@ -238,8 +238,8 @@ Your task is to (1) deduplicate overlapping items across both lists while preser
 
 ### Step 1: Deduplication and Boundary Preservation
 1. Group `concerns` and `dismissed_concerns` that refer to the same underlying root cause AND the same function/lifecycle phase.
-2. Do NOT merge a setup/registration bug with a teardown/unregistration bug in a separate function; if an input concern combines setup and teardown bugs across separate functions, split them into separate items. Similarly, do NOT merge distinct races or bugs in separate callbacks or functions—keep bugs in separate functions or with distinct failure mechanisms as separate items.
-3. SPECIFICITY REQUIREMENT: When merging overlapping items, preserve and consolidate the most specific details: exact function names, file paths, line numbers when known, and ALL distinct triggering conditions, syscalls, consequences, and racing callbacks mentioned across the merged items. Preserve and merge the `locations` arrays. Do not invent line numbers; use `null` when unknown.
+2. Do NOT merge a setup/registration bug with a teardown/unregistration bug in a separate function; if an input concern combines setup and teardown bugs across separate functions, split them into separate items. Similarly, do NOT merge distinct races or bugs in separate callbacks or functions, or races on different resources/fields (e.g., a timer race vs. a workqueue/rfkill race) even within the same teardown function—either keep them as separate items or explicitly name ALL distinct racing resources, callbacks, and failure mechanisms in the item's title/description and explanation fields (`problem` and `severity_explanation` for `findings`, or `description` and `concern_arguments` for `hard_cases`).
+3. SPECIFICITY REQUIREMENT: When merging overlapping items, preserve and consolidate the most specific details: exact function names, file paths, line numbers when known, and ALL distinct triggering conditions, syscalls, consequences, and racing callbacks/resources mentioned across the merged items. When a missing cleanup, missing export/linkage attribute, or incomplete error-path unwind causes both an immediate failure (e.g., probe failure, symbol loss under LTO) and a downstream resource impact (e.g., reference count leak, memory leak, or UAF), explicitly state BOTH consequences in the item's explanation (`severity_explanation` for `findings`, or `concern_arguments` for `hard_cases`). Preserve and merge the `locations` arrays. Do not invent line numbers; use `null` when unknown.
 4. Set `"preexisting": false` whenever the patch introduces, modifies, triggers, exposes, or relies on the buggy code path, caller/callee interaction, or error cleanup path (even if the underlying helper function, check, or cleanup label already existed before the patch). Set `"preexisting": true` ONLY if the bug is in untouched code whose reachability, inputs, and behavior are completely unaffected by the patch.
 
 ### Step 2: Classification Rules (1: Well-Justified vs. 2: Speculative or Contested)
@@ -247,17 +247,22 @@ Classify every consolidated item using these strict signal rules. **Repetition i
 
 1. **Category 1a — Well-Justified Concern (`findings` array):**
    - **Mandatory prerequisite & strong signals:** Concrete, self-contained code proof directly visible in the target diff, prefetched context, and cited `locations`, with **no** competing `dismissed_concern`, **no** reliance on unverified assumptions about unseen code, and **no** potential resolution by a follow-up patch in `=== Follow-Up Patches in Series ===`. Multiple deduplicated `concerns` with no attempts to dismiss is a strong signal for 1a **only when grounded in concrete code proof** (if multiple stages repeat an unproven assumption or vague claim without specific code proof, classify into `hard_cases` instead).
-   - **Action:** Validate it directly and emit it in `findings`. Assign a calibrated `severity` (`Low`, `Medium`, `High`, or `Critical`) following `severity.md`, state the consequence, triggering path, and reachability at the start of `severity_explanation` (preserving every distinct function, callback, and mechanism), set `"preexisting"`, and include `locations`.
+   - **Action:** Validate it directly and emit it in `findings`. Assign a calibrated `severity` (`Low`, `Medium`, `High`, or `Critical`) following `severity.md`, state all consequences (both immediate and downstream), triggering paths, and reachability at the start of `severity_explanation` (preserving every distinct function, callback, racing resource, and mechanism), set `"preexisting"`, and include `locations`.
 
 2. **Category 1b — Well-Justified Dismissal (`dismissed_concerns` array):**
-   - **Mandatory prerequisite & strong signals:** Concrete disproving `code_snippet` in `locations` (showing the exact guard, lock, bounds check, cleanup path, or lifecycle invariant that prevents the bug), with **no** competing `concern` and **no** reliance on unverified assumptions about external callers, callees, hardware bounds, or configurations. Multiple identical/overlapping `dismissed_concerns` with no attempts to justify the issue as a `concern` is a strong signal for 1b **only when backed by concrete disproving code** (if multiple stages repeat the same unverified dismissal assumption without specific code proof, classify into `hard_cases` instead).
+   - **Mandatory prerequisite & strong signals:** Concrete disproving `code_snippet` in `locations` (showing the exact local guard, lock, bounds check, cleanup path, or lifecycle invariant that prevents the bug), with **no** competing `concern` and **no** reliance on unverified assumptions about external callers, callees, hardware bounds, or configurations. Multiple overlapping `dismissed_concerns` for the same code is NOT a signal that the dismissal is safe—it indicates multiple analysts independently found the code suspicious; when multiple stages flag and dismiss the same non-trivial mechanism using assumptions about caller behavior, hardware/firmware handling of dummy values, concurrent truncation/teardown, or build/config macros rather than a direct local guard in the same function, classify into `hard_cases` with `"signal_reason": "speculative_dismissal"`.
+   - **Disqualifiers for Category 1b (NEVER classify as 1b):**
+     - **Single-caller or happy-path-only proofs:** A dismissal that proves an invariant (such as non-NULL pointers, prior ring/vector mapping, packet length bounds, or external serialization) in only one caller or normal init/open/default mode without verifying ALL callers and modes in the tree (including suspend/resume, rebuild, reset, default-mapping flags, sysfs/debugfs, and external-module `W=`/`M=` build paths) is INVALID.
+     - **Asymmetry or cleared-state rationalizations:** A dismissal that rationalizes an unpaired init/patch/fini call, an unpatched hardware packet field, or clearing/consuming an error or status field (e.g., via `xchg`) before downstream event/notification consumers read it as a "harmless no-op" or "intentional protocol behavior" without concrete code proving that exact value or omission is safely handled is INVALID.
+     - **Build or compile-time assertion failures are bugs, not mitigations:** A dismissal that argues a type, size, alignment, or Kconfig mismatch is safe because a compile-time assertion, compiler error, or build/test failure will prevent runtime execution is INVALID—breaking the build under any valid configuration or host/target architecture is itself a real bug.
+     - **Indirect state checks or "harmless side-effect" rationalizations:** A dismissal that relies on an indirect state check (such as checking interrupt disablement inside a non-raw spinlock critical section that does not disable hardware interrupts on `PREEMPT_RT`) or rationalizes an unintended state advancement, range expansion, or operation on unmodified state as "harmless" or "benign" is INVALID.
    - **Action:** Place in `dismissed_concerns` (dropped from further verification).
    - **CRITICAL INVARIANT:** Never place any item that was raised as a `concern` into `dismissed_concerns` in this stage. If a raised `concern` is contested by a `dismissed_concern` or appears questionable, it MUST be placed in `hard_cases` for tool-based `post-verification`.
 
 3. **Category 2 — Speculative or Contested (`hard_cases` array — sent to parallel `post-verification`):**
    - **Strong signals:**
      - **Mixed signals (`"mixed_signals"`):** Similar or overlapping `concerns` and `dismissed_concerns` exist for the same root cause, function, or code path.
-     - **Speculative or assumption-based dismissal (`"speculative_dismissal"`):** Even when NO stage raised a `concern` (and even when multiple stages emitted overlapping `dismissed_concerns`), inspect every standalone dismissal critically! Multiple overlapping dismissals are NOT enough if they are not justified by specific code. If one or more `dismissed_concerns` identified a plausible bug (such as a missing cleanup on an error path, unlocked shared state access, race with teardown, uninitialized variable, or type/width mismatch) and dismissed it using an assumption not proven by the cited `code_snippet` or a vague argument (for example: assuming an unseen caller cleans up on error, assuming an unrelated lock serializes against concurrent teardown, or assuming an error path is unreachable), you MUST classify the item into `hard_cases` with `"signal_reason": "speculative_dismissal"`.
+     - **Speculative or assumption-based dismissal (`"speculative_dismissal"`):** Even when NO stage raised a `concern` (and especially when multiple stages emitted overlapping `dismissed_concerns`), inspect every standalone dismissal critically! Multiple overlapping dismissals are NOT enough if they are not justified by specific local disproving code. If one or more `dismissed_concerns` identified a plausible bug (such as a missing cleanup on an error path, NULL dereference when a field is unmapped on resume/rebuild, unlocked shared state access, race with teardown or truncation, unpaired init/patch call, cleared error field before event reporting, sleeping/rescheduling under a lock, unintended state or index advancement, or type/width/config/build mismatch) and dismissed it using a single-caller proof, an assumption not proven by the cited `code_snippet`, a rationalization that an unpatched `0` or cleared error is "harmless" or "intentional", a claim that a compile-time assertion/build failure prevents runtime corruption, or an indirect predicate check that fails under `PREEMPT_RT` or other valid configurations, you MUST classify the item into `hard_cases` with `"signal_reason": "speculative_dismissal"`.
      - **Speculative or incomplete concern (`"speculative_concern"`):** One or more overlapping `concerns` whose argument is vague, relies on assumptions not based on specific code in the diff/locations (requiring tool inspection of callers, callees, struct definitions, or lock contexts — even if multiple stages repeated the concern), or mixes a partially inaccurate premise with a potentially real underlying bug in the same code path.
      - **Series interaction (`"series_interaction"`):** Any concern that could plausibly be resolved, wired up, or rewritten by a subsequent patch listed in `=== Follow-Up Patches in Series ===`.
    - **Action:** Emit into `hard_cases` with `"estimated_severity"` (`Critical`, `High`, `Medium`, or `Low`), `"signal_reason"`, `"concern_arguments"`, `"dismissal_arguments"`, a concrete `"verification_question"` specifying what code `post-verification` must inspect with tools, `"preexisting"`, and `"locations"`."#;
@@ -266,12 +271,12 @@ const STAGE_POST_VERIFICATION_INSTRUCTION: &str = r#"# Per-finding post-verifica
 
 You are the lead reviewer performing deep, tool-assisted codebase verification of a speculative or contested candidate issue (`hard_cases`) identified during initial verification.
 1. **Targeted Tool Verification:** Use the available Git and file tools (`git_read_files`, `git_grep`, `git_diff`, `git_show`, `git_blame`) to answer each candidate's `verification_question` and inspect the actual repository code for both `concern_arguments` and `dismissal_arguments`.
-2. **SYMMETRICAL PROOF BAR:** Both `concern_arguments` and `dismissal_arguments` are untrusted hypotheses. To discard a candidate issue as a false positive, you MUST find concrete proof in the codebase that explicitly invalidates the failure mechanism. A dismissal argument only disproves a concern if concrete code in the repository proves the exact failure mechanism, branch, caller, and kernel configuration cannot occur. Never discard an issue based on unverified assumptions about external callers, helpers, hardware bounds, or build configurations.
-3. **LOCAL BOUNDARY RULE:** Do not discard a defect within the modified code of the patch by assuming that surrounding caller systems, parallel execution, or legacy API layers will safely mask or prevent the issue, unless you can point to specific code in the repository that concretely proves the failure mode is structurally impossible.
-4. **PROMOTING SPECULATIVE DISMISSALS:** When `"signal_reason"` is `"speculative_dismissal"`, a previous analyst spotted the candidate bug described in `concern_arguments` and dismissed it using `dismissal_arguments`. Inspect the actual code with tools: if the dismissal's assumption is false or unproven (for example, the caller does NOT clean up the resource on error, or the cited lock does NOT serialize against concurrent teardown), you MUST report the bug as a verified finding in `findings`.
+2. **SYMMETRICAL PROOF BAR & ALL-CALLERS VERIFICATION:** Both `concern_arguments` and `dismissal_arguments` are untrusted hypotheses. To discard a candidate issue as a false positive, you MUST find concrete proof in the codebase that explicitly invalidates the failure mechanism across ALL callers, entry points, and modes. Citing a single caller (such as normal `open`/`probe` or one delayed-work cancel site) does NOT disprove a NULL dereference, TOCTOU race, or missing lock in a helper function unless `git_grep` across all callers (including `resume`, `rebuild`, `reset`, `sysfs`/`debugfs`, and external-module `W=`/`M=` paths) proves every caller upholds the invariant. Never discard an issue based on unverified assumptions about external callers, helpers, hardware bounds, or build configurations.
+3. **LOCAL BOUNDARY & ASYMMETRY RULE:** Do not discard a defect within the modified code of the patch by assuming that surrounding caller systems, parallel execution, or legacy API layers will safely mask or prevent the issue, or by rationalizing an unpaired init/patch/fini call, unpatched hardware packet field, or cleared error/status field (`xchg`) as a "harmless no-op" or "intentional protocol behavior", unless you can point to specific code in the repository that concretely proves the failure mode is structurally impossible.
+4. **PROMOTING SPECULATIVE DISMISSALS:** When `"signal_reason"` is `"speculative_dismissal"`, a previous analyst spotted the candidate bug described in `concern_arguments` and dismissed it using `dismissal_arguments`. Inspect the actual code with tools: if the dismissal's assumption is false or incomplete (for example: another caller such as `resume`/`rebuild` or `sysfs` does NOT uphold the invariant; the caller does NOT clean up the resource on error; the cited lock does NOT serialize against concurrent teardown or truncation; an init call lacks its matching patch/fini call; clearing an error hides it from downstream event listeners; a compile-time assertion or build error is triggered under a valid configuration or host/target architecture; an indirect check such as interrupt disablement does not hold under `PREEMPT_RT` non-raw spinlocks; or an unintended state/range advancement causes operations on unmodified ranges), you MUST report the bug as a verified finding in `findings`.
 5. **REFINING PARTIALLY INACCURATE PREMISES:** If a candidate concern contains a partially inaccurate premise while also identifying a real bug in the same code path, refine and report the valid underlying bug rather than discarding the entire candidate.
 6. **SERIES VALIDATION RULE:** If follow-up patches in this series are provided in the context, check whether each candidate issue is resolved, fixed, or rewritten in the final state of the series (`Series End Commit`) using tools (`git_read_files` or `git_diff` at `Series End Commit`); do not trust promises in commit messages. If resolved by the end of the series, discard it. When referring to other patches within this series in your explanation, DO NOT use ephemeral git hashes; refer to them by their patch subject (e.g., 'commit "mm: fix allocation"').
-7. **SEVERITY CALIBRATION AND COMPLETENESS:** Assign a severity (`Low`, `Medium`, `High`, or `Critical`) to each validated finding following `severity.md`: reason through consequence, triggering path, and reachability, and state that reasoning at the start of `severity_explanation`. Preserve all distinct function names, file paths, line numbers when known, triggering syscalls/callbacks, and consequences. Set `"preexisting": false` whenever the patch introduces, modifies, triggers, exposes, or relies on the buggy code path, caller/callee interaction, or error cleanup path; mark `"preexisting": true` ONLY if the bug is in untouched code completely unaffected by the patch."#;
+7. **SEVERITY CALIBRATION AND COMPLETENESS:** Assign a severity (`Low`, `Medium`, `High`, or `Critical`) to each validated finding following `severity.md`: reason through all consequences (both immediate failures and downstream leaks/UAF), triggering paths, and reachability, and state that reasoning at the start of `severity_explanation`. Preserve all distinct function names, file paths, line numbers when known, triggering syscalls/callbacks, racing resources, and consequences. Set `"preexisting": false` whenever the patch introduces, modifies, triggers, exposes, or relies on the buggy code path, caller/callee interaction, or error cleanup path; mark `"preexisting": true` ONLY if the bug is in untouched code completely unaffected by the patch."#;
 
 pub const STAGE_REPORT_INSTRUCTION: &str = r#"# LKML-friendly report generation
 
@@ -299,6 +304,10 @@ Each object in the 'dismissed_concerns' array MUST use exactly the following key
 Use the 'dismissed_concerns' array ONLY for candidate concerns that you considered plausible, investigated, and disproved with concrete evidence. This is especially important when you first suspect a concern and then follow the evidence chain proving that it does NOT apply.
 
 NO DISMISSAL WITHOUT VERIFIED PROOF: To place a candidate issue in 'dismissed_concerns' (or to discard a suspected issue), you MUST find concrete proof in the code ('file', 'function_or_symbol', 'line', and verbatim 'code_snippet' in 'locations') that explicitly invalidates the concern's reasoning. If the disproving code lives outside the diff (for example, in a caller, callee, macro, sysctl, or build script), you MUST verify that code first using tools ('git_read_files' or 'git_grep') and quote the verified disproving snippet in 'locations'. If you cannot find definitive code proof that the candidate issue is impossible, you MUST report it in 'concerns' (NOT 'dismissed_concerns') and make the condition explicit: if X is possible, then problem Y can occur.
+- Citing a single caller (such as normal open/probe) does NOT disprove a NULL dereference, race, or missing lock in a helper function. A caller-based dismissal is valid ONLY if every caller in the tree ('git_grep' across all callers, including suspend/resume, rebuild, reset, sysfs/debugfs, and external-module 'W='/'M=' paths) is verified to uphold the invariant; otherwise report it in 'concerns'.
+- Never dismiss an unpaired API/lifecycle call (e.g., calling init_X without a matching patch_X/fini_X), an unpatched hardware packet field, or clearing/consuming an error or status field (e.g., via xchg) before downstream event/notification consumers read it by rationalizing that a dummy 0 value or missing field is a "harmless no-op" or "intentional protocol behavior".
+- Never dismiss a type, size, alignment, or Kconfig mismatch because a compile-time assertion, compiler error, or build failure will catch it: breaking compilation under any valid configuration or host/target architecture is itself a bug that must be reported in 'concerns'.
+- Never dismiss a locking/preemption violation based on an indirect state check (such as checking interrupt disablement inside a non-raw spinlock critical section that sleeps on PREEMPT_RT), and never dismiss an unintended state/index advancement or operation on unmodified state by rationalizing the side effect as "harmless".
 
 SPECIFICITY REQUIREMENT: When reporting a concern or dismissed_concern, cite exact function name(s), file path(s), and line number(s) when known. Do not invent line numbers; use null when exact values are unknown.
 
@@ -2234,6 +2243,8 @@ mod tests {
             "the candidate concern that was investigated and disproved",
             "NO DISMISSAL WITHOUT VERIFIED PROOF",
             "MUST cite the concrete disproving code",
+            "Citing a single caller",
+            "unpaired API/lifecycle call",
         ] {
             assert!(
                 STAGE_JSON_SCHEMA_EXAMPLE.contains(required),
@@ -2241,12 +2252,21 @@ mod tests {
             );
         }
         assert!(
-            STAGE_VERIFICATION_INSTRUCTION.contains("speculative_dismissal"),
-            "verification stage must classify speculative dismissals into hard_cases"
+            STAGE_IMPLEMENTATION_INSTRUCTION.contains("Do not stop after finding several bugs"),
+            "implementation stage must include full-hunk sweep directive"
         );
         assert!(
-            STAGE_POST_VERIFICATION_INSTRUCTION.contains("SYMMETRICAL PROOF BAR"),
-            "post-verification stage must enforce symmetrical proof bar"
+            STAGE_VERIFICATION_INSTRUCTION.contains("speculative_dismissal")
+                && STAGE_VERIFICATION_INSTRUCTION
+                    .contains("Single-caller or happy-path-only proofs")
+                && STAGE_VERIFICATION_INSTRUCTION
+                    .contains("Asymmetry or cleared-state rationalizations"),
+            "verification stage must classify speculative, single-caller, and asymmetry dismissals into hard_cases"
+        );
+        assert!(
+            STAGE_POST_VERIFICATION_INSTRUCTION.contains("SYMMETRICAL PROOF BAR")
+                && STAGE_POST_VERIFICATION_INSTRUCTION.contains("ALL-CALLERS VERIFICATION"),
+            "post-verification stage must enforce symmetrical proof bar and all-callers verification"
         );
     }
 
@@ -2781,6 +2801,75 @@ mod tests {
     }
 
     #[test]
+    fn test_post_verification_stage_preserves_existing_state() {
+        let batch = vec![json!({
+            "type": "Race Condition",
+            "description": "Candidate race in foo()",
+            "estimated_severity": "High",
+        })];
+        let stage = post_verification_stage("post-verification-1", batch, 10, 0.0);
+        let mut state = LinuxPatchReviewState {
+            findings: vec![json!({
+                "problem": "earlier finding",
+                "severity": "High",
+                "preexisting": false,
+            })],
+            concerns: vec![json!({
+                "type": "Pre-existing Race",
+                "description": "Old race condition",
+                "preexisting": true,
+            })],
+            deduplicated_dismissed_concerns: vec![json!({
+                "description": "Earlier dismissed concern",
+                "reasoning": "Already proved safe",
+            })],
+            ..Default::default()
+        };
+
+        let output = PostVerificationOutput {
+            findings: vec![
+                json!({
+                    "problem": "new post-verified finding",
+                    "severity": "High",
+                    "preexisting": false,
+                }),
+                json!({
+                    "problem": "post-verified pre-existing",
+                    "severity": "Medium",
+                    "severity_explanation": "Old leak",
+                    "preexisting": true,
+                }),
+            ],
+            dismissed_concerns: vec![json!({
+                "description": "Disproved hard case",
+                "reasoning": "Caller holds lock",
+            })],
+        };
+
+        (stage.reducer)(&mut state, output);
+
+        assert_eq!(state.findings.len(), 2);
+        assert_eq!(state.findings[0]["problem"], "earlier finding");
+        assert_eq!(state.findings[1]["problem"], "new post-verified finding");
+        assert_eq!(state.concerns.len(), 2);
+        assert_eq!(state.concerns[0]["description"], "Old race condition");
+        assert_eq!(
+            state.concerns[1]["description"],
+            "post-verified pre-existing"
+        );
+        assert_eq!(state.concerns[1]["reasoning"], "Old leak");
+        assert_eq!(state.deduplicated_dismissed_concerns.len(), 2);
+        assert_eq!(
+            state.deduplicated_dismissed_concerns[0]["description"],
+            "Earlier dismissed concern"
+        );
+        assert_eq!(
+            state.deduplicated_dismissed_concerns[1]["description"],
+            "Disproved hard case"
+        );
+    }
+
+    #[test]
     fn test_report_preexisting_keeps_preexisting_through_verification() {
         let ver_stage = verification_stage(20, 0.0);
 
@@ -2816,78 +2905,12 @@ mod tests {
         );
         assert_eq!(state.concerns[0]["severity"], "High");
     }
-    #[test]
-    fn test_post_verification_stage_preserves_existing_state() {
-        let mut state = LinuxPatchReviewState {
-            findings: vec![json!({"problem": "existing finding", "preexisting": false})],
-            concerns: vec![json!({"description": "existing preexisting"})],
-            deduplicated_dismissed_concerns: vec![json!({"description": "existing dismissed"})],
-            ..Default::default()
-        };
-
-        let pv1 = post_verification_stage("post-verification-1", vec![], 20, 0.0);
-        (pv1.reducer)(
-            &mut state,
-            PostVerificationOutput {
-                findings: vec![
-                    json!({
-                        "problem": "mm: new leak in foo()",
-                        "severity": "High",
-                        "severity_explanation": "Leak on error path",
-                        "preexisting": false,
-                        "locations": []
-                    }),
-                    json!({
-                        "problem": "net: old race in bar()",
-                        "severity": "Medium",
-                        "severity_explanation": "Unlocked access",
-                        "preexisting": true,
-                        "locations": []
-                    }),
-                ],
-                dismissed_concerns: vec![json!({"description": "dismissed in batch 1"})],
-            },
-        );
-
-        let pv2 = post_verification_stage("post-verification-2", vec![], 20, 0.0);
-        (pv2.reducer)(
-            &mut state,
-            PostVerificationOutput {
-                findings: vec![json!({
-                    "problem": "fs: use-after-free in baz()",
-                    "severity": "Critical",
-                    "severity_explanation": "Freed before return",
-                    "preexisting": false,
-                    "locations": []
-                })],
-                dismissed_concerns: vec![json!({"description": "dismissed in batch 2"})],
-            },
-        );
-
-        assert_eq!(state.findings.len(), 3);
-        assert_eq!(state.findings[0]["problem"], "existing finding");
-        assert_eq!(state.findings[1]["problem"], "mm: new leak in foo()");
-        assert_eq!(state.findings[2]["problem"], "fs: use-after-free in baz()");
-        assert_eq!(state.concerns.len(), 2);
-        assert_eq!(state.concerns[0]["description"], "existing preexisting");
-        assert_eq!(state.concerns[1]["description"], "net: old race in bar()");
-        assert_eq!(state.deduplicated_dismissed_concerns.len(), 3);
-        assert_eq!(
-            state.deduplicated_dismissed_concerns[0]["description"],
-            "existing dismissed"
-        );
-        assert_eq!(
-            state.deduplicated_dismissed_concerns[1]["description"],
-            "dismissed in batch 1"
-        );
-        assert_eq!(
-            state.deduplicated_dismissed_concerns[2]["description"],
-            "dismissed in batch 2"
-        );
-    }
 
     #[test]
     fn test_collect_stage_prompts_and_provenance_enrichment() {
+        // Use Gemini-style function-name tool call IDs ("read_prompt") across parallel
+        // calls where one call succeeds and another fails, verifying that a failed call
+        // does not drop a sibling successful call sharing the same tool_call_id.
         let outcome = crate::workflow::stage::StageOutcome {
             tokens_in: 10,
             tokens_out: 10,
@@ -2899,8 +2922,6 @@ mod tests {
                     thought: None,
                     thought_signature: None,
                     tool_calls: Some(vec![
-                        // Use Gemini-style duplicate "read_prompt" IDs in a parallel turn
-                        // so a failed read_prompt call does not poison successful siblings.
                         crate::ai::ToolCall {
                             id: "read_prompt".to_string(),
                             function_name: "read_prompt".to_string(),
