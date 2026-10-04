@@ -12,6 +12,9 @@ Sashiko is a self-contained, agentic Linux kernel code review system. It uses ke
 - **Mailing List:** Join [`sashiko@lists.linux.dev`](https://lore.kernel.org/sashiko) for announcements, feedback, and discussions (automated review replies use `sashiko-reviews@lists.linux.dev`).
 - **Community & Press:** Read what kernel maintainers and the media say in [Sashiko in the Press](PRESS.md).
 
+> [!NOTE]
+> **Other Open-Source Projects:** Sashiko is exploring covering other open-source projects beyond the Linux kernel. If you are interested in bringing Sashiko to your project, please reach out to Roman Gushchin (`roman.gushchin@linux.dev`).
+
 ## Quick Start (Local Patch Review)
 
 The easiest way to use Sashiko is `sashiko review`, which reviews commits directly in your local Linux kernel checkout without running a daemon or database.
