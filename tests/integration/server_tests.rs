@@ -1,8 +1,5 @@
-//! Integration tests that spin up a real HTTP server and exercise the API.
-//!
-//! These tests are marked `#[ignore]` so they only run via `make integration-test`
-//! (i.e. `cargo test --all-features --test integration_tests -- --ignored`). They are included in the tag-release
-//! CI workflow but skipped during normal `make test` / PR checks.
+//! Integration tests that spin up an in-memory HTTP server on an ephemeral port
+//! and exercise the REST API.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -121,7 +118,6 @@ async fn spawn_test_server(read_only: bool) -> TestServer {
 // ── Smoke Tests ─────────────────────────────────────────────────────────
 
 #[tokio::test]
-#[ignore]
 async fn test_stats_endpoint_returns_ok() {
     let server = spawn_test_server(false).await;
     let resp = reqwest::get(format!("{}/api/stats", server.base_url))
@@ -136,7 +132,6 @@ async fn test_stats_endpoint_returns_ok() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_patchsets_empty_on_fresh_db() {
     let server = spawn_test_server(false).await;
     let resp = reqwest::get(format!("{}/api/patchsets", server.base_url))
@@ -151,7 +146,6 @@ async fn test_patchsets_empty_on_fresh_db() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_messages_empty_on_fresh_db() {
     let server = spawn_test_server(false).await;
     let resp = reqwest::get(format!("{}/api/messages", server.base_url))
@@ -166,7 +160,6 @@ async fn test_messages_empty_on_fresh_db() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_lists_empty_on_fresh_db() {
     let server = spawn_test_server(false).await;
     let resp = reqwest::get(format!("{}/api/lists", server.base_url))
@@ -214,7 +207,6 @@ index 1a2b3c4d5e6f..7a8b9c0d1e2f 100644
 ";
 
 #[tokio::test]
-#[ignore]
 async fn test_submit_inject_accepted() {
     let mut server = spawn_test_server(false).await;
 
@@ -249,7 +241,6 @@ async fn test_submit_inject_accepted() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_submit_rejected_in_read_only_mode() {
     let server = spawn_test_server(/* read_only */ true).await;
 
@@ -269,7 +260,6 @@ async fn test_submit_rejected_in_read_only_mode() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_submit_rejects_empty_mbox() {
     let server = spawn_test_server(false).await;
 
@@ -289,7 +279,6 @@ async fn test_submit_rejects_empty_mbox() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_submit_rejects_a_baseline_that_is_not_a_commit_id() {
     let server = spawn_test_server(false).await;
     let client = reqwest::Client::new();
@@ -335,7 +324,6 @@ async fn test_submit_rejects_a_baseline_that_is_not_a_commit_id() {
 // ── Database-Backed Query Tests ─────────────────────────────────────────
 
 #[tokio::test]
-#[ignore]
 async fn test_patchsets_returned_after_insert() {
     let server = spawn_test_server(false).await;
 
@@ -388,7 +376,6 @@ async fn test_patchsets_returned_after_insert() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_message_details_via_api() {
     let server = spawn_test_server(false).await;
 
@@ -418,7 +405,6 @@ async fn test_message_details_via_api() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_stats_reviews_endpoint() {
     let server = spawn_test_server(false).await;
 
@@ -478,7 +464,6 @@ async fn test_stats_reviews_endpoint() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_stats_tools_endpoint() {
     let server = spawn_test_server(false).await;
 
@@ -536,7 +521,6 @@ async fn test_stats_tools_endpoint() {
 // ── Redirect Tests ───────────────────────────────────────────────────────
 
 #[tokio::test]
-#[ignore]
 async fn test_redirect_www_to_non_www() {
     let server = spawn_test_server(false).await;
 
@@ -560,7 +544,6 @@ async fn test_redirect_www_to_non_www() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_redirect_www_to_non_www_with_path_and_query() {
     let server = spawn_test_server(false).await;
 
@@ -584,7 +567,6 @@ async fn test_redirect_www_to_non_www_with_path_and_query() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_review_endpoint_returns_logs() {
     let server = spawn_test_server(false).await;
 
