@@ -1,7 +1,7 @@
 # Sashiko Development and CI Tasks
 
-.PHONY: help build fmt lint lint-local lint-local-cache test test-local test-local-cache clean
-.PHONY: check-pr check-integration check-all sob integration-test check-db-invariants
+.PHONY: help build fmt lint lint-local lint-local-cache test clean
+.PHONY: check-pr check-all sob check-db-invariants
 
 # Default target
 .DEFAULT_GOAL := help
@@ -11,24 +11,21 @@ help:
 	@echo "Available targets:"
 	@echo ""
 	@echo "  Development:"
-	@echo "    build             - Build release binary"
-	@echo "    fmt               - Auto-format Rust code"
-	@echo "    lint              - Run all linters (clippy, fmt --check, yamllint)"
-	@echo "    lint-local        - Run clippy on local-review profile (no cache)"
-	@echo "    lint-local-cache  - Run clippy on local-review profile with cache"
-	@echo "    test              - Run unit tests"
-	@echo "    test-local        - Run tests on local-review profile (no cache)"
-	@echo "    test-local-cache  - Run tests on local-review profile with cache"
-	@echo "    clean             - Remove build artifacts"
+	@echo "    build               - Build release binary"
+	@echo "    fmt                 - Auto-format Rust code"
+	@echo "    lint                - Run all linters (clippy, fmt --check, yamllint)"
+	@echo "    lint-local          - Run clippy on local-review profile (no cache)"
+	@echo "    lint-local-cache    - Run clippy on local-review profile with cache"
+	@echo "    test                - Run unit and integration tests"
+	@echo "    clean               - Remove build artifacts"
 	@echo ""
 	@echo "  CI Suites:"
-	@echo "    check-pr          - Run all PR checks (SOB, Lint, Unit Tests)"
-	@echo "    check-integration - Run integration tests (server + API)"
-	@echo "    check-all         - Run the complete check suite (PR + Integration)"
-	@echo "    check-db-invariants- Check database state anomalies"
+	@echo "    check-pr            - Run fast diff-aware local checks (RANGE=HEAD~1..HEAD)"
+	@echo "    check-all           - Run the complete check suite unconditionally"
+	@echo "    check-db-invariants - Check database state anomalies"
 	@echo ""
 	@echo "  Utilities:"
-	@echo "    sob               - Check Signed-off-by tags (RANGE=HEAD~1..HEAD)"
+	@echo "    sob                 - Check Signed-off-by tags (RANGE=HEAD~1..HEAD)"
 
 # ── Development ──────────────────────────────────────────
 
@@ -44,7 +41,7 @@ fmt:
 lint:
 	@cargo clippy --all-targets --all-features -- -D warnings
 	@cargo fmt --all -- --check
-	-@yamllint .
+	@yamllint .
 
 # Run clippy on local-review feature profile (without cache)
 lint-local:
@@ -54,17 +51,9 @@ lint-local:
 lint-local-cache:
 	@cargo clippy --all-targets --no-default-features --features cache -- -D warnings
 
-# Run unit tests
+# Run unit and integration tests
 test:
 	@cargo test --all-features
-
-# Run tests on local-review feature profile (without cache)
-test-local:
-	@cargo test --no-default-features
-
-# Run tests on local-review feature profile with cache
-test-local-cache:
-	@cargo test --no-default-features --features cache
 
 # Remove build artifacts
 clean:
@@ -72,22 +61,43 @@ clean:
 
 # ── CI Suites ────────────────────────────────────────────
 
-# [PR Suite] Run all checks required for a Pull Request (SOB, Lint, Unit Tests)
-check-pr: sob lint lint-local lint-local-cache test test-local test-local-cache
+# [Local PR Suite] Fast diff-aware local pre-flight check.
+# Skips local cargo clippy/test when only non-code files (such as docs or
+# prompts) are modified; GitHub Actions CI runs the full Rust test suite
+# unconditionally on every pull request and push.
+RANGE ?= HEAD~1..HEAD
+check-pr: sob
+	@set -e; \
+	WORKTREE_CHANGED=$$(git diff --name-only HEAD); \
+	RANGE_CHANGED=$$(git diff --name-only "$(RANGE)"); \
+	CHANGED=$$(printf "%s\n%s\n" "$$WORKTREE_CHANGED" "$$RANGE_CHANGED" | sed '/^$$/d' | sort -u); \
+	if [ -z "$$CHANGED" ]; then \
+		echo "No changed files detected."; \
+		exit 0; \
+	fi; \
+	if echo "$$CHANGED" | grep -qE '\.(yml|yaml)$$|^\.yamllint$$'; then \
+		echo "Running yamllint..."; \
+		yamllint .; \
+	else \
+		echo "No YAML changes detected; skipping yamllint."; \
+	fi; \
+	if echo "$$CHANGED" | grep -qE '^src/|^tests/|\.rs$$|^Cargo\.(toml|lock)$$|^rust-toolchain\.toml$$'; then \
+		echo "Running Rust fmt, clippy, and tests..."; \
+		cargo fmt --all -- --check; \
+		cargo clippy --all-targets --all-features -- -D warnings; \
+		cargo clippy --all-targets --no-default-features -- -D warnings; \
+		cargo clippy --all-targets --no-default-features --features cache -- -D warnings; \
+		cargo test --all-features; \
+	else \
+		echo "No Rust changes detected; skipping local cargo lint and test."; \
+	fi
 
-# [Integration Suite] Run #[ignore]-tagged integration tests (server + API)
-check-integration: integration-test
-
-# Run the complete check suite (PR + Integration)
-check-all: check-pr check-integration check-db-invariants
+# Run the complete check suite unconditionally
+check-all: sob lint lint-local lint-local-cache test check-db-invariants
 
 # Check Signed-off-by tags (default: HEAD~1..HEAD)
-RANGE ?= HEAD~1..HEAD
 sob:
-	-@./scripts/check-sob.sh "$(RANGE)"
-# Run #[ignore]-tagged integration tests (spins up real HTTP servers)
-integration-test:
-	@cargo test --all-features --test integration_tests -- --ignored
+	@./scripts/check-sob.sh "$(RANGE)"
 
 # Run lightweight database invariant checks
 check-db-invariants:

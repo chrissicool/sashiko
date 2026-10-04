@@ -5,3 +5,5 @@ ignore: |
   benchmarks/smoke-repo/
   review_trees/
   third_party/
+  target/
+  archives/

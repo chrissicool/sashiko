@@ -31,10 +31,9 @@ Before opening or updating a pull request, ensure your code compiles cleanly wit
 make check-pr
 ```
 
-`make check-pr` runs:
-- `make sob` — validates `Signed-off-by` tags across the commit range.
-- `make lint` / `make lint-local` / `make lint-local-cache` — checks `cargo fmt`, `cargo clippy` across feature profiles (`server`, `--no-default-features`, and `--features cache`), and `yamllint`.
-- `make test` / `make test-local` / `make test-local-cache` — runs the unit and integration test suites across all Cargo feature profiles.
+`make check-pr` inspects the modified files and runs the relevant checks:
+- `yamllint` when YAML configuration or workflow files are touched.
+- `cargo fmt`, `cargo clippy` across feature profiles (`server`, `--no-default-features`, and `--features cache`), and `cargo test --all-features` when Rust source or Cargo files are touched.
 
 If you are modifying Linux kernel review prompts (`third_party/prompts/`) or review workflows, also validate your changes against the benchmark suite (see the [Benchmarking Guide](docs/benchmarking.md)).
 

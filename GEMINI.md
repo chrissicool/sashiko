@@ -8,7 +8,7 @@ You're an expert Software Engineer with deep knowledge of Rust, Distributed Syst
 - **Never** use backticks to quote any code, functions and variables names, etc. in the commit message.
 - **Never** include metadata tags like `TAG` or `CONV` in commit messages. Only include standard git trailers (like `Signed-off-by`).
 - After each change if it touches the Rust code make sure the code compiles and all tests pass. Never start a new task with non-clean git status. Clear the context between tasks.
-- Make sure to not commit any logs or temporary files. NEVER commit before running `make check-pr` to ensure CI/CD checks pass.
+- Make sure to not commit any logs or temporary files. Before committing, run `make check-pr` (which only runs `yamllint` when YAML files change and only runs Rust lint/tests when Rust or Cargo files change).
 - Before opening or updating a Pull Request, run `sashiko review --project sashiko --agent` in the local agentic loop on the commits being proposed and resolve any reported issues.
 - After opening or updating a Pull Request, check for upstream `sashiko-for-sashiko` review comments posted on GitHub (`gh pr view <num> --json comments,reviews`) and act on every finding: either fix the issue and push an updated commit, or post a reply explaining with concrete code evidence why the finding is a false positive (and ideally propose a prompt or workflow change to `sashiko-for-sashiko` to prevent it).
 - Once the task is done, no local changes should remain. Amend them to the previous commit, if it makes sense, make a standalone commit or get rid of them.
@@ -27,12 +27,11 @@ Install the following tools to manage the development lifecycle:
 
 ## 2. Common Commands
 Use `make` to run common development tasks:
-- `make lint`: Run all linters (clippy, fmt, yamllint).
-- `make test`: Run unit tests.
-- `make integration-test`: Run the full integration smoke tests (starts server, runs benchmark, cleans up).
-- `make sob`: Validate Signed-off-by tags for a commit range.
-- `make check-pr`: Run all checks required for a Pull Request (`sob`, `lint`, `lint-local`, `lint-local-cache`, `test`, `test-local`, `test-local-cache`).
-- `make check-all`: Run the complete suite including integration tests and database invariants (`check-pr`, `check-integration`, `check-db-invariants`).
+- `make lint`: Run all linters (`clippy`, `fmt`, `yamllint`).
+- `make lint-local` / `make lint-local-cache`: Run `clippy` on minimal local-review feature profiles (`--no-default-features` and `--features cache`).
+- `make test`: Run unit and integration tests (`cargo test --all-features`).
+- `make check-pr`: Run diff-aware PR checks (runs `yamllint` only when YAML files changed, and `fmt`, `clippy` across feature profiles, and `test` only when Rust/Cargo files changed).
+- `make check-all`: Run the complete suite unconditionally (`lint`, `lint-local`, `lint-local-cache`, `test`, `check-db-invariants`).
 - `make check-db-invariants`: Run lightweight database invariant checks.
 
 ## 3. Self-Review (Sashiko for Sashiko)
