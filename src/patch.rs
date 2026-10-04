@@ -45,6 +45,10 @@ pub struct Patch {
     pub body: String,
     pub diff: String,
     pub part_index: u32,
+    /// The `Subject:` the changeset carried, when it arrived as a
+    /// format-patch block inside a larger mail. `None` leaves the patch
+    /// named after the mail it came in.
+    pub subject: Option<String>,
 }
 
 #[cfg(feature = "server")]
@@ -284,11 +288,12 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Vec<Patch>)> {
         changesets
             .into_iter()
             .enumerate()
-            .map(|(n, diff)| Patch {
+            .map(|(n, changeset)| Patch {
                 message_id: format!("{}#{}", message_id, n + 1),
-                body: body.clone(),
-                diff,
+                body: changeset.message,
+                diff: changeset.diff,
                 part_index: u32::try_from(n + 1).unwrap_or(u32::MAX),
+                subject: changeset.subject,
             })
             .collect()
     } else if has_diff {
@@ -297,6 +302,7 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Vec<Patch>)> {
             body: body.clone(),
             diff,
             part_index: index,
+            subject: None,
         }]
     } else {
         Vec::new()
@@ -403,24 +409,72 @@ fn changeset_starts(body: &str) -> Vec<usize> {
     starts
 }
 
-/// Splits `body` into one string per changeset, dropping any region that turns
+/// One changeset of a batched mail: the diff, and the commit it describes.
+#[cfg(feature = "server")]
+pub(crate) struct Changeset {
+    pub subject: Option<String>,
+    pub message: String,
+    pub diff: String,
+}
+
+/// The `Subject:` of a format-patch block, if its headers are there.
+#[cfg(feature = "server")]
+fn preamble_subject(preamble: &str) -> Option<String> {
+    preamble
+        .lines()
+        .rev()
+        .find_map(|l| l.strip_prefix("Subject: "))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The commit message under that `Subject:`, up to the diffstat separator.
+#[cfg(feature = "server")]
+fn preamble_message(preamble: &str) -> String {
+    let lines: Vec<&str> = preamble.lines().collect();
+    let Some(subject_at) = lines.iter().rposition(|l| l.starts_with("Subject: ")) else {
+        return String::new();
+    };
+    let body = lines[subject_at + 1..]
+        .iter()
+        .take_while(|l| l.trim_end() != "---")
+        .copied()
+        .collect::<Vec<_>>();
+    body.join("\n").trim().to_string()
+}
+
+/// Splits `body` into one changeset per commit, dropping any region that turns
 /// out to carry no diff after all.
 ///
 /// A region is kept when it holds a hunk, or is a git diff whose only change is
-/// to a mode or a name and so has none.
+/// to a mode or a name and so has none. The headers introducing a commit trail
+/// the diff before it, so each region hands its tail to the next.
 #[cfg(feature = "server")]
-fn split_changesets(body: &str) -> Vec<String> {
+fn split_changesets(body: &str) -> Vec<Changeset> {
     let lines: Vec<&str> = body.lines().collect();
     let starts = changeset_starts(body);
     let mut out = Vec::new();
+    // What precedes the first diff introduces it; what trails a diff
+    // introduces the next one, so each region hands its tail forward.
+    let mut preamble = lines[..starts.first().copied().unwrap_or(0)].join("\n");
     for (n, &start) in starts.iter().enumerate() {
         let end = starts.get(n + 1).copied().unwrap_or(lines.len());
-        let region = lines[start..end].join("\n");
-        let carries_diff = region.lines().any(|l| l.starts_with("@@ -"))
-            || region.lines().any(|l| l.starts_with("diff --git "));
+        let region = &lines[start..end];
+        let cut = region
+            .iter()
+            .rposition(|l| crate::mbox::is_mbox_separator(l.as_bytes()))
+            .unwrap_or(region.len());
+        let diff = region[..cut].join("\n");
+        let carries_diff = diff.lines().any(|l| l.starts_with("@@ -"))
+            || diff.lines().any(|l| l.starts_with("diff --git "));
         if carries_diff {
-            out.push(region);
+            out.push(Changeset {
+                subject: preamble_subject(&preamble),
+                message: preamble_message(&preamble),
+                diff,
+            });
         }
+        preamble = region[cut..].join("\n");
     }
     out
 }
@@ -1152,6 +1206,61 @@ diff --git a/file.c b/file.c";
     ///
     /// The next file's header follows hunk content directly, with no prose
     /// between, which is what separates it from a new patch.
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_a_changeset_keeps_the_headers_that_introduce_it() {
+        let body = "\
+Here is the first batch.
+
+From 1850 Mon Sep 17 00:00:00 2001
+From: A <a@example.com>
+Subject: [PATCH 01/02] qwz: reject state changes while stopped
+
+Backport qwx.c,v 1.75.
+---
+ sys/dev/ic/qwz.c | 5 +++++
+
+diff --git sys/dev/ic/qwz.c sys/dev/ic/qwz.c
+@@ -859,6 +859,11 @@ qwz_newstate(void)
++\tfirst
+ 
+From 40ca Mon Sep 17 00:00:00 2001
+From: A <a@example.com>
+Subject: [PATCH 02/02] qwz: retain active key task arguments
+
+Recheck association state after waits.
+---
+ sys/dev/ic/qwz.c | 4 ++++
+
+diff --git sys/dev/ic/qwz.c sys/dev/ic/qwz.c
+@@ -743,6 +743,12 @@ qwz_add_sta_key(void)
++\tsecond
+";
+        let sets = split_changesets(body);
+        assert_eq!(sets.len(), 2, "two changesets");
+
+        assert_eq!(
+            sets[0].subject.as_deref(),
+            Some("[PATCH 01/02] qwz: reject state changes while stopped")
+        );
+        assert_eq!(sets[0].message, "Backport qwx.c,v 1.75.");
+        assert_eq!(
+            sets[1].subject.as_deref(),
+            Some("[PATCH 02/02] qwz: retain active key task arguments")
+        );
+        assert_eq!(sets[1].message, "Recheck association state after waits.");
+
+        // Each diff stops where the next commit is announced, so no part
+        // carries the headers of the one after it.
+        assert!(sets[0].diff.contains("first"), "{}", sets[0].diff);
+        assert!(
+            !sets[0].diff.contains("PATCH 02/02"),
+            "the next commit's headers leaked into this diff: {}",
+            sets[0].diff
+        );
+        assert!(sets[1].diff.contains("second"), "{}", sets[1].diff);
+    }
+
     #[cfg(feature = "server")]
     #[test]
     fn test_a_multi_file_diff_is_one_changeset() {

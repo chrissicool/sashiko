@@ -1234,6 +1234,18 @@ pub struct ForgeOutboxRow {
     pub created_at: i64,
 }
 
+/// The message a split changeset came from, as `create_part_message` needs it.
+#[cfg(feature = "server")]
+pub struct PartMessageParent<'a> {
+    pub thread_id: i64,
+    pub message_id: &'a str,
+    pub author: &'a str,
+    pub date: i64,
+    pub to: &'a str,
+    pub cc: &'a str,
+    pub mailing_list: Option<&'a str>,
+}
+
 #[cfg(feature = "server")]
 impl Database {
     pub fn has_bug_actor(&self) -> bool {
@@ -1383,7 +1395,7 @@ impl Database {
             let mut messages = Vec::new();
             if let Some(tid) = thread_id {
                 let mut msg_rows = self.conn.query(
-                    "SELECT id, message_id, author, date, subject, in_reply_to FROM messages WHERE thread_id = ? AND subject != '(placeholder)' ORDER BY date ASC",
+                    "SELECT id, message_id, author, date, subject, in_reply_to FROM messages WHERE thread_id = ? AND subject != '(placeholder)' AND message_id NOT LIKE '%#%' ORDER BY date ASC",
                     libsql::params![tid]
                 ).await?;
                 while let Ok(Some(m)) = msg_rows.next().await {
@@ -5405,6 +5417,37 @@ impl Database {
         Ok(thread_id)
     }
 
+    /// Records the message row a split changeset needs to exist as a patch.
+    ///
+    /// `patches.message_id` is a foreign key into `messages`, and a mail
+    /// carrying several changesets yields parts whose ids no mail ever had.
+    /// The row carries the part's own `Subject:` and commit message, so the
+    /// patch applies and reviews under the name its author gave it. Thread
+    /// and list views leave it out by its id, so the one message that was
+    /// really sent stays the only one on show.
+    pub async fn create_part_message(
+        &self,
+        part_message_id: &str,
+        subject: Option<&str>,
+        message: &str,
+        parent: &PartMessageParent<'_>,
+    ) -> Result<()> {
+        self.create_message(
+            part_message_id,
+            parent.thread_id,
+            Some(parent.message_id),
+            parent.author,
+            subject.unwrap_or("(placeholder)"),
+            parent.date,
+            message,
+            parent.to,
+            parent.cc,
+            None,
+            parent.mailing_list,
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn create_message(
         &self,
@@ -7015,6 +7058,12 @@ impl Database {
 
         // Always exclude placeholders
         conditions.push("subject != '(placeholder)'".to_string());
+        // A changeset split out of a batched mail is not a message anybody
+        // sent, so it stays out of the message list. Patchsets carry no
+        // message_id of their own, so the test is only theirs to fail.
+        if target != "patchset" {
+            conditions.push("message_id NOT LIKE '%#%'".to_string());
+        }
 
         if let Some(list) = mailing_list
             && !list.is_empty()
@@ -7683,7 +7732,7 @@ impl Database {
             let mut messages = Vec::new();
             if let Some(tid) = thread_id {
                 let mut msg_rows = self.conn.query(
-                    "SELECT id, message_id, author, date, subject, in_reply_to FROM messages WHERE thread_id = ? AND subject != '(placeholder)' ORDER BY date ASC",
+                    "SELECT id, message_id, author, date, subject, in_reply_to FROM messages WHERE thread_id = ? AND subject != '(placeholder)' AND message_id NOT LIKE '%#%' ORDER BY date ASC",
                     libsql::params![tid]
                 ).await?;
                 while let Ok(Some(m)) = msg_rows.next().await {
@@ -7931,7 +7980,7 @@ impl Database {
             let mut messages = Vec::new();
             if let Some(tid) = thread_id {
                 let mut msg_rows = self.conn.query(
-                    "SELECT id, message_id, author, date, subject, in_reply_to FROM messages WHERE thread_id = ? AND subject != '(placeholder)' ORDER BY date ASC",
+                    "SELECT id, message_id, author, date, subject, in_reply_to FROM messages WHERE thread_id = ? AND subject != '(placeholder)' AND message_id NOT LIKE '%#%' ORDER BY date ASC",
                     libsql::params![tid]
                 ).await?;
                 while let Ok(Some(m)) = msg_rows.next().await {
@@ -19923,6 +19972,109 @@ mod tests {
         assert_eq!(
             db.get_patchset_status(ps_id).await.unwrap().as_deref(),
             Some("Cancelled")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_split_changeset_needs_its_own_message_row() {
+        let db = setup_db().await;
+        let author = "Author <author@example.com>";
+        let mail = "87wls64qff.wl-author@example.com";
+
+        let thread_id = db
+            .create_thread(mail, "Batch of fixes", 1000)
+            .await
+            .unwrap();
+        db.create_message(
+            mail,
+            thread_id,
+            None,
+            author,
+            "Batch of fixes",
+            1000,
+            "body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let patchset_id = db
+            .create_patchset(
+                thread_id,
+                Some(mail),
+                mail,
+                "Batch of fixes",
+                author,
+                1000,
+                2,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The id a split part carries names no mail, so the foreign key on
+        // patches.message_id refuses it until the row exists.
+        let part = format!("{mail}#1");
+        assert!(
+            db.create_patch(patchset_id, &part, 1, "diff --git a b\n")
+                .await
+                .is_err(),
+            "a part with no message row must be refused"
+        );
+
+        db.create_part_message(
+            &part,
+            Some("[PATCH 01/02] qwz: reject state changes while stopped"),
+            "Backport sys/dev/ic/qwx.c,v 1.75.",
+            &PartMessageParent {
+                thread_id,
+                message_id: mail,
+                author,
+                date: 1000,
+                to: "",
+                cc: "",
+                mailing_list: None,
+            },
+        )
+        .await
+        .unwrap();
+        db.create_patch(patchset_id, &part, 1, "diff --git a b\n")
+            .await
+            .expect("a part with its message row must be accepted");
+
+        // The part is left out of the thread by its id, so the reader still
+        // sees the one message that was sent.
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM messages WHERE thread_id = ? AND subject != '(placeholder)' AND message_id NOT LIKE '%#%'",
+                libsql::params![thread_id],
+            )
+            .await
+            .unwrap();
+        let shown: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            shown, 1,
+            "only the mail that was sent belongs in the thread"
+        );
+
+        // It still applies and reviews under the name its author gave it.
+        let diffs = db.get_patch_diffs(patchset_id).await.unwrap();
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(
+            diffs[0].3,
+            "[PATCH 01/02] qwz: reject state changes while stopped"
         );
     }
 

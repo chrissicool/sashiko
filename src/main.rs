@@ -656,6 +656,7 @@ async fn run_daemon(
                             body: message,
                             diff,
                             part_index: index,
+                            subject: None,
                         }];
 
                         let source = if group.starts_with("git-import") {
@@ -3076,6 +3077,38 @@ async fn process_parsed_article(
                         "Failed to attribute patchset {} to MAINTAINERS sections: {}",
                         patchset_id, e
                     );
+                }
+
+                // A mail carrying several changesets yields one patch per
+                // changeset, under an id no mail ever had. Give each its row in
+                // messages first, because patches.message_id is a foreign key
+                // there and the insert is refused without it.
+                for patch in &patch_list {
+                    if patch.message_id == metadata.message_id {
+                        continue;
+                    }
+                    if let Err(e) = worker_db
+                        .create_part_message(
+                            &patch.message_id,
+                            patch.subject.as_deref(),
+                            &patch.body,
+                            &sashiko::db::PartMessageParent {
+                                thread_id,
+                                message_id: &metadata.message_id,
+                                author: &metadata.author,
+                                date: metadata.date,
+                                to: &metadata.to,
+                                cc: &metadata.cc,
+                                mailing_list: Some(&group),
+                            },
+                        )
+                        .await
+                    {
+                        error!(
+                            "Failed to record part {} of {}: {}",
+                            patch.part_index, metadata.message_id, e
+                        );
+                    }
                 }
 
                 for patch in patch_list {
