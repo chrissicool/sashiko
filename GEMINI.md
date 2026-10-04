@@ -128,7 +128,6 @@ Sashiko reviews changes to its own repository using the `--project sashiko` prof
 - `email_policy.toml`: Email policy configuration.
 - `prompts/sashiko/`: First-party review prompts, subsystem invariants, and pattern guides for reviewing Sashiko itself (`--project sashiko`).
 - `third_party/prompts/`: Markdown templates/prompts for AI reviews of upstream projects (Linux kernel, systemd, iproute).
-- `skills/`: Agent skills directory.
 - `static/`: Web assets (HTML, images).
 
 ## Data & External

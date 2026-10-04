@@ -87,8 +87,3 @@ When you open or update a pull request on GitHub, the upstream Sashiko service (
 ## Coding Standards & AI Coding Agents
 
 Detailed Rust coding standards, architectural rules, and LLM workflow design principles are documented in [GEMINI.md](GEMINI.md) (also linked via [AGENTS.md](AGENTS.md)).
-
-We also provide specialized agent skills under `skills/` to automate development workflows:
-
-- **`review-pr`** (`skills/review-pr/SKILL.md`): Performs deep code reviews against [GEMINI.md](GEMINI.md) and design documents (`designs/`), generating categorized findings with suggested diffs.
-- **`sashiko-feature`** (`skills/sashiko-feature/SKILL.md`): Guides end-to-end feature implementation, from design document creation and codebase investigation to iterative `make check-pr` and self-review verification.
