@@ -36,32 +36,57 @@ and never less.
 
 ### 1.3 Diverge & Converge (Map-Reduce)
 Broad, complex analyses must split into parallel specialized stages (Map)
-followed by consolidation stages (`deduplication` -> `conflict-resolution` ->
-`verification`) (Reduce).
+followed by consolidation stages (`verification` -> parallel `post-verification`)
+(Reduce).
 - **Invariant**: Parallel map stages must never mutate shared state directly.
   They return a deferred `StateMutation` closure (`stage.rs:execute_isolated`)
   that appends items tagged with the stage name (`append_stage_items`).
+- **Note (`verification` stage `ToolScope::All`)**: `verification_stage`
+  intentionally sets `ToolScope::All` so it can call `read_prompt` (recorded via
+  `outcome.read_prompts()` in `enrich_verification_output`) or perform quick
+  location spot-checks while `STAGE_VERIFICATION_INSTRUCTION` explicitly directs
+  the model to route any candidate requiring caller/callee/tree investigation
+  into `hard_cases` for parallel `post-verification`. Do not flag
+  `verification_stage`'s `ToolScope::All` as a bug.
 
 ### 1.4 Negative Data Tracking (`dismissed_concerns`)
 When an analysis stage investigates a plausible defect and proves it is safe,
 it must output that item in `dismissed_concerns` with concrete evidence in
-`reasoning`.
-- **Why this matters**: `conflict-resolution` compares `concerns` against
-  `dismissed_concerns`. If one stage flags a candidate bug and another stage
-  traced the caller and proved the precondition is impossible, the dismissed
-  concern prevents a false positive.
+`reasoning` and a disproving `code_snippet` in `locations`.
+- **Why this matters**: `verification` consolidates and classifies `concerns`
+  and `dismissed_concerns` into well-justified concerns (`findings`),
+  well-justified dismissals (`dismissed_concerns`), and speculative or
+  contested `hard_cases` (which are verified with tools in parallel
+  `post-verification` stages). If one stage flags a candidate bug and another
+  stage traced the caller and proved the precondition is impossible, routing the
+  contested item through `hard_cases` into `post-verification` prevents a false
+  positive, while auditing standalone speculative dismissals prevents missed
+  bugs.
+- **Terminal `post-verification` output (`PostVerificationOutput`)**: Every
+  `post-verification` stage must account for its candidate hard cases in either
+  `findings: Vec<Value>` (if validated) or `dismissed_concerns: Vec<Value>`
+  (only if disproved by concrete code with a verbatim `code_snippet` in
+  `locations`, validated by `validate_post_verification_output`). Its reducer
+  appends `out.dismissed_concerns` into `state.deduplicated_dismissed_concerns`,
+  which is exported in the review's final `dismissed_concerns` output.
 - **Violation**: Any reducer or consolidation stage that drops
-  `dismissed_concerns` before `conflict-resolution` breaks negative data
-  tracking.
+  `dismissed_concerns` before or during `verification` / `post-verification`, or
+  allows a stage to silently drop a candidate issue without a disproving
+  `code_snippet` in `dismissed_concerns`, breaks negative data tracking.
 
 ### 1.5 Early Exits (Short-Circuiting)
-Workflows must defensively bail out as soon as further processing is unnecessary
-using `WorkflowBuilder::early_exit_if`.
+Workflows must defensively bail out or skip consolidation stages as soon as
+further processing is unnecessary using `WorkflowBuilder::early_exit_if` (or
+`StageBuilder::skip_if` when a trailing stage such as `summary_stage` must
+always run).
 - **Required Checkpoints**:
-  1. After parallel analysis stages: exit if `all_concerns.is_empty()`.
-  2. After deduplication: exit if `deduplicated_concerns.is_empty()`.
-  3. After conflict resolution: exit if `patch_concerns.is_empty()`.
-  4. After verification: exit if `findings.is_empty()`.
+  1. After parallel analysis stages: exit (or skip `verification`) if
+     `all_concerns.is_empty() && all_dismissed_concerns.is_empty()`.
+  2. After `verification`: `resolve_post_verification_stages_with_options`
+     returns an empty stage list when `hard_cases.is_empty()`.
+  3. After `verification` and `post-verification`: exit (or skip `report_stage`
+     in workflows with a trailing `summary_stage` like `sashiko_patch_review`)
+     if `findings.is_empty()`.
 - **Why**: Running consolidation or report generation on empty arrays wastes
   tokens and tempts the LLM to hallucinate findings to satisfy its prompt.
 
@@ -86,7 +111,12 @@ Never force the LLM to choose between a fixed set of enum options unless those
 options mathematically partition all possible real-world scenarios.
 - **Rule**: Classifiers and severity/category enums must include an escape path
   (e.g., `"Other"`, `"Unknown"`, or allowing `line: null` when an exact line
-  number is unknown).
+  number is unknown). Note: for `findings[].severity` and
+  `hard_cases[].estimated_severity`, the structural validators
+  (`validate_finding_object`, `validate_verification_stage_output`) and JSON
+  schema descriptions accept `"Unknown"` as a fallback escape hatch even when
+  the stage instruction asks the model to calibrate severity to `Low`, `Medium`,
+  `High`, or `Critical` per `severity.md`.
 - **Why**: When boxed into a rigid schema without an escape hatch, an LLM will
   hallucinate an incorrect classification or invent line numbers rather than
   fail schema validation.

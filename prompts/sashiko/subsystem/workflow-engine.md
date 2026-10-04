@@ -66,9 +66,9 @@ capturing an `Arc<Mutex<...>>` in a reducer or a `with_var` extractor, which
    sibling's prompt says, depending on scheduling.
 2. *Results stop being reproducible.* `all_concerns` order is currently
    fixed by the `stages` slice order, because mutations are applied in a `for`
-   loop after the join. The deduplication stage serialises `all_concerns` into
+   loop after the join. The `verification` stage serialises `all_concerns` into
    its prompt verbatim (`serde_json::to_string_pretty(&s.all_concerns)`), so
-   any reordering changes the dedup prompt and therefore the review output.
+   any reordering changes the verification prompt and therefore the review output.
    Two runs of the same patch would diverge for no reason visible in a log.
 3. *`BestEffort` stops being partial-failure-safe.* A stage that fails
    mid-run has already published half its mutations; the engine's error
@@ -107,14 +107,21 @@ stage.name(), err)` and nothing else — no event, no state marker, no field on
 `WorkflowOutcome`. Downstream stages cannot tell that a stage was dropped;
 they see fewer concerns and cannot distinguish that from a clean stage.
 
-The review pipeline uses `BestEffort` for its analysis fan-out
-(`build_linux_patch_review_workflow_with_options`), deliberately: one
-misbehaving analyst must not throw away six others' work.
+The review pipeline uses `BestEffort` for both its analysis fan-out and its
+per-candidate `post-verification` fan-out
+(`build_linux_patch_review_workflow_with_options` and
+`build_sashiko_patch_review_workflow_with_options`), deliberately: one
+misbehaving analyst or one `post-verification-N` stage exhausting its turn or
+validation budget on a single candidate batch must not abort the entire review
+and discard the six other analysts' work or the already-validated
+`state.findings` from `verification` and sibling `post-verification` stages
+(which `FailFast` would throw away).
 
 **Check in a diff:**
 - A switch from `BestEffort` to `FailFast` on a batch whose stages have
-  independent value. You are trading six stages' partial results for a hard
-  abort on one.
+  independent value (such as the analysis or `post-verification` fan-outs). You
+  are trading sibling stages' partial results (and any prior `verification`
+  findings) for a hard abort on one.
 - A switch from `FailFast` to `BestEffort` on a batch where a later step
   *requires* a specific stage's reducer to have run. There is no per-stage
   success signal, so the later step must be written to tolerate the default
@@ -135,32 +142,39 @@ or evaluates a condition.** There is no lazy or deferred write.
 The corollary is the dangerous part: a later reducer can clobber an earlier
 one's work, and nothing detects it. That is exactly commit `c419f184205b`
 ("workflow: preserve pre-existing bug concerns across review and benchmark").
-`conflict_resolution_stage`'s reducer splits concerns into
-`state.patch_concerns` and `state.concerns` (pre-existing). The verification
-reducer then began with:
+Both `verification_stage` and `post_verification_stage_for_batch` record
+validated findings into `state.findings` (patch defects) and `state.concerns`
+(pre-existing defects) via `record_verified_findings`:
 
 ```rust
 .reduce(|state, out: VerificationOutput| {
-    let mut new_findings = Vec::new();
-    state.concerns.clear();          // <-- removed by c419f184205b
-    for finding in out.findings { ... state.concerns.push(concern); }
+    record_verified_findings(state, out.findings);
+    state.hard_cases = out.hard_cases;
+    state
+        .deduplicated_dismissed_concerns
+        .extend(out.dismissed_concerns);
+})
 ```
 
-Every pre-existing concern found in conflict resolution was discarded, and
-the daemon stopped forwarding pre-existing bug candidates to the Linux bug
-pipeline. The fix deleted the `clear()` and added
-`test_verification_stage_preserves_preexisting_concerns`, which seeds
-`state.concerns` before calling `(stage.reducer)(&mut state, output)` and
-asserts both the seeded and the new entry survive.
+Notice that both `verification_stage` and `post_verification_stage` /
+`post_verification_stage_for_batch` append to `state.findings`, `state.concerns`
+(via `record_verified_findings`), and `state.deduplicated_dismissed_concerns`
+(via `.extend(out.dismissed_concerns)`) without clearing entries already
+recorded in state. `test_verification_stage_preserves_preexisting_concerns`
+and `test_post_verification_stage_preserves_existing_state` seed
+`state.findings`, `state.concerns`, and `state.deduplicated_dismissed_concerns`
+before calling `(stage.reducer)(&mut state, output)` and assert both the seeded
+and the new entries survive.
 
 **Check in a diff:** any reducer that assigns (`state.x = ...`) or clears a
 state field rather than extending it. Ask *who else writes this field*. In
-`LinuxPatchReviewState`, `concerns` has two writers (conflict-resolution and
-verification) and `all_concerns` / `all_dismissed_concerns` have one writer
-per analysis stage via `append_stage_items` /
-`append_stage_dismissed_concerns`. A new writer of a multi-writer field needs
-a test in the shape of the one above — call `(stage.reducer)(&mut state, out)`
-directly on a pre-populated state.
+`LinuxPatchReviewState`, `findings`, `concerns`, and
+`deduplicated_dismissed_concerns` are written by both `verification_stage` and
+each parallel `post_verification_stage_for_batch`, while `all_concerns` /
+`all_dismissed_concerns` have one writer per analysis stage via
+`append_stage_items` / `append_stage_dismissed_concerns`. A new writer of a
+multi-writer field needs a test in the shape of the ones above — call
+`(stage.reducer)(&mut state, out)` directly on a pre-populated state.
 
 `early_exit_if` (`graph.rs`, `WorkflowStep::EarlyExitIf`) evaluates its
 condition against the state as of that point in the list, logs, emits
@@ -172,16 +186,19 @@ breaks the parent loop; `Parallel` and `DynamicParallel` do **not** inspect
 
 **Check in a diff:** an `early_exit_if` inserted between a stage and its
 reader must test the field that stage's reducer writes, not a neighbouring
-one. The review pipeline pairs them exactly:
-`all_concerns` after the analysis fan-out, `deduplicated_concerns` after
-deduplication, `patch_concerns` after conflict resolution, `findings` after
-verification. A patch that makes conflict resolution write a differently
-named field, or that reorders the steps, must move the guard with it, or the
-guard tests a field that is still at its `Default` value and exits every run.
+one. The Linux review pipeline pairs them exactly:
+`all_concerns.is_empty() && all_dismissed_concerns.is_empty()` after the
+analysis fan-out, and `findings.is_empty()` after the `verification` +
+`post-verification` `DynamicParallel` step (while `sashiko_patch_review.rs`
+uses `.skip_if(...)` on `verification_stage` and `report_stage` so its
+trailing `summary_stage` still runs when there are zero findings). A patch
+that makes a stage write a differently named field, or that reorders the
+steps, must move the guard with it, or the guard tests a field that is still
+at its `Default` value and exits every run.
 
 **Check in a diff:** `build_linux_patch_review_workflow` has a structural
 test, `test_build_workflow_graph_structure`, asserting
-`workflow.steps.len() == 10`. A patch that adds or removes a step and updates
+`workflow.steps.len() == 6`. A patch that adds or removes a step and updates
 that number without a matching reason in the commit message deserves a second
 look.
 
@@ -211,8 +228,13 @@ unconditionally — including when the resolver returned nothing.
 **Check in a diff:** new UI, metrics, or database writes hung off
 `StageStarted`/`StageFinished` for a stage that can be skipped. Derive from
 `ParallelResolved` or from state instead. `src/worker/prompts.rs`'s
-`is_counted_stage` and `planned_stages_from` are the reference: both read the
-stage tables in `linux_patch_review.rs` rather than the event stream's shape.
+`is_counted_stage`, `planned_stages_from`, and
+`refine_planned_stages_with_post_verification` are the reference: they read the
+stage tables in `linux_patch_review.rs` rather than the event stream's shape,
+and emitting `WorkerProgressEvent::ReviewStarted` a second time when
+`post-verification` resolves only updates `planned_stages` (the progress bar
+denominator in `main.rs` and `local_review.rs`) without resetting
+`completed_stages` or `active_stages`.
 
 **Check in a diff:** a new `skip_if` on a stage whose reducer initialises a
 field that a later `early_exit_if` tests. Skipping now means exiting.
@@ -462,30 +484,21 @@ getting the format wrong, not a reason to abandon the work.
   that makes `render_for_log` expand files inflates every stored interaction
   log by the size of the guide tree.
 
-### The one substitution hazard the boundary does not cover
+### Single-pass variable substitution
 
-`substitute_vars` iterates `self.vars` in registration order and applies
-`text.replace(&format!("{{{{{}}}}}", key), &extractor(state))` in sequence to
-an accumulating string. A value produced by an *earlier* extractor is
-therefore still scanned for *later* keys.
+`substitute_vars` scans each `Segment::Template` in a single pass from left to
+right (`while let Some(pos) = rest.find("{{")`), replacing each bound `{{key}}`
+placeholder and advancing `rest` past the placeholder without ever re-scanning
+the inserted value (`test_a_variable_value_is_not_substituted_again`). As a
+result, an untrusted variable value (such as a patch diff, series context, or
+model-generated JSON in `aggregated_concerns` / `candidate_hard_cases`) that
+contains another variable's `{{placeholder}}` keeps that text literally,
+regardless of `with_var` registration order.
 
-In `linux_system_prompt` the registration order is `target_commit_sha`,
-`baseline_sha`, `target_commit_diff`, `target_commit_diff_only`,
-`prefetched_block`, `custom_prompt_block`. A patch whose diff text contains
-the literal `{{custom_prompt_block}}`, `{{prefetched_block}}`, or
-`{{target_commit_diff_only}}` gets that content spliced into the diff body.
-Same shape in `deduplication_stage`, where `aggregated_concerns` is
-registered before `aggregated_dismissed_concerns` and both are filled with
-model-generated text.
-
-This is not currently exploitable for anything worse than confusing the model
-(the values are all already in the same prompt), but it is a real gap in a
-boundary the rest of this module takes seriously.
-
-**Check in a diff:** a new `with_var` whose value is untrusted *and* which is
-registered before a variable carrying something the untrusted source should
-not control. If a patch adds a variable holding credentials, a system
-directive, or another patch's content, this ordering matters.
+**Check in a diff:** any refactor of `substitute_vars` in `src/workflow/prompt.rs`
+that replaces single-pass scanning with sequential `text.replace(...)` over
+`self.vars`. Sequential replacement would re-scan earlier variable values for
+later variable placeholders and break `test_a_variable_value_is_not_substituted_again`.
 
 ## 9. `OutputFormat` parsing traps
 
@@ -494,19 +507,21 @@ raw `from_str`, then `find_json_candidates(raw_text)` iterated **in reverse**
 — so when the model emits several top-level objects, the **last** one that
 deserialises wins.
 
-Combine that with `#[serde(default)]`. `StageConcernsOutput`,
-`ConflictResolutionOutput` and `VerificationOutput` all mark every field
-`#[serde(default)]`, which means **any** JSON object deserialises into them,
-producing empty vectors. A model that ends its message with a stray `{}` or a
-small summary object silently yields zero concerns, and
-`validate_concerns_output` will not notice — it is a no-op:
-
-```rust
-fn validate_concerns_output(_output: &StageConcernsOutput,
-                            _state: &LinuxPatchReviewState) -> Result<(), String> {
-    Ok(())
-}
-```
+Combine that with `#[serde(default)]`. `StageConcernsOutput` requires the
+top-level `concerns` key (marking only `dismissed_concerns` with
+`#[serde(default)]`), `VerificationOutput` requires all three top-level keys
+(`findings`, `hard_cases`, and `dismissed_concerns`), and
+`PostVerificationOutput` requires the top-level `findings` key (marking only
+`dismissed_concerns` with `#[serde(default)]`), so inner `locations` objects in
+malformed outer JSON cannot accidentally deserialize as a stage output
+(`test_stage_outputs_do_not_match_inner_location_on_malformed_outer_json`), and
+in `VerificationOutput` a typo in `hard_cases` or `dismissed_concerns` is
+rejected by Serde rather than silently defaulting to an empty vector. Their
+custom validators
+(`validate_concerns_output`, `validate_verification_stage_output`, and
+`validate_post_verification_output`) then enforce structural requirements on the
+parsed elements and prevent raised concerns or dismissed concerns from being
+silently dropped.
 
 `PrescreenOutput` and `PlanningOutput` do not use `#[serde(default)]`, so
 their required keys genuinely gate parsing. That asymmetry is worth knowing
@@ -524,8 +539,8 @@ Other traps in `output.rs`:
   `planning_stage` alone.
 - `format_feedback` for a `Json` variant with no `feedback_formatter` falls
   through to the generic "Previous attempt was rejected: {}. Please correct
-  your output format." `conflict_resolution_stage` and `verification_stage`
-  are in that state today.
+  your output format." Both `verification_stage` and
+  `post_verification_stage_for_batch` attach explicit feedback formatters.
 - `Self::Text`'s `validate` downcasts a `String` into `T`; this is sound only
   because `text()`/`text_with_validator` live in `impl<S> OutputFormat<S, String>`.
   A patch that widens that impl breaks the invariant into a runtime
@@ -614,11 +629,9 @@ is already loose.
 - [ ] Does any path reaching an inclusion API originate from model output or
       from the patch under review? If so, is it filtered to a plain file name
       as in `prescreen_stage`'s reducer?
-- [ ] Does the change preserve: placement before substitution, substitution
-      on `Segment::Template` only, and `place` never scanning
-      `Segment::Included`?
-- [ ] Is a new `with_var` holding untrusted content registered *before* a
-      variable whose placeholder it could then expand?
+- [ ] Does the change preserve: placement before substitution, single-pass
+      substitution on `Segment::Template` only (never re-scanning inserted
+      variable values), and `place` never scanning `Segment::Included`?
 - [ ] Does a new output struct use `#[serde(default)]` on every field
       without a validator that rejects the empty parse?
 - [ ] Was `with_validator` / `with_feedback_formatter` called on an

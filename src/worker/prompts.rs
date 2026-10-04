@@ -355,9 +355,8 @@ impl Worker {
             report_preexisting: self.report_preexisting,
             all_concerns: Vec::new(),
             all_dismissed_concerns: Vec::new(),
-            deduplicated_concerns: Vec::new(),
             deduplicated_dismissed_concerns: Vec::new(),
-            patch_concerns: Vec::new(),
+            hard_cases: Vec::new(),
             concerns: Vec::new(),
             findings: Vec::new(),
             summary: String::new(),
@@ -400,6 +399,7 @@ impl Worker {
 
         let project = self.project;
         let skip_report = self.skip_report;
+        let current_planned = std::sync::Mutex::new(Vec::<String>::new());
         let event_cb = move |event: WorkflowEvent| {
             if let Some(progress_cb) = progress {
                 match event {
@@ -415,12 +415,39 @@ impl Worker {
                         }
                     }
                     WorkflowEvent::ParallelResolved { stage_names } => {
-                        let mut planned_stages =
+                        let mut initial =
                             crate::workflows::planned_stages_from(project, &stage_names);
-                        if skip_report {
-                            planned_stages.retain(|s| s != "report" && s != "summary");
+                        if !initial.is_empty() {
+                            if skip_report {
+                                initial.retain(|s| s != "report" && s != "summary");
+                            }
+                            if let Ok(mut guard) = current_planned.lock() {
+                                *guard = initial.clone();
+                            }
+                            progress_cb(WorkerProgressEvent::ReviewStarted {
+                                planned_stages: initial,
+                            });
+                        } else {
+                            let refined = current_planned.lock().ok().and_then(|mut guard| {
+                                if guard.is_empty() {
+                                    None
+                                } else {
+                                    let next =
+                                        crate::workflows::refine_planned_stages_with_post_verification(
+                                            &guard,
+                                            &stage_names,
+                                        );
+                                    *guard = next.clone();
+                                    Some(next)
+                                }
+                            });
+                            if let Some(planned_stages) = refined {
+                                // Downstream handlers (AiReviewPlanReady in main.rs, ReviewStarted
+                                // in local_review.rs) only update planned_stages (the progress bar
+                                // denominator) without resetting completed_stages or active_stages.
+                                progress_cb(WorkerProgressEvent::ReviewStarted { planned_stages });
+                            }
                         }
-                        progress_cb(WorkerProgressEvent::ReviewStarted { planned_stages });
                     }
                     WorkflowEvent::StageFinished { stage_name, .. } => {
                         if crate::workflows::is_counted_stage(project, stage_name) {
@@ -777,9 +804,8 @@ mod tests {
                 "goal",
                 "implementation",
                 "locking",
-                "deduplication",
-                "conflict-resolution",
                 "verification",
+                "post-verification",
                 "report"
             ]
         );
@@ -793,9 +819,8 @@ mod tests {
                 "implementation",
                 "concurrency",
                 "llm-pipeline",
-                "deduplication",
-                "conflict-resolution",
                 "verification",
+                "post-verification",
                 "report",
                 "summary"
             ]
@@ -804,10 +829,33 @@ mod tests {
             crate::workflows::planned_stages_from(ProjectId::Linux, &[]),
             Vec::<String>::new()
         );
-        // Only analysis stages come through the fan-out.
+        // Only analysis stages come through the initial fan-out.
         assert_eq!(
             crate::workflows::planned_stages_from(ProjectId::Linux, &["planning"]),
             Vec::<String>::new()
+        );
+
+        // Once verification resolves the concrete post-verification batch
+        // fan-out, the placeholder is replaced by 0..=10 concrete stages.
+        let initial =
+            crate::workflows::planned_stages_from(ProjectId::Linux, &["goal", "implementation"]);
+        assert_eq!(
+            crate::workflows::refine_planned_stages_with_post_verification(&initial, &[]),
+            ["goal", "implementation", "verification", "report"]
+        );
+        assert_eq!(
+            crate::workflows::refine_planned_stages_with_post_verification(
+                &initial,
+                &["post-verification-1", "post-verification-2"]
+            ),
+            [
+                "goal",
+                "implementation",
+                "verification",
+                "post-verification-1",
+                "post-verification-2",
+                "report"
+            ]
         );
     }
 
@@ -1422,16 +1470,18 @@ mod tests {
                 .unwrap_or_default();
 
             // Dispatch on the heading each stage's instruction opens with.
-            // Analysis stages and deduplication return both lists, conflict
-            // resolution only concerns, verification findings.
-            let content = if last_user.contains("# Analyze commit main goal")
-                || last_user.contains("# Deduplication and Consolidation")
-            {
+            // Analysis stages return concerns/dismissed_concerns, verification
+            // returns findings/hard_cases/dismissed_concerns, and
+            // post-verification returns findings/dismissed_concerns.
+            let content = if last_user.contains("# Analyze commit main goal") {
                 r#"{"concerns": [{"type": "Bug", "description": "some issue", "reasoning": "reason", "preexisting": false, "locations": []}], "dismissed_concerns": []}"#
-            } else if last_user.contains("# Concern/dismissed-concern conflict resolution") {
-                r#"{"concerns": [{"type": "Bug", "description": "some issue", "reasoning": "reason", "preexisting": false, "locations": []}]}"#
-            } else if last_user.contains("# Verification and severity estimation") {
-                r#"{"findings": []}"#
+            } else if last_user.contains("# Verification and severity estimation")
+                || last_user.contains("# Consolidate, classify, and verify concerns")
+            {
+                r#"{"findings": [], "hard_cases": [{"type": "Bug", "description": "some issue", "estimated_severity": "High", "signal_reason": "series_interaction", "concern_arguments": "reason", "dismissal_arguments": "", "verification_question": "check series end", "preexisting": false, "locations": []}], "dismissed_concerns": []}"#
+            } else if last_user.contains("# Per-finding post-verification and conflict resolution")
+            {
+                r#"{"findings": [], "dismissed_concerns": [{"description": "some issue", "reasoning": "fixed in patch 2", "locations": [{"file": "file2.c", "function_or_symbol": "patch2", "line": 1, "code_snippet": "int patch2;"}]}]}"#
             } else {
                 r#"{"concerns": [], "dismissed_concerns": []}"#
             };
@@ -1518,6 +1568,24 @@ mod tests {
         assert!(content.contains("Series End Commit (Final State): sha2"));
         assert!(content.contains("- [Patch 2 of 2] (commit sha2): Patch 2 Subject"));
         assert!(content.contains("SERIES VERIFICATION DIRECTIVE:"));
+
+        let post_verification_user_msg = worker_res
+            .history
+            .iter()
+            .find(|m| {
+                m.role == crate::ai::AiRole::User
+                    && m.content
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("# Per-finding post-verification and conflict resolution")
+            })
+            .expect("post-verification user message should be in history");
+
+        let post_content = post_verification_user_msg.content.as_deref().unwrap();
+        assert!(post_content.contains("=== Follow-Up Patches in Series ==="));
+        assert!(post_content.contains("Series End Commit (Final State): sha2"));
+        assert!(post_content.contains("- [Patch 2 of 2] (commit sha2): Patch 2 Subject"));
+        assert!(post_content.contains("SERIES VERIFICATION DIRECTIVE:"));
     }
 
     #[test]
@@ -1593,20 +1661,12 @@ mod tests {
                     anyhow::bail!("report or summary stage should have been skipped");
                 }
 
-                let content = if last_user.contains("# Analyze commit main goal")
-                    || last_user.contains("# Deduplication and Consolidation")
-                    || last_user.contains("# Deduplicate concerns and dismissed concerns")
-                {
+                let content = if last_user.contains("# Analyze commit main goal") {
                     r#"{"concerns": [{"type": "Bug", "description": "some issue", "reasoning": "reason", "preexisting": false, "locations": []}], "dismissed_concerns": []}"#
-                } else if last_user.contains("# Concern/dismissed-concern conflict resolution")
-                    || last_user
-                        .contains("# Resolve conflicts between concerns and dismissed concerns")
-                {
-                    r#"{"concerns": [{"type": "Bug", "description": "some issue", "reasoning": "reason", "preexisting": false, "locations": []}]}"#
                 } else if last_user.contains("# Verification and severity estimation")
-                    || last_user.contains("# Verify remaining concerns and calibrate severity")
+                    || last_user.contains("# Consolidate, classify, and verify concerns")
                 {
-                    r#"{"findings": [{"problem": "some issue", "severity": "High", "severity_explanation": "bad", "preexisting": false, "locations": []}]}"#
+                    r#"{"findings": [{"problem": "some issue", "severity": "High", "severity_explanation": "bad", "preexisting": false, "locations": []}], "hard_cases": [], "dismissed_concerns": []}"#
                 } else {
                     r#"{"concerns": [], "dismissed_concerns": []}"#
                 };
@@ -1686,14 +1746,12 @@ mod tests {
                     .and_then(|m| m.content.as_deref())
                     .unwrap_or_default();
 
-                let content = if last_user.contains("# Analyze commit main goal")
-                    || last_user.contains("# Deduplication and Consolidation")
-                {
+                let content = if last_user.contains("# Analyze commit main goal") {
                     r#"{"concerns": [{"type": "Memory Leak", "description": "Pre-existing leak in foo()", "reasoning": "Missing kfree", "preexisting": true, "locations": [{"file": "foo.c", "function_or_symbol": "foo", "line": 10, "code_snippet": "return -ENOMEM;", "why_this_location_matters": "leaks buf"}]}], "dismissed_concerns": []}"#
-                } else if last_user.contains("# Concern/dismissed-concern conflict resolution") {
-                    r#"{"concerns": [{"type": "Memory Leak", "description": "Pre-existing leak in foo()", "reasoning": "Missing kfree", "preexisting": true, "locations": [{"file": "foo.c", "function_or_symbol": "foo", "line": 10, "code_snippet": "return -ENOMEM;", "why_this_location_matters": "leaks buf"}]}]}"#
-                } else if last_user.contains("# Verification and severity estimation") {
-                    r#"{"findings": [{"problem": "mm: memory leak in foo()", "severity": "High", "severity_explanation": "foo() returns -ENOMEM without freeing buf", "preexisting": true, "locations": [{"file": "foo.c", "function_or_symbol": "foo", "line": 10, "code_snippet": "return -ENOMEM;", "why_this_location_matters": "leaks buf"}]}]}"#
+                } else if last_user.contains("# Verification and severity estimation")
+                    || last_user.contains("# Consolidate, classify, and verify concerns")
+                {
+                    r#"{"findings": [{"problem": "mm: memory leak in foo()", "severity": "High", "severity_explanation": "foo() returns -ENOMEM without freeing buf", "preexisting": true, "locations": [{"file": "foo.c", "function_or_symbol": "foo", "line": 10, "code_snippet": "return -ENOMEM;", "why_this_location_matters": "leaks buf"}]}], "hard_cases": [], "dismissed_concerns": []}"#
                 } else if last_user.contains("# LKML-friendly report generation") {
                     "commit sha1\nAuthor: Test <test@example.com>\n\nSubject\n\nSummary.\n\n> +int x;\n\n[Severity: High]\nThis problem wasn't introduced by this patch, but foo() leaks buf on error.\n"
                 } else {
@@ -1728,7 +1786,7 @@ mod tests {
             "patches": [{"index": 1, "diff": "diff --git a/foo.c b/foo.c\n+int x;", "commit_id": "sha1"}]
         });
 
-        // With report_preexisting: false, workflow exits after conflict-resolution with 0 findings.
+        // With report_preexisting: false, verification routes pre-existing findings only to concerns (0 findings).
         let mut worker_default = Worker::new(
             std::sync::Arc::new(MockPreexistingOnlyProvider),
             std::sync::Arc::new(crate::toolbox::ToolBox::new(

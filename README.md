@@ -80,10 +80,10 @@ Sashiko evaluates patches through specialized parallel analysis stages followed 
 
 **Consolidation stages** (run in sequence):
 
-1. **`deduplication`** — merges duplicate findings and groups overlapping issues across analysis stages.
-2. **`conflict-resolution`** — weighs findings against dismissed concerns using concrete code evidence.
-3. **`verification`** — validates surviving concerns against the tree, filters false positives, and assigns severity.
-4. **`report`** — formats confirmed findings into a standard inline-commented LKML review report.
+1. **`verification`** — consolidates concerns and dismissed concerns across analysis stages,
+   emits well-justified findings and dismissals directly, and routes contested or speculative candidates to `hard_cases`.
+2. **`post-verification`** — runs parallel per-finding verification stages (`post-verification-1` .. `post-verification-10`) with repository tools to validate or disprove `hard_cases`.
+3. **`report`** — formats confirmed findings into a standard inline-commented LKML review report.
 
 ## Documentation
 

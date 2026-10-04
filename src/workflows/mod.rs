@@ -90,3 +90,23 @@ pub fn planned_stages_from(project: ProjectId, stage_names: &[&'static str]) -> 
         }
     }
 }
+
+/// Replaces the `"post-verification"` placeholder in `planned_stages` with the
+/// concrete `post-verification-*` stages resolved after `verification` (which
+/// may be empty when no hard cases exist, or up to 10 stages when hard cases
+/// fan out in parallel).
+pub fn refine_planned_stages_with_post_verification(
+    planned_stages: &[String],
+    post_verification_stages: &[&'static str],
+) -> Vec<String> {
+    let mut updated =
+        Vec::with_capacity(planned_stages.len().saturating_sub(1) + post_verification_stages.len());
+    for stage in planned_stages {
+        if stage == linux_patch_review::POST_VERIFICATION.name {
+            updated.extend(post_verification_stages.iter().map(|s| (*s).to_string()));
+        } else {
+            updated.push(stage.clone());
+        }
+    }
+    updated
+}
