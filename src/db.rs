@@ -184,6 +184,7 @@ pub struct Database {
     pub conn: libsql::Connection,
     tx_conn: libsql::Connection,
     tx_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    in_transaction: bool,
     bug_actor: String,
     bug_tool: String,
     bug_model: Option<String>,
@@ -1363,6 +1364,7 @@ impl Database {
             conn: self.conn.clone(),
             tx_conn: self.tx_conn.clone(),
             tx_lock: self.tx_lock.clone(),
+            in_transaction: self.in_transaction,
             bug_actor: author.into(),
             bug_tool: tool.into(),
             bug_model: model,
@@ -1376,6 +1378,7 @@ impl Database {
             conn: conn.clone(),
             tx_conn: conn,
             tx_lock: self.tx_lock.clone(),
+            in_transaction: true,
             bug_actor: self.bug_actor.clone(),
             bug_tool: self.bug_tool.clone(),
             bug_model: self.bug_model.clone(),
@@ -1389,6 +1392,7 @@ impl Database {
             conn: self.conn.clone(),
             tx_conn: self.tx_conn.clone(),
             tx_lock: self.tx_lock.clone(),
+            in_transaction: self.in_transaction,
             bug_actor: self.bug_actor.clone(),
             bug_tool: self.bug_tool.clone(),
             bug_model: self.bug_model.clone(),
@@ -1399,14 +1403,64 @@ impl Database {
         }
     }
 
-    /// Opens a transaction after acquiring the connection's transaction lock.
+    /// Executes a write statement on the serialized write connection.
+    ///
+    /// Running all writes through `tx_conn` under `tx_lock` prevents an open
+    /// `SELECT` cursor on `conn` from holding `conn` in an older WAL read
+    /// snapshot (`TRANS_READ`) and triggering `SQLITE_BUSY_SNAPSHOT`
+    /// (`database is locked`) when `conn` attempts an autocommit write after
+    /// `tx_conn` has committed a newer transaction.
+    pub async fn execute(
+        &self,
+        sql: &str,
+        params: impl libsql::params::IntoParams,
+    ) -> std::result::Result<u64, libsql::Error> {
+        let _guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.tx_lock.lock().await)
+        };
+        self.tx_conn.execute(sql, params).await
+    }
+
+    /// Executes a SQL batch on the serialized write connection.
+    pub async fn execute_batch(
+        &self,
+        sql: &str,
+    ) -> std::result::Result<libsql::BatchRows, libsql::Error> {
+        let _guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.tx_lock.lock().await)
+        };
+        self.tx_conn.execute_batch(sql).await
+    }
+
+    /// Executes a write statement with a `RETURNING <int>` clause on the
+    /// serialized write connection, finalizing the statement before releasing
+    /// `tx_lock`.
+    async fn query_returning_i64(
+        &self,
+        sql: &str,
+        params: impl libsql::params::IntoParams,
+    ) -> Result<Option<i64>> {
+        let _guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.tx_lock.lock().await)
+        };
+        let mut rows = self.tx_conn.query(sql, params).await?;
+        let val = match rows.next().await? {
+            Some(row) => Some(row.get::<i64>(0)?),
+            None => None,
+        };
+        drop(rows);
+        Ok(val)
+    }
+
+    /// Opens a write transaction after acquiring the connection's transaction lock.
     pub async fn begin_transaction(&self) -> Result<DatabaseTransaction> {
-        let guard = self.tx_lock.clone().lock_owned().await;
-        let tx = self.tx_conn.transaction().await?;
-        Ok(DatabaseTransaction {
-            tx: Some(tx),
-            _guard: guard,
-        })
+        self.begin_immediate_transaction().await
     }
 
     /// Opens an IMMEDIATE write transaction after acquiring the connection's transaction lock.
@@ -1767,6 +1821,7 @@ impl Database {
             conn,
             tx_conn,
             tx_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            in_transaction: false,
             bug_actor: "system".into(),
             bug_tool: "sashiko".into(),
             bug_model: None,
@@ -1787,8 +1842,8 @@ impl Database {
         if current_version < 1 {
             info!("Applying database migration version 1 (initial)...");
             let schema = include_str!("migrations/001_initial.sql");
-            self.conn.execute_batch(schema).await?;
-            self.conn.execute("PRAGMA user_version = 1", ()).await?;
+            self.execute_batch(schema).await?;
+            self.execute("PRAGMA user_version = 1", ()).await?;
         }
 
         if current_version < 2 {
@@ -1875,10 +1930,9 @@ impl Database {
         // shared connection for the duration.
         if current_version < 5 {
             info!("Applying database migration version 5 (index patches by message id)...");
-            self.conn
-                .execute_batch(include_str!("migrations/005_index_patches_message_id.sql"))
+            self.execute_batch(include_str!("migrations/005_index_patches_message_id.sql"))
                 .await?;
-            self.conn.execute("PRAGMA user_version = 5", ()).await?;
+            self.execute("PRAGMA user_version = 5", ()).await?;
         }
 
         if current_version < 6 {
@@ -1952,19 +2006,17 @@ impl Database {
                 found
             };
             if has_git_patch_id {
-                self.conn
-                    .execute(
-                        "CREATE INDEX IF NOT EXISTS idx_patches_git_patch_id
-                         ON patches(git_patch_id)",
-                        (),
-                    )
-                    .await?;
+                self.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_patches_git_patch_id
+                     ON patches(git_patch_id)",
+                    (),
+                )
+                .await?;
             } else {
-                self.conn
-                    .execute_batch(include_str!("migrations/012_git_patch_id.sql"))
+                self.execute_batch(include_str!("migrations/012_git_patch_id.sql"))
                     .await?;
             }
-            self.conn.execute("PRAGMA user_version = 12", ()).await?;
+            self.execute("PRAGMA user_version = 12", ()).await?;
         }
 
         if current_version < 13 {
@@ -2032,12 +2084,11 @@ impl Database {
             return Ok(());
         }
 
-        self.conn
-            .execute(
-                "INSERT INTO meta (key, value) VALUES ('project', ?1)",
-                libsql::params![project.as_str()],
-            )
-            .await?;
+        self.execute(
+            "INSERT INTO meta (key, value) VALUES ('project', ?1)",
+            libsql::params![project.as_str()],
+        )
+        .await?;
         Ok(())
     }
 
@@ -2061,8 +2112,7 @@ impl Database {
         message_id: i64,
         mailing_list_id: i64,
     ) -> Result<()> {
-        self.conn
-            .execute(
+        self.execute(
                 "INSERT OR IGNORE INTO messages_mailing_lists (message_id, mailing_list_id) VALUES (?, ?)",
                 libsql::params![message_id, mailing_list_id],
             )
@@ -2111,30 +2161,23 @@ impl Database {
         baseline_id: Option<i64>,
         prompts_hash: Option<&str>,
     ) -> Result<i64> {
-        let mut rows = self
-            .conn
-            .query(
-                "INSERT INTO reviews (patchset_id, patch_id, status, created_at, provider, model, baseline_id, prompts_hash)
+        self.query_returning_i64(
+            "INSERT INTO reviews (patchset_id, patch_id, status, created_at, provider, model, baseline_id, prompts_hash)
              VALUES (?, ?, 'Pending', ?, ?, ?, ?, ?) RETURNING id",
-                libsql::params![
-                    patchset_id,
-                    patch_id,
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)?
-                        .as_secs() as i64,
-                    provider,
-                    model,
-                    baseline_id,
-                    prompts_hash
-                ],
-            )
-            .await?;
-
-        if let Ok(Some(row)) = rows.next().await {
-            Ok(row.get(0)?)
-        } else {
-            Err(anyhow::anyhow!("Failed to get review ID"))
-        }
+            libsql::params![
+                patchset_id,
+                patch_id,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs() as i64,
+                provider,
+                model,
+                baseline_id,
+                prompts_hash
+            ],
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Failed to get review ID"))
     }
 
     pub async fn has_successful_review(
@@ -2193,23 +2236,21 @@ impl Database {
         logs: Option<&str>,
     ) -> Result<()> {
         if let Some(l) = logs {
-            self.conn
-                .execute(
-                    "UPDATE reviews SET status = ?, logs = ? WHERE id = ?",
-                    libsql::params![
-                        status,
-                        crate::compression::compress_string_if_needed(l),
-                        review_id
-                    ],
-                )
-                .await?;
+            self.execute(
+                "UPDATE reviews SET status = ?, logs = ? WHERE id = ?",
+                libsql::params![
+                    status,
+                    crate::compression::compress_string_if_needed(l),
+                    review_id
+                ],
+            )
+            .await?;
         } else {
-            self.conn
-                .execute(
-                    "UPDATE reviews SET status = ? WHERE id = ?",
-                    libsql::params![status, review_id],
-                )
-                .await?;
+            self.execute(
+                "UPDATE reviews SET status = ? WHERE id = ?",
+                libsql::params![status, review_id],
+            )
+            .await?;
         }
         Ok(())
     }
@@ -2225,17 +2266,16 @@ impl Database {
         inline_review: Option<&str>,
         logs: Option<&str>,
     ) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE reviews SET status = ?, result_description = ?, summary = ?, interaction_id = ?, inline_review = ?, logs = ? WHERE id = ?",
-                libsql::params![status, result, summary, interaction_id, inline_review.map(crate::compression::compress_string_if_needed).unwrap_or(libsql::Value::Null), logs.map(crate::compression::compress_string_if_needed).unwrap_or(libsql::Value::Null), review_id],
-            )
-            .await?;
+        self.execute(
+            "UPDATE reviews SET status = ?, result_description = ?, summary = ?, interaction_id = ?, inline_review = ?, logs = ? WHERE id = ?",
+            libsql::params![status, result, summary, interaction_id, inline_review.map(crate::compression::compress_string_if_needed).unwrap_or(libsql::Value::Null), logs.map(crate::compression::compress_string_if_needed).unwrap_or(libsql::Value::Null), review_id],
+        )
+        .await?;
         Ok(())
     }
 
     pub async fn create_ai_interaction(&self, params: AiInteractionParams<'_>) -> Result<()> {
-        self.conn.execute(
+        self.execute(
             "INSERT INTO ai_interactions (id, parent_interaction_id, workflow_id, provider, model, input_context, output_raw, tokens_in, tokens_out, tokens_cached, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             libsql::params![
@@ -2256,7 +2296,7 @@ impl Database {
     }
 
     pub async fn create_tool_usage(&self, usage: ToolUsage) -> Result<()> {
-        self.conn.execute(
+        self.execute(
             "INSERT INTO tool_usages (review_id, provider, model, tool_name, arguments, output_length, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?)",
             libsql::params![
@@ -2279,18 +2319,17 @@ impl Database {
         arguments: &str,
         output_length: usize,
     ) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE tool_usages 
-                 SET output_length = ? 
-                 WHERE id = (
-                     SELECT id FROM tool_usages 
-                     WHERE review_id = ? AND tool_name = ? AND arguments = ? AND output_length = 0
-                     ORDER BY id DESC LIMIT 1
-                 )",
-                libsql::params![output_length as i64, review_id, tool_name, arguments],
-            )
-            .await?;
+        self.execute(
+            "UPDATE tool_usages 
+             SET output_length = ? 
+             WHERE id = (
+                 SELECT id FROM tool_usages 
+                 WHERE review_id = ? AND tool_name = ? AND arguments = ? AND output_length = 0
+                 ORDER BY id DESC LIMIT 1
+             )",
+            libsql::params![output_length as i64, review_id, tool_name, arguments],
+        )
+        .await?;
         Ok(())
     }
 
@@ -2300,20 +2339,19 @@ impl Database {
             .locations
             .as_ref()
             .and_then(|v| serde_json::to_string(v).ok());
-        self.conn
-            .execute(
-                "INSERT INTO findings (review_id, severity, severity_explanation, problem, preexisting, locations)
+        self.execute(
+            "INSERT INTO findings (review_id, severity, severity_explanation, problem, preexisting, locations)
              VALUES (?, ?, ?, ?, ?, ?)",
-                libsql::params![
-                    finding.review_id,
-                    finding.severity as i32,
-                    finding.severity_explanation,
-                    finding.problem,
-                    val,
-                    locations_val,
-                ],
-            )
-            .await?;
+            libsql::params![
+                finding.review_id,
+                finding.severity as i32,
+                finding.severity_explanation,
+                finding.problem,
+                val,
+                locations_val,
+            ],
+        )
+        .await?;
         Ok(())
     }
 
@@ -2351,9 +2389,8 @@ impl Database {
             .filter(|s| !s.is_empty())
             .map(str::to_string);
         let assigned_at = assignee.as_ref().map(|_| now);
-        let mut rows = self
-            .conn
-            .query(
+        let Some(id) = self
+            .query_returning_i64(
                 "INSERT INTO bugs (
                     bugid, title, lifecycle_status, pipeline_state, reporter, reported_at,
                     assignee, assigned_at,
@@ -2383,28 +2420,25 @@ impl Database {
                     self.bug_model.clone(),
                 ],
             )
-            .await?;
-
-        if let Some(row) = rows.next().await? {
-            let id: i64 = row.get(0)?;
-            for sub in &bug.subsystems {
-                let trimmed = sub.name.trim();
-                if !trimmed.is_empty() {
-                    self.conn
-                        .execute(
-                            UPSERT_BUG_SUBSYSTEM_SQL,
-                            libsql::params![id, trimmed, sub.source.as_str()],
-                        )
-                        .await?;
-                }
-            }
-            if let Some(vector_json) = bug.vector_json.as_deref() {
-                self.store_bug_vector(id, vector_json).await?;
-            }
-            Ok(id)
-        } else {
+            .await?
+        else {
             bail!("Failed to insert bug: no id returned");
+        };
+
+        for sub in &bug.subsystems {
+            let trimmed = sub.name.trim();
+            if !trimmed.is_empty() {
+                self.execute(
+                    UPSERT_BUG_SUBSYSTEM_SQL,
+                    libsql::params![id, trimmed, sub.source.as_str()],
+                )
+                .await?;
+            }
         }
+        if let Some(vector_json) = bug.vector_json.as_deref() {
+            self.store_bug_vector(id, vector_json).await?;
+        }
+        Ok(id)
     }
 
     /// Records a deduplication embedding for a bug.
@@ -2412,21 +2446,20 @@ impl Database {
     /// Keyed by the model that produced it, so switching embedding models adds a
     /// row rather than destroying the previous vector.
     async fn store_bug_vector(&self, bug_id: i64, vector_json: &str) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT INTO bug_vectors (bug_id, model, vector_json, created_at)
-                 VALUES (?, ?, ?, ?)
-                 ON CONFLICT(bug_id, model) DO UPDATE SET
-                     vector_json = excluded.vector_json,
-                     created_at = excluded.created_at",
-                libsql::params![
-                    bug_id,
-                    self.bug_model.clone().unwrap_or_default(),
-                    vector_json,
-                    chrono::Utc::now().timestamp(),
-                ],
-            )
-            .await?;
+        self.execute(
+            "INSERT INTO bug_vectors (bug_id, model, vector_json, created_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(bug_id, model) DO UPDATE SET
+                 vector_json = excluded.vector_json,
+                 created_at = excluded.created_at",
+            libsql::params![
+                bug_id,
+                self.bug_model.clone().unwrap_or_default(),
+                vector_json,
+                chrono::Utc::now().timestamp(),
+            ],
+        )
+        .await?;
         Ok(())
     }
 
@@ -2472,44 +2505,36 @@ impl Database {
             chrono::Utc::now().timestamp()
         };
 
-        let mut rows = self
-            .conn
-            .query(
-                "INSERT INTO bug_enrichments (
-                    bug_id, kind, tool, model, author, created_at, content, data_json,
-                    tokens_in, tokens_out, tokens_cached, logs
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                 RETURNING id",
-                libsql::params![
-                    bug_id,
-                    enrichment.kind.as_str(),
-                    if enrichment.tool.is_empty() {
-                        self.bug_tool.as_str()
-                    } else {
-                        enrichment.tool.as_str()
-                    },
-                    enrichment.model.clone().or_else(|| self.bug_model.clone()),
-                    enrichment
-                        .author
-                        .clone()
-                        .or_else(|| Some(self.bug_actor.clone())),
-                    now,
-                    compressed_content,
-                    data_json_str,
-                    enrichment.tokens_in.map(|t| t as i64),
-                    enrichment.tokens_out.map(|t| t as i64),
-                    enrichment.tokens_cached.map(|t| t as i64),
-                    compressed_logs,
-                ],
-            )
-            .await?;
-
-        if let Some(row) = rows.next().await? {
-            let eid: i64 = row.get(0)?;
-            Ok(eid)
-        } else {
-            bail!("Failed to insert bug enrichment: no id returned");
-        }
+        self.query_returning_i64(
+            "INSERT INTO bug_enrichments (
+                bug_id, kind, tool, model, author, created_at, content, data_json,
+                tokens_in, tokens_out, tokens_cached, logs
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             RETURNING id",
+            libsql::params![
+                bug_id,
+                enrichment.kind.as_str(),
+                if enrichment.tool.is_empty() {
+                    self.bug_tool.as_str()
+                } else {
+                    enrichment.tool.as_str()
+                },
+                enrichment.model.clone().or_else(|| self.bug_model.clone()),
+                enrichment
+                    .author
+                    .clone()
+                    .or_else(|| Some(self.bug_actor.clone())),
+                now,
+                compressed_content,
+                data_json_str,
+                enrichment.tokens_in.map(|t| t as i64),
+                enrichment.tokens_out.map(|t| t as i64),
+                enrichment.tokens_cached.map(|t| t as i64),
+                compressed_logs,
+            ],
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Failed to insert bug enrichment: no id returned"))
     }
 
     pub async fn get_bug_enrichments(&self, bug_id: i64) -> Result<Vec<BugEnrichment>> {
@@ -2708,12 +2733,11 @@ impl Database {
             if name.is_empty() {
                 continue;
             }
-            self.conn
-                .execute(
-                    UPSERT_PATCHSET_SECTION_SQL,
-                    libsql::params![patchset_id, name, section.source.as_str()],
-                )
-                .await?;
+            self.execute(
+                UPSERT_PATCHSET_SECTION_SQL,
+                libsql::params![patchset_id, name, section.source.as_str()],
+            )
+            .await?;
         }
         Ok(())
     }
@@ -2756,22 +2780,20 @@ impl Database {
 
         for section in existing {
             if !wanted.contains_key(section.as_str()) {
-                self.conn
-                    .execute(
-                        "DELETE FROM patchset_maintainer_sections \
+                self.execute(
+                    "DELETE FROM patchset_maintainer_sections \
                          WHERE patchset_id = ? AND subsystem = ?",
-                        libsql::params![patchset_id, section],
-                    )
-                    .await?;
+                    libsql::params![patchset_id, section],
+                )
+                .await?;
             }
         }
         for (name, source) in wanted {
-            self.conn
-                .execute(
-                    UPSERT_PATCHSET_SECTION_SQL,
-                    libsql::params![patchset_id, name, source.as_str()],
-                )
-                .await?;
+            self.execute(
+                UPSERT_PATCHSET_SECTION_SQL,
+                libsql::params![patchset_id, name, source.as_str()],
+            )
+            .await?;
         }
         Ok(())
     }
@@ -3414,6 +3436,15 @@ impl Database {
     ///
     /// `worker_id` identifies the holder so that a stuck lease can be traced
     /// back to a process.
+    async fn get_bug_on_write_conn(&self, id: i64) -> Result<Option<Bug>> {
+        let _guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.tx_lock.lock().await)
+        };
+        self.with_connection(self.tx_conn.clone()).get_bug(id).await
+    }
+
     pub async fn claim_pending_bug(
         &self,
         worker_id: &str,
@@ -3421,9 +3452,8 @@ impl Database {
         max_attempts: i64,
     ) -> Result<Option<Bug>> {
         let now = chrono::Utc::now().timestamp();
-        let mut rows = self
-            .conn
-            .query(
+        let id_opt = self
+            .query_returning_i64(
                 "UPDATE bugs
                     SET pipeline_state = 'running',
                         locked_by = ?1,
@@ -3453,8 +3483,8 @@ impl Database {
                 ],
             )
             .await?;
-        match rows.next().await? {
-            Some(row) => self.get_bug(row.get::<i64>(0)?).await,
+        match id_opt {
+            Some(id) => self.get_bug_on_write_conn(id).await,
             None => Ok(None),
         }
     }
@@ -3491,7 +3521,6 @@ impl Database {
     ) -> Result<bool> {
         let now = chrono::Utc::now().timestamp();
         let updated = self
-            .conn
             .execute(
                 "UPDATE bugs
                     SET lease_expires_at = ?1
@@ -3513,7 +3542,6 @@ impl Database {
     pub async fn abandon_exhausted_bugs(&self, max_attempts: i64) -> Result<usize> {
         let now = chrono::Utc::now().timestamp();
         let count = self
-            .conn
             .execute(
                 "UPDATE bugs
                     SET pipeline_state = 'abandoned',
@@ -3556,7 +3584,6 @@ impl Database {
     pub async fn recover_stale_running_bugs(&self) -> Result<usize> {
         let now = chrono::Utc::now().timestamp();
         let count = self
-            .conn
             .execute(
                 "UPDATE bugs
                     SET pipeline_state = 'pending',
@@ -3584,24 +3611,22 @@ impl Database {
         status: BugLifecycleStatus,
     ) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
-        self.conn
-            .execute(
-                "UPDATE bugs SET lifecycle_status = ?, updated_at = ?, audit_author = ?, audit_tool = ?, audit_model = ? WHERE id = ?",
-                libsql::params![status.as_str(), now, self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), id],
-            )
-            .await?;
+        self.execute(
+            "UPDATE bugs SET lifecycle_status = ?, updated_at = ?, audit_author = ?, audit_tool = ?, audit_model = ? WHERE id = ?",
+            libsql::params![status.as_str(), now, self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), id],
+        )
+        .await?;
         Ok(())
     }
 
     /// Updates the analysis execution state of a bug.
     pub async fn set_bug_pipeline_state(&self, id: i64, state: BugPipelineState) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
-        self.conn
-            .execute(
-                "UPDATE bugs SET pipeline_state = ?, updated_at = ?, audit_author = ?, audit_tool = ?, audit_model = ? WHERE id = ?",
-                libsql::params![state.as_str(), now, self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), id],
-            )
-            .await?;
+        self.execute(
+            "UPDATE bugs SET pipeline_state = ?, updated_at = ?, audit_author = ?, audit_tool = ?, audit_model = ? WHERE id = ?",
+            libsql::params![state.as_str(), now, self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), id],
+        )
+        .await?;
         Ok(())
     }
 
@@ -3640,12 +3665,11 @@ impl Database {
 
     pub async fn update_bug_title(&self, id: i64, title: &str) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
-        self.conn
-            .execute(
-                "UPDATE bugs SET title = ?, updated_at = ?, audit_author = ?, audit_tool = ?, audit_model = ? WHERE id = ?",
-                libsql::params![title, now, self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), id],
-            )
-            .await?;
+        self.execute(
+            "UPDATE bugs SET title = ?, updated_at = ?, audit_author = ?, audit_tool = ?, audit_model = ? WHERE id = ?",
+            libsql::params![title, now, self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), id],
+        )
+        .await?;
         Ok(())
     }
 
@@ -3671,7 +3695,7 @@ impl Database {
         id: i64,
         subsystems: &[AttributedSubsystem],
     ) -> Result<()> {
-        self.conn.execute("UPDATE bugs SET audit_author = ?, audit_tool = ?, audit_model = ?, updated_at = ? WHERE id = ?", libsql::params![self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), chrono::Utc::now().timestamp(), id]).await?;
+        self.execute("UPDATE bugs SET audit_author = ?, audit_tool = ?, audit_model = ?, updated_at = ? WHERE id = ?", libsql::params![self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), chrono::Utc::now().timestamp(), id]).await?;
         let wanted: std::collections::BTreeMap<&str, SubsystemSource> = subsystems
             .iter()
             .map(|s| (s.name.trim(), s.source))
@@ -3698,21 +3722,19 @@ impl Database {
 
         for sub in existing {
             if !wanted.contains_key(sub.as_str()) {
-                self.conn
-                    .execute(
-                        "DELETE FROM bug_subsystems WHERE bug_id = ? AND subsystem = ?",
-                        libsql::params![id, sub],
-                    )
-                    .await?;
+                self.execute(
+                    "DELETE FROM bug_subsystems WHERE bug_id = ? AND subsystem = ?",
+                    libsql::params![id, sub],
+                )
+                .await?;
             }
         }
         for (name, source) in wanted {
-            self.conn
-                .execute(
-                    UPSERT_BUG_SUBSYSTEM_SQL,
-                    libsql::params![id, name, source.as_str()],
-                )
-                .await?;
+            self.execute(
+                UPSERT_BUG_SUBSYSTEM_SQL,
+                libsql::params![id, name, source.as_str()],
+            )
+            .await?;
         }
         Ok(())
     }
@@ -3744,21 +3766,20 @@ impl Database {
         }
         // A verdict initializes triage; it must not undo a human decision
         // made while this analysis was pending or running.
-        self.conn
-            .execute(
-                "UPDATE bugs SET lifecycle_status = ?, updated_at = ?,
-                    audit_author = ?, audit_tool = ?, audit_model = ?
+        self.execute(
+            "UPDATE bugs SET lifecycle_status = ?, updated_at = ?,
+                audit_author = ?, audit_tool = ?, audit_model = ?
              WHERE id = ? AND lifecycle_status = 'new'",
-                libsql::params![
-                    params.lifecycle_status.as_str(),
-                    now,
-                    self.bug_actor.as_str(),
-                    self.bug_tool.as_str(),
-                    self.bug_model.clone(),
-                    id
-                ],
-            )
-            .await?;
+            libsql::params![
+                params.lifecycle_status.as_str(),
+                now,
+                self.bug_actor.as_str(),
+                self.bug_tool.as_str(),
+                self.bug_model.clone(),
+                id
+            ],
+        )
+        .await?;
         if params.verified_on_sha.is_some() || params.locations.is_some() {
             let is_valid = params.lifecycle_status != BugLifecycleStatus::Dismissed;
             let refutation = if !is_valid {
@@ -3872,42 +3893,35 @@ impl Database {
         }
         let now = chrono::Utc::now().timestamp();
         let ttl = lease_ttl_seconds.clamp(1, 86_400);
-        let id_opt: Option<i64> = {
-            let mut rows = self
-                .conn
-                .query(
-                    "UPDATE bugs
-                        SET locked_by = ?1,
-                            lease_expires_at = ?2,
-                            updated_at = ?3
-                      WHERE id = (
-                          SELECT id FROM bugs
-                           WHERE lifecycle_status = 'open'
-                             AND pipeline_state = 'succeeded'
-                             AND duplicate_of_id IS NULL
-                             AND verified_on_sha IS NOT NULL
-                             AND verified_on_sha != ''
-                             AND verified_on_sha != ?4
-                             AND (lease_expires_at IS NULL OR lease_expires_at <= ?3)
-                           ORDER BY updated_at ASC, id ASC
-                           LIMIT 1
-                      )
-                      RETURNING id",
-                    libsql::params![
-                        worker_id,
-                        now.saturating_add(ttl),
-                        now,
-                        current_linus_sha.trim()
-                    ],
-                )
-                .await?;
-            rows.next()
-                .await?
-                .map(|row| row.get::<i64>(0))
-                .transpose()?
-        };
+        let id_opt = self
+            .query_returning_i64(
+                "UPDATE bugs
+                    SET locked_by = ?1,
+                        lease_expires_at = ?2,
+                        updated_at = ?3
+                  WHERE id = (
+                      SELECT id FROM bugs
+                       WHERE lifecycle_status = 'open'
+                         AND pipeline_state = 'succeeded'
+                         AND duplicate_of_id IS NULL
+                         AND verified_on_sha IS NOT NULL
+                         AND verified_on_sha != ''
+                         AND verified_on_sha != ?4
+                         AND (lease_expires_at IS NULL OR lease_expires_at <= ?3)
+                       ORDER BY updated_at ASC, id ASC
+                       LIMIT 1
+                  )
+                  RETURNING id",
+                libsql::params![
+                    worker_id,
+                    now.saturating_add(ttl),
+                    now,
+                    current_linus_sha.trim()
+                ],
+            )
+            .await?;
         match id_opt {
-            Some(id) => self.get_bug(id).await,
+            Some(id) => self.get_bug_on_write_conn(id).await,
             None => Ok(None),
         }
     }
@@ -4011,7 +4025,6 @@ impl Database {
         let now = chrono::Utc::now().timestamp();
         let ttl = lease_ttl_seconds.clamp(1, 86_400);
         let updated = self
-            .conn
             .execute(
                 "UPDATE bugs
                     SET locked_by = ?1,
@@ -4029,7 +4042,7 @@ impl Database {
             )
             .await?;
         if updated > 0 {
-            self.get_bug(bug_id).await
+            self.get_bug_on_write_conn(bug_id).await
         } else {
             Ok(None)
         }
@@ -4056,7 +4069,6 @@ impl Database {
             let tx_db = self.with_connection((*tx).clone());
             for bug in chunk {
                 let updated = tx_db
-                    .conn
                     .execute(
                         "UPDATE bugs
                             SET verified_on_sha = ?1,
@@ -4141,18 +4153,17 @@ impl Database {
     pub async fn touch_bug_fix_check_timestamp(&self, id: i64) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
         let owner = self.bug_claim.as_ref().map(|c| c.owner.as_str());
-        self.conn
-            .execute(
-                "UPDATE bugs
+        self.execute(
+            "UPDATE bugs
                     SET updated_at = ?1,
                         locked_by = NULL,
                         lease_expires_at = ?2
                   WHERE id = ?3
                     AND lifecycle_status = 'open'
                     AND (?4 IS NULL OR locked_by = ?4)",
-                libsql::params![now, now + 60, id, owner],
-            )
-            .await?;
+            libsql::params![now, now + 60, id, owner],
+        )
+        .await?;
         Ok(())
     }
 
@@ -4191,7 +4202,6 @@ impl Database {
         let owner = self.bug_claim.as_ref().map(|c| c.owner.as_str());
         if let Some(fix_sha) = params.fixing_commit_sha {
             let updated = self
-                .conn
                 .execute(
                     "UPDATE bugs
                         SET lifecycle_status = 'fixed',
@@ -4247,7 +4257,6 @@ impl Database {
         }
 
         let updated = self
-            .conn
             .execute(
                 "UPDATE bugs
                     SET verified_on_sha = ?1,
@@ -4301,7 +4310,6 @@ impl Database {
         params: &UpstreamFixCheckParams<'_>,
     ) -> Result<()> {
         let updated_enrichment = self
-            .conn
             .execute(
                 "UPDATE bug_enrichments
                     SET data_json = json_set(COALESCE(data_json, '{}'), '$.verified_on_sha', ?1)
@@ -4691,16 +4699,15 @@ impl Database {
         bug_id: i64,
         is_newly_discovered: bool,
     ) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT INTO bug_reviews (review_id, bug_id, is_newly_discovered)
+        self.execute(
+            "INSERT INTO bug_reviews (review_id, bug_id, is_newly_discovered)
                  VALUES (?1, ?2, ?3)
                  ON CONFLICT(review_id, bug_id) DO UPDATE
                     SET is_newly_discovered =
                         MAX(is_newly_discovered, excluded.is_newly_discovered)",
-                libsql::params![review_id, bug_id, if is_newly_discovered { 1 } else { 0 }],
-            )
-            .await?;
+            libsql::params![review_id, bug_id, if is_newly_discovered { 1 } else { 0 }],
+        )
+        .await?;
         Ok(())
     }
 
@@ -4820,19 +4827,17 @@ impl Database {
     }
 
     pub async fn migrate_review_bugs(&self, from_bug_id: i64, to_bug_id: i64) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT OR IGNORE INTO bug_reviews (review_id, bug_id, is_newly_discovered)
+        self.execute(
+            "INSERT OR IGNORE INTO bug_reviews (review_id, bug_id, is_newly_discovered)
              SELECT review_id, ?, 0 FROM bug_reviews WHERE bug_id = ?",
-                libsql::params![to_bug_id, from_bug_id],
-            )
-            .await?;
-        self.conn
-            .execute(
-                "DELETE FROM bug_reviews WHERE bug_id = ?",
-                libsql::params![from_bug_id],
-            )
-            .await?;
+            libsql::params![to_bug_id, from_bug_id],
+        )
+        .await?;
+        self.execute(
+            "DELETE FROM bug_reviews WHERE bug_id = ?",
+            libsql::params![from_bug_id],
+        )
+        .await?;
         Ok(())
     }
 
@@ -5316,29 +5321,44 @@ impl Database {
     // People & Recipients
     pub async fn ensure_person(&self, name: Option<&str>, email: &str) -> Result<i64> {
         let email = email.trim();
-        // Try to insert
-        self.conn
+        {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT id FROM people WHERE email = ?",
+                    libsql::params![email],
+                )
+                .await?;
+            if let Ok(Some(row)) = rows.next().await {
+                return Ok(row.get(0)?);
+            }
+        }
+
+        let _guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.tx_lock.lock().await)
+        };
+        self.tx_conn
             .execute(
                 "INSERT OR IGNORE INTO people (name, email) VALUES (?, ?)",
                 libsql::params![name, email],
             )
             .await?;
 
-        // If a name is provided and the existing record has none, update it.
-        // For now, keep it simple. Just get ID.
         let mut rows = self
-            .conn
+            .tx_conn
             .query(
                 "SELECT id FROM people WHERE email = ?",
                 libsql::params![email],
             )
             .await?;
-
-        if let Ok(Some(row)) = rows.next().await {
-            Ok(row.get(0)?)
-        } else {
-            Err(anyhow::anyhow!("Failed to ensure person: {}", email))
-        }
+        let id = match rows.next().await? {
+            Some(row) => Some(row.get::<i64>(0)?),
+            None => None,
+        };
+        drop(rows);
+        id.ok_or_else(|| anyhow::anyhow!("Failed to ensure person: {}", email))
     }
 
     pub async fn add_message_recipient(
@@ -5347,51 +5367,73 @@ impl Database {
         person_id: i64,
         recipient_type: &str,
     ) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT OR IGNORE INTO messages_recipients (message_id, person_id, recipient_type) VALUES (?, ?, ?)",
-                libsql::params![message_id, person_id, recipient_type],
-            )
-            .await?;
+        self.execute(
+            "INSERT OR IGNORE INTO messages_recipients (message_id, person_id, recipient_type) VALUES (?, ?, ?)",
+            libsql::params![message_id, person_id, recipient_type],
+        )
+        .await?;
         Ok(())
     }
 
     // Subsystems
     pub async fn ensure_subsystem(&self, name: &str, mailing_list_address: &str) -> Result<i64> {
-        // Try to insert
-        self.conn
+        {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT id FROM subsystems WHERE mailing_list_address = ?",
+                    libsql::params![mailing_list_address],
+                )
+                .await?;
+            if let Ok(Some(row)) = rows.next().await {
+                return Ok(row.get(0)?);
+            }
+        }
+
+        let _guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.tx_lock.lock().await)
+        };
+        self.tx_conn
             .execute(
                 "INSERT OR IGNORE INTO subsystems (name, mailing_list_address) VALUES (?, ?)",
                 libsql::params![name, mailing_list_address],
             )
             .await?;
 
-        // Get ID
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT id FROM subsystems WHERE mailing_list_address = ?",
-                libsql::params![mailing_list_address],
-            )
-            .await?;
-
-        if let Ok(Some(row)) = rows.next().await {
-            Ok(row.get(0)?)
-        } else {
-            // Fallback: Get ID by name (Collision on name with different address)
+        let id = {
             let mut rows = self
-                .conn
+                .tx_conn
+                .query(
+                    "SELECT id FROM subsystems WHERE mailing_list_address = ?",
+                    libsql::params![mailing_list_address],
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => Some(row.get::<i64>(0)?),
+                None => None,
+            }
+        };
+        if let Some(id) = id {
+            return Ok(id);
+        }
+
+        // Fallback: Get ID by name (Collision on name with different address)
+        let fallback_id = {
+            let mut rows = self
+                .tx_conn
                 .query(
                     "SELECT id FROM subsystems WHERE name = ?",
                     libsql::params![name],
                 )
                 .await?;
-            if let Ok(Some(row)) = rows.next().await {
-                Ok(row.get(0)?)
-            } else {
-                Err(anyhow::anyhow!("Failed to ensure subsystem"))
+            match rows.next().await? {
+                Some(row) => Some(row.get::<i64>(0)?),
+                None => None,
             }
-        }
+        };
+        fallback_id.ok_or_else(|| anyhow::anyhow!("Failed to ensure subsystem"))
     }
 
     pub async fn add_subsystem_to_message(
@@ -5399,32 +5441,29 @@ impl Database {
         message_id_db: i64,
         subsystem_id: i64,
     ) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT OR IGNORE INTO messages_subsystems (message_id, subsystem_id) VALUES (?, ?)",
-                libsql::params![message_id_db, subsystem_id],
-            )
-            .await?;
+        self.execute(
+            "INSERT OR IGNORE INTO messages_subsystems (message_id, subsystem_id) VALUES (?, ?)",
+            libsql::params![message_id_db, subsystem_id],
+        )
+        .await?;
         Ok(())
     }
 
     pub async fn add_subsystem_to_thread(&self, thread_id: i64, subsystem_id: i64) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT OR IGNORE INTO threads_subsystems (thread_id, subsystem_id) VALUES (?, ?)",
-                libsql::params![thread_id, subsystem_id],
-            )
-            .await?;
+        self.execute(
+            "INSERT OR IGNORE INTO threads_subsystems (thread_id, subsystem_id) VALUES (?, ?)",
+            libsql::params![thread_id, subsystem_id],
+        )
+        .await?;
         Ok(())
     }
 
     pub async fn add_subsystem_to_patch(&self, patch_id: i64, subsystem_id: i64) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT OR IGNORE INTO patches_subsystems (patch_id, subsystem_id) VALUES (?, ?)",
-                libsql::params![patch_id, subsystem_id],
-            )
-            .await?;
+        self.execute(
+            "INSERT OR IGNORE INTO patches_subsystems (patch_id, subsystem_id) VALUES (?, ?)",
+            libsql::params![patch_id, subsystem_id],
+        )
+        .await?;
         Ok(())
     }
 
@@ -5433,12 +5472,11 @@ impl Database {
         patchset_id: i64,
         subsystem_id: i64,
     ) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT OR IGNORE INTO patchsets_subsystems (patchset_id, subsystem_id) VALUES (?, ?)",
-                libsql::params![patchset_id, subsystem_id],
-            )
-            .await?;
+        self.execute(
+            "INSERT OR IGNORE INTO patchsets_subsystems (patchset_id, subsystem_id) VALUES (?, ?)",
+            libsql::params![patchset_id, subsystem_id],
+        )
+        .await?;
         Ok(())
     }
 
@@ -5458,13 +5496,12 @@ impl Database {
     }
 
     pub async fn ensure_mailing_list(&self, name: &str, group: &str) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT INTO mailing_lists (name, nntp_group, last_article_num) VALUES (?, ?, 0)
+        self.execute(
+            "INSERT INTO mailing_lists (name, nntp_group, last_article_num) VALUES (?, ?, 0)
                  ON CONFLICT(nntp_group) DO UPDATE SET name = excluded.name",
-                libsql::params![name, group],
-            )
-            .await?;
+            libsql::params![name, group],
+        )
+        .await?;
         Ok(())
     }
 
@@ -5486,12 +5523,11 @@ impl Database {
     }
 
     pub async fn update_last_article_num(&self, group: &str, num: u64) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE mailing_lists SET last_article_num = ? WHERE nntp_group = ?",
-                libsql::params![num as i64, group],
-            )
-            .await?;
+        self.execute(
+            "UPDATE mailing_lists SET last_article_num = ? WHERE nntp_group = ?",
+            libsql::params![num as i64, group],
+        )
+        .await?;
         Ok(())
     }
 
@@ -5501,18 +5537,12 @@ impl Database {
         subject: &str,
         date: i64,
     ) -> Result<i64> {
-        let mut rows = self.conn
-            .query(
-                "INSERT INTO threads (root_message_id, subject, last_updated) VALUES (?, ?, ?) RETURNING id",
-                libsql::params![root_message_id, subject, date],
-            )
-            .await?;
-
-        if let Ok(Some(row)) = rows.next().await {
-            Ok(row.get(0)?)
-        } else {
-            Err(anyhow::anyhow!("Failed to get thread ID"))
-        }
+        self.query_returning_i64(
+            "INSERT INTO threads (root_message_id, subject, last_updated) VALUES (?, ?, ?) RETURNING id",
+            libsql::params![root_message_id, subject, date],
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Failed to get thread ID"))
     }
 
     pub async fn get_thread_id_for_message(&self, message_id: &str) -> Result<Option<i64>> {
@@ -5702,30 +5732,26 @@ impl Database {
         branch: Option<&str>,
         commit: Option<&str>,
     ) -> Result<i64> {
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT id FROM baselines WHERE repo_url IS ? AND branch IS ? AND last_known_commit IS ?",
-                libsql::params![repo_url, branch, commit],
-            )
-            .await?;
+        {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT id FROM baselines WHERE repo_url IS ? AND branch IS ? AND last_known_commit IS ?",
+                    libsql::params![repo_url, branch, commit],
+                )
+                .await?;
 
-        if let Ok(Some(row)) = rows.next().await {
-            return Ok(row.get(0)?);
+            if let Ok(Some(row)) = rows.next().await {
+                return Ok(row.get(0)?);
+            }
         }
 
-        let mut rows = self.conn
-            .query(
-                "INSERT INTO baselines (repo_url, branch, last_known_commit) VALUES (?, ?, ?) RETURNING id",
-                libsql::params![repo_url, branch, commit],
-            )
-            .await?;
-
-        if let Ok(Some(row)) = rows.next().await {
-            Ok(row.get(0)?)
-        } else {
-            Err(anyhow::anyhow!("Failed to get baseline ID"))
-        }
+        self.query_returning_i64(
+            "INSERT INTO baselines (repo_url, branch, last_known_commit) VALUES (?, ?, ?) RETURNING id",
+            libsql::params![repo_url, branch, commit],
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Failed to get baseline ID"))
     }
 
     pub async fn get_baseline_commit(&self, id: i64) -> Result<Option<String>> {
@@ -5762,16 +5788,15 @@ impl Database {
         baseline_id: i64,
         part_index: Option<u32>,
     ) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE patchsets SET baseline_id = ?, baseline_part_index = ?
+        self.execute(
+            "UPDATE patchsets SET baseline_id = ?, baseline_part_index = ?
                  WHERE id = ?
                    AND (baseline_id IS NULL
                         OR baseline_part_index IS NULL
                         OR ? <= baseline_part_index)",
-                libsql::params![baseline_id, part_index, patchset_id, part_index],
-            )
-            .await?;
+            libsql::params![baseline_id, part_index, patchset_id, part_index],
+        )
+        .await?;
         Ok(())
     }
 
@@ -6010,12 +6035,11 @@ impl Database {
     }
 
     async fn set_series_identity(&self, patchset_id: i64, identity: &str) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE patchsets SET cover_letter_message_id = ? WHERE id = ?",
-                libsql::params![identity, patchset_id],
-            )
-            .await?;
+        self.execute(
+            "UPDATE patchsets SET cover_letter_message_id = ? WHERE id = ?",
+            libsql::params![identity, patchset_id],
+        )
+        .await?;
         Ok(())
     }
 
@@ -6353,15 +6377,13 @@ impl Database {
 
                 // We proceed to update this record with the full metadata
                 if is_reply_msg {
-                    self.conn
-                        .execute(
-                            "UPDATE patchsets SET thread_id = ?, parser_version = ? WHERE id = ?",
-                            libsql::params![thread_id, parser_version, id],
-                        )
-                        .await?;
+                    self.execute(
+                        "UPDATE patchsets SET thread_id = ?, parser_version = ? WHERE id = ?",
+                        libsql::params![thread_id, parser_version, id],
+                    )
+                    .await?;
                 } else {
-                    self.conn
-                        .execute(
+                    self.execute(
                             "UPDATE patchsets SET thread_id = ?, author = ?, total_parts = ?, parser_version = ?, to_recipients = ?, cc_recipients = ? WHERE id = ?",
                             libsql::params![thread_id, final_author, final_total, parser_version, to, cc, id],
                         )
@@ -6382,16 +6404,14 @@ impl Database {
 
                 // Update subject if this is a better index (e.g. going from placeholder to real subject)
                 if !is_reply_msg && part_index < subject_index {
-                    self.conn
-                        .execute(
-                            "UPDATE patchsets SET subject = ?, subject_index = ? WHERE id = ?",
-                            libsql::params![subject, part_index, id],
-                        )
-                        .await?;
+                    self.execute(
+                        "UPDATE patchsets SET subject = ?, subject_index = ? WHERE id = ?",
+                        libsql::params![subject, part_index, id],
+                    )
+                    .await?;
                 }
 
-                self.conn
-                    .execute(
+                self.execute(
                         "UPDATE patchsets
                          SET status = 'Incomplete', failed_reason = NULL
                          WHERE id = ?
@@ -6400,7 +6420,7 @@ impl Database {
                     )
                     .await?;
 
-                self.conn.execute(
+                self.execute(
                     "UPDATE patchsets SET status = 'Pending' WHERE id = ? AND received_parts >= total_parts AND status IN ('Incomplete', 'Fetching')",
                     libsql::params![id],
                 ).await?;
@@ -6549,8 +6569,7 @@ impl Database {
                     if let Some(clid) = cover_letter_message_id {
                         self.adopt_series_identity(id, clid, 0, false).await?;
                     }
-                    self.conn
-                        .execute(
+                    self.execute(
                             "UPDATE patchsets SET subject = ?, subject_index = 0 WHERE id = ? AND subject_index > 0",
                             libsql::params![subject, id],
                         )
@@ -6913,15 +6932,13 @@ impl Database {
 
             // Update the target patchset
             if is_reply_msg {
-                self.conn
-                    .execute(
-                        "UPDATE patchsets SET parser_version = ? WHERE id = ?",
-                        libsql::params![parser_version, target_id],
-                    )
-                    .await?;
+                self.execute(
+                    "UPDATE patchsets SET parser_version = ? WHERE id = ?",
+                    libsql::params![parser_version, target_id],
+                )
+                .await?;
             } else {
-                self.conn
-                    .execute(
+                self.execute(
                         "UPDATE patchsets SET author = ?, total_parts = ?, parser_version = ?, to_recipients = ?, cc_recipients = ? WHERE id = ?",
                         libsql::params![author, final_total, parser_version, to, cc, target_id],
                     )
@@ -6929,7 +6946,7 @@ impl Database {
             }
 
             if skip_filters_json.is_some() || only_filters_json.is_some() {
-                self.conn.execute(
+                self.execute(
                     "UPDATE patchsets SET skip_filters = COALESCE(?, skip_filters), only_filters = COALESCE(?, only_filters) WHERE id = ?",
                     libsql::params![skip_filters_json.clone(), only_filters_json.clone(), target_id],
                 ).await?;
@@ -6951,24 +6968,21 @@ impl Database {
 
             // Conditionally update subject if the newly arrived message has an even better index
             if !is_reply_msg && part_index < current_subject_index {
-                self.conn
-                    .execute(
-                        "UPDATE patchsets SET subject = ?, subject_index = ? WHERE id = ?",
-                        libsql::params![subject, part_index, target_id],
-                    )
-                    .await?;
+                self.execute(
+                    "UPDATE patchsets SET subject = ?, subject_index = ? WHERE id = ?",
+                    libsql::params![subject, part_index, target_id],
+                )
+                .await?;
             }
 
             // Recalculate received parts for target (in case we merged)
-            self.conn
-            .execute(
+            self.execute(
                 "UPDATE patchsets SET received_parts = (SELECT COUNT(*) FROM patches WHERE patchset_id = ?) WHERE id = ?",
                 libsql::params![target_id, target_id],
             )
             .await?;
 
-            self.conn
-                .execute(
+            self.execute(
                     "UPDATE patchsets
                      SET status = 'Incomplete', failed_reason = NULL
                      WHERE id = ?
@@ -6977,7 +6991,7 @@ impl Database {
                 )
                 .await?;
 
-            self.conn.execute(
+            self.execute(
                 "UPDATE patchsets SET status = 'Pending' WHERE id = ? AND received_parts >= total_parts AND status IN ('Incomplete', 'Fetching')",
                 libsql::params![target_id],
             ).await?;
@@ -7029,22 +7043,15 @@ impl Database {
             }
         }
 
-        let mut rows = self.conn
-            .query(
+        let id = self
+            .query_returning_i64(
                 "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, baseline_id, baseline_part_index, skip_filters, only_filters)
                  VALUES (?, ?, ?, ?, ?, ?, 0, 'Incomplete', ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
                 libsql::params![thread_id, final_cover_id.as_deref(), subject, author, date, total_parts, parser_version, to, cc, if part_index == 0 && Self::is_reply_subject(subject) { 9999 } else { part_index }, baseline_id, baseline_id.map(|_| part_index), skip_filters_json.clone(), only_filters_json.clone()],
             )
-            .await?;
-
-        if let Some(row) = rows.next().await? {
-            let id: i64 = row.get(0)?;
-            Ok(Some(id))
-        } else {
-            Err(anyhow::anyhow!(
-                "Failed to retrieve patchset ID after insert"
-            ))
-        }
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Failed to retrieve patchset ID after insert"))?;
+        Ok(Some(id))
     }
 
     /// Inserts or updates a patch when no stable Git patch ID is available.
@@ -7245,12 +7252,11 @@ impl Database {
     }
 
     pub async fn set_patchset_embargo_until(&self, id: i64, embargo_until: i64) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE patchsets SET embargo_until = ? WHERE id = ?",
-                libsql::params![embargo_until, id],
-            )
-            .await?;
+        self.execute(
+            "UPDATE patchsets SET embargo_until = ? WHERE id = ?",
+            libsql::params![embargo_until, id],
+        )
+        .await?;
         Ok(())
     }
 
@@ -7264,15 +7270,14 @@ impl Database {
         id: i64,
         embargo_until: i64,
     ) -> Result<()> {
-        self.conn
-            .execute(
-                &format!(
-                    "UPDATE patchsets SET embargo_until = ?
+        self.execute(
+            &format!(
+                "UPDATE patchsets SET embargo_until = ?
                      WHERE id = ? AND NOT {CLOSED_TO_NEW_PARTS_SQL}"
-                ),
-                libsql::params![embargo_until, id],
-            )
-            .await?;
+            ),
+            libsql::params![embargo_until, id],
+        )
+        .await?;
         Ok(())
     }
 
@@ -7346,7 +7351,6 @@ impl Database {
             let old_ver = crate::patch::parse_subject_version(&old_subject).unwrap_or(1);
             let candidate_slug = format!("{}-v{}", slug, old_ver);
             let res = self
-                .conn
                 .execute(
                     "UPDATE patchsets SET slug = ? WHERE id = ?",
                     libsql::params![candidate_slug, old_id],
@@ -7355,7 +7359,6 @@ impl Database {
             if res.is_err() {
                 let fallback_slug = format!("{}-v{}-{}", slug, old_ver, old_id);
                 let _ = self
-                    .conn
                     .execute(
                         "UPDATE patchsets SET slug = ? WHERE id = ?",
                         libsql::params![fallback_slug, old_id],
@@ -7377,31 +7380,29 @@ impl Database {
         if let Some(s) = slug {
             self.rotate_mr_slug(s, Some(id)).await?;
         }
-        self.conn
-            .execute(
-                "UPDATE patchsets SET
+        self.execute(
+            "UPDATE patchsets SET
                     mr_url = COALESCE(mr_url, ?),
                     mr_title = COALESCE(mr_title, ?),
                     mr_number = COALESCE(mr_number, ?),
                     slug = COALESCE(?, slug)
                  WHERE id = ?",
-                libsql::params![mr_url, mr_title, mr_number, slug, id],
-            )
-            .await?;
+            libsql::params![mr_url, mr_title, mr_number, slug, id],
+        )
+        .await?;
         self.reconcile_superseded_pr_patchsets(id, mr_url, mr_number)
             .await?;
         Ok(())
     }
 
     pub async fn clear_patchset_embargo(&self, id: i64) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE patchsets
+        self.execute(
+            "UPDATE patchsets
                  SET embargo_until = NULL, embargo_release_started_at = NULL
                  WHERE id = ?",
-                libsql::params![id],
-            )
-            .await?;
+            libsql::params![id],
+        )
+        .await?;
         Ok(())
     }
 
@@ -8351,13 +8352,12 @@ impl Database {
 
     /// Writes an instance-wide marker, replacing any previous value.
     pub async fn set_meta(&self, key: &str, value: &str) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT INTO meta (key, value) VALUES (?, ?) \
+        self.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) \
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                libsql::params![key, value],
-            )
-            .await?;
+            libsql::params![key, value],
+        )
+        .await?;
         Ok(())
     }
 
@@ -8739,19 +8739,17 @@ impl Database {
                AND (p.embargo_until <= ? OR ({CLEAN_PATCHSET_PREDICATE}))"
         );
         let updated = self
-            .conn
             .execute(&sql, libsql::params![now, id, now - 600, now])
             .await?;
         Ok(updated == 1)
     }
 
     pub async fn clear_patchset_embargo_release_claim(&self, id: i64) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE patchsets SET embargo_release_started_at = NULL WHERE id = ?",
-                libsql::params![id],
-            )
-            .await?;
+        self.execute(
+            "UPDATE patchsets SET embargo_release_started_at = NULL WHERE id = ?",
+            libsql::params![id],
+        )
+        .await?;
         Ok(())
     }
 
@@ -8843,26 +8841,23 @@ impl Database {
 
     pub async fn update_patchset_status(&self, id: i64, status: &str) -> Result<()> {
         if status == ReviewStatus::Cancelled.as_str() {
-            self.conn
-                .execute(
-                    "UPDATE patchsets SET status = ? WHERE id = ?",
-                    libsql::params![status, id],
-                )
-                .await?;
+            self.execute(
+                "UPDATE patchsets SET status = ? WHERE id = ?",
+                libsql::params![status, id],
+            )
+            .await?;
         } else {
-            self.conn
-                .execute(
-                    "UPDATE patchsets SET status = ? WHERE id = ? AND status != 'Cancelled'",
-                    libsql::params![status, id],
-                )
-                .await?;
+            self.execute(
+                "UPDATE patchsets SET status = ? WHERE id = ? AND status != 'Cancelled'",
+                libsql::params![status, id],
+            )
+            .await?;
         }
         Ok(())
     }
 
     pub async fn claim_patchset_for_review(&self, id: i64) -> Result<bool> {
         let count = self
-            .conn
             .execute(
                 "UPDATE patchsets SET status = 'In Review' WHERE id = ? AND status = 'Pending'",
                 libsql::params![id],
@@ -8872,12 +8867,11 @@ impl Database {
     }
 
     pub async fn update_patch_status(&self, patch_id: i64, status: &str) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE patches SET status = ? WHERE id = ?",
-                libsql::params![status, patch_id],
-            )
-            .await?;
+        self.execute(
+            "UPDATE patches SET status = ? WHERE id = ?",
+            libsql::params![status, patch_id],
+        )
+        .await?;
         Ok(())
     }
 
@@ -8897,34 +8891,31 @@ impl Database {
     }
 
     pub async fn cancel_outbox_for_patchset(&self, id: i64, reason: &str) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE forge_outbox
+        self.execute(
+            "UPDATE forge_outbox
                  SET status = 'Cancelled', error_log = ?, locked_at = NULL
                  WHERE patchset_id = ? AND status IN ('Pending', 'Embargoed')",
-                libsql::params![reason.to_string(), id],
-            )
-            .await?;
+            libsql::params![reason.to_string(), id],
+        )
+        .await?;
 
-        self.conn
-            .execute(
-                "UPDATE email_outbox
+        self.execute(
+            "UPDATE email_outbox
                  SET status = 'Cancelled', error_log = ?, locked_at = NULL
                  WHERE status IN ('Pending', 'Embargoed')
                    AND patch_id IN (SELECT id FROM patches WHERE patchset_id = ?)",
-                libsql::params![reason.to_string(), id],
-            )
-            .await?;
+            libsql::params![reason.to_string(), id],
+        )
+        .await?;
 
-        self.conn
-            .execute(
-                "UPDATE patchwork_outbox
+        self.execute(
+            "UPDATE patchwork_outbox
                  SET status = 'Cancelled', error_log = ?, locked_at = NULL
                  WHERE status = 'Pending'
                    AND patch_msg_id IN (SELECT message_id FROM patches WHERE patchset_id = ?)",
-                libsql::params![reason.to_string(), id],
-            )
-            .await?;
+            libsql::params![reason.to_string(), id],
+        )
+        .await?;
 
         Ok(())
     }
@@ -8940,7 +8931,6 @@ impl Database {
         // status != 'Cancelled') is immediately blocked from marking the
         // patchset as 'Reviewed'.
         let count = self
-            .conn
             .execute(
                 &format!(
                     "UPDATE patchsets SET status = 'Cancelled' WHERE id = ? AND status IN {}",
@@ -8953,14 +8943,12 @@ impl Database {
             return Ok(false);
         }
 
-        self.conn
-            .execute(
+        self.execute(
                 "UPDATE reviews SET status = 'Cancelled' WHERE patchset_id = ? AND status IN ('Pending', 'In Review')",
                 libsql::params![id],
             )
             .await?;
-        self.conn
-            .execute(
+        self.execute(
                 "UPDATE patches SET status = 'Cancelled' WHERE patchset_id = ? AND status IN ('Pending', 'In Review', 'Reviewing')",
                 libsql::params![id],
             )
@@ -9195,17 +9183,15 @@ impl Database {
         let should_increment = current_status.as_deref() == Some("Reviewed");
 
         // 2. Reset patchset status to Pending
-        self.conn
-            .execute(
-                "UPDATE patchsets SET status = 'Pending' WHERE id = ?",
-                libsql::params![id],
-            )
-            .await?;
+        self.execute(
+            "UPDATE patchsets SET status = 'Pending' WHERE id = ?",
+            libsql::params![id],
+        )
+        .await?;
 
         // 3. Increment target_review_count only if it was previously Reviewed
         if should_increment {
-            self.conn
-                .execute(
+            self.execute(
                     "UPDATE patchsets SET target_review_count = COALESCE(target_review_count, 1) + 1 WHERE id = ?",
                     libsql::params![id],
                 )
@@ -9213,8 +9199,7 @@ impl Database {
         }
 
         // 4. Delete associated tool usages and findings for failed reviews that block retrying
-        self.conn
-            .execute(
+        self.execute(
                 "DELETE FROM tool_usages WHERE review_id IN (
                     SELECT id FROM reviews WHERE patchset_id = ? AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL
                 )",
@@ -9222,8 +9207,7 @@ impl Database {
             )
             .await?;
 
-        self.conn
-            .execute(
+        self.execute(
                 "DELETE FROM findings WHERE review_id IN (
                     SELECT id FROM reviews WHERE patchset_id = ? AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL
                 )",
@@ -9232,8 +9216,7 @@ impl Database {
             .await?;
 
         // 5. Delete failed reviews that block retrying (infra failures)
-        self.conn
-            .execute(
+        self.execute(
                 "DELETE FROM reviews WHERE patchset_id = ? AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL",
                 libsql::params![id],
             )
@@ -9341,7 +9324,7 @@ impl Database {
                     if let Some(s) = slug {
                         self.rotate_mr_slug(s, Some(id)).await?;
                     }
-                    self.conn.execute(
+                    self.execute(
                         "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, subject = ?, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ? WHERE id = ?",
                         libsql::params![effective_subject, skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, id]
                     ).await?;
@@ -9360,30 +9343,22 @@ impl Database {
         }
 
         // 3. Create the fetching patchset
-        let mut rows = self.conn
-            .query(
+        let id = self
+            .query_returning_i64(
                 "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, status, date, skip_filters, only_filters, mr_url, mr_title, mr_number, slug)
                      VALUES (?, ?, ?, 'Fetching', ?, ?, ?, ?, ?, ?, ?) RETURNING id",
                 libsql::params![thread_id, root_msg_id, effective_subject, now, skip_filters_json, only_filters_json, mr_url, mr_title, mr_number, slug],
             )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Failed to get patchset ID"))?;
+        self.reconcile_superseded_pr_patchsets(id, mr_url, mr_number)
             .await?;
-
-        if let Some(row) = rows.next().await? {
-            let id: i64 = row.get(0)?;
-            drop(rows);
-            self.reconcile_superseded_pr_patchsets(id, mr_url, mr_number)
-                .await?;
-            Ok(id)
-        } else {
-            Err(anyhow::anyhow!("Failed to get patchset ID"))
-        }
+        Ok(id)
     }
     pub async fn update_patchset_error(&self, root_msg_id: &str, error: &str) -> Result<()> {
         let candidates = Self::get_msgid_candidates(root_msg_id);
         for clid in candidates {
-            let res = self
-                .conn
-                .execute(
+            let res = self.execute(
                     "UPDATE patchsets SET status = 'Failed', failed_reason = ? WHERE cover_letter_message_id = ?",
                     libsql::params![error, clid],
                 )
@@ -9398,9 +9373,7 @@ impl Database {
     pub async fn fail_fetching_patchset(&self, root_msg_id: &str, error: &str) -> Result<()> {
         let candidates = Self::get_msgid_candidates(root_msg_id);
         for clid in candidates {
-            let res = self
-                .conn
-                .execute(
+            let res = self.execute(
                     "UPDATE patchsets SET status = 'Failed', failed_reason = ?
                      WHERE cover_letter_message_id = ?
                        AND (status = 'Fetching' OR (status = 'Incomplete' AND COALESCE(received_parts, 0) = 0))",
@@ -9415,9 +9388,7 @@ impl Database {
     }
 
     pub async fn fail_interrupted_fetching_patchsets(&self) -> Result<u64> {
-        let count = self
-            .conn
-            .execute(
+        let count = self.execute(
                 "UPDATE patchsets SET status = 'Failed', failed_reason = 'Interrupted before fetch completed'
                  WHERE status = 'Fetching' OR (status = 'Incomplete' AND COALESCE(received_parts, 0) = 0)",
                 (),
@@ -9435,8 +9406,7 @@ impl Database {
         logs: Option<&str>,
         provider: Option<&str>,
     ) -> Result<()> {
-        self.conn
-            .execute(
+        self.execute(
                 "UPDATE patchsets SET baseline_id = ?, model_name = ?, prompts_git_hash = ?, baseline_logs = ?, provider = ? WHERE id = ?",
                 libsql::params![baseline_id, model_name, prompts_hash, logs.map(crate::compression::compress_string_if_needed).unwrap_or(libsql::Value::Null), provider, id],
             )
@@ -9451,7 +9421,7 @@ impl Database {
         status: &str,
         error: Option<&str>,
     ) -> Result<()> {
-        self.conn.execute(
+        self.execute(
             "UPDATE patches SET status = ?, apply_error = ? WHERE patchset_id = ? AND part_index = ?",
             libsql::params![status, error, patchset_id, part_index],
         ).await?;
@@ -9462,7 +9432,6 @@ impl Database {
         let status_pending = ReviewStatus::Pending.as_str();
         // Reset Patchsets
         let count_ps = self
-            .conn
             .execute(
                 format!(
                     "UPDATE patchsets SET status = '{}' WHERE status IN ('In Review', 'Reviewing')",
@@ -9475,7 +9444,6 @@ impl Database {
 
         // Reset Reviews
         let count_rev = self
-            .conn
             .execute(
                 format!(
                     "UPDATE reviews SET status = '{}' WHERE status = 'In Review'",
@@ -9540,7 +9508,7 @@ impl Database {
         }
 
         let created_at = chrono::Utc::now().timestamp();
-        self.conn.execute(
+        self.execute(
             "INSERT INTO email_outbox (patch_id, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             libsql::params![
@@ -9637,23 +9605,22 @@ impl Database {
     }
 
     pub async fn mark_email_sent(&self, id: i64) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE email_outbox SET status = 'Sent', locked_at = NULL WHERE id = ?",
-                libsql::params![id],
-            )
-            .await?;
+        self.execute(
+            "UPDATE email_outbox SET status = 'Sent', locked_at = NULL WHERE id = ?",
+            libsql::params![id],
+        )
+        .await?;
         Ok(())
     }
 
     pub async fn mark_email_failed(&self, id: i64, error_log: &str) -> Result<()> {
-        self.conn.execute("UPDATE email_outbox SET status = 'Failed', error_log = ?, locked_at = NULL WHERE id = ?", libsql::params![error_log.to_string(), id]).await?;
+        self.execute("UPDATE email_outbox SET status = 'Failed', error_log = ?, locked_at = NULL WHERE id = ?", libsql::params![error_log.to_string(), id]).await?;
         Ok(())
     }
 
     pub async fn sweep_ghost_emails(&self) -> Result<u64> {
         let ten_mins_ago = chrono::Utc::now().timestamp() - 600;
-        let count = self.conn.execute(
+        let count = self.execute(
             "UPDATE email_outbox SET status = 'Pending', locked_at = NULL WHERE status = 'Sending' AND locked_at < ?",
             libsql::params![ten_mins_ago]
         ).await?;
@@ -9684,8 +9651,7 @@ impl Database {
         }
 
         let created_at = chrono::Utc::now().timestamp();
-        self.conn
-            .execute(
+        self.execute(
                 "INSERT INTO patchwork_outbox (patch_msg_id, api_url, check_state, description, target_url, context, created_at)
                  VALUES (?, ?, ?, ?, ?, ?, ?)",
                 libsql::params![
@@ -9775,18 +9741,16 @@ impl Database {
     }
 
     pub async fn mark_patchwork_sent(&self, id: i64) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE patchwork_outbox SET status = 'Sent', locked_at = NULL WHERE id = ?",
-                libsql::params![id],
-            )
-            .await?;
+        self.execute(
+            "UPDATE patchwork_outbox SET status = 'Sent', locked_at = NULL WHERE id = ?",
+            libsql::params![id],
+        )
+        .await?;
         Ok(())
     }
 
     pub async fn mark_patchwork_failed(&self, id: i64, error_log: &str) -> Result<()> {
-        self.conn
-            .execute(
+        self.execute(
                 "UPDATE patchwork_outbox SET status = 'Failed', error_log = ?, locked_at = NULL WHERE id = ?",
                 libsql::params![error_log.to_string(), id],
             )
@@ -9798,8 +9762,7 @@ impl Database {
     /// Increments retry_count, sets next_retry_at, and returns to
     /// Pending status so the worker loop continues without blocking.
     pub async fn set_patchwork_retry_at(&self, id: i64, next_retry_at: i64) -> Result<()> {
-        self.conn
-            .execute(
+        self.execute(
                 "UPDATE patchwork_outbox SET status = 'Pending', retry_count = retry_count + 1, next_retry_at = ?, locked_at = NULL WHERE id = ?",
                 libsql::params![next_retry_at, id],
             )
@@ -9809,8 +9772,7 @@ impl Database {
 
     pub async fn sweep_ghost_patchwork(&self) -> Result<u64> {
         let ten_mins_ago = chrono::Utc::now().timestamp() - 600;
-        let count = self.conn
-            .execute(
+        let count = self.execute(
                 "UPDATE patchwork_outbox SET status = 'Pending', locked_at = NULL WHERE status = 'Sending' AND locked_at < ?",
                 libsql::params![ten_mins_ago],
             )
@@ -9882,8 +9844,7 @@ impl Database {
         }
 
         let created_at = chrono::Utc::now().timestamp();
-        self.conn
-            .execute(
+        self.execute(
                 "INSERT INTO forge_outbox (patchset_id, provider, repo, pr_number, head_sha, body, target_url, status, created_at)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 libsql::params![
@@ -9974,18 +9935,16 @@ impl Database {
     }
 
     pub async fn mark_forge_outbox_sent(&self, id: i64) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE forge_outbox SET status = 'Sent', locked_at = NULL WHERE id = ?",
-                libsql::params![id],
-            )
-            .await?;
+        self.execute(
+            "UPDATE forge_outbox SET status = 'Sent', locked_at = NULL WHERE id = ?",
+            libsql::params![id],
+        )
+        .await?;
         Ok(())
     }
 
     pub async fn mark_forge_outbox_failed(&self, id: i64, error_log: &str) -> Result<()> {
-        self.conn
-            .execute(
+        self.execute(
                 "UPDATE forge_outbox SET status = 'Failed', error_log = ?, locked_at = NULL WHERE id = ?",
                 libsql::params![error_log.to_string(), id],
             )
@@ -9999,8 +9958,7 @@ impl Database {
         next_retry_at: i64,
         error_log: &str,
     ) -> Result<()> {
-        self.conn
-            .execute(
+        self.execute(
                 "UPDATE forge_outbox
                  SET status = 'Pending', retry_count = retry_count + 1, next_retry_at = ?, error_log = ?, locked_at = NULL
                  WHERE id = ?",
@@ -10012,9 +9970,7 @@ impl Database {
 
     pub async fn sweep_ghost_forge_outbox(&self) -> Result<u64> {
         let ten_mins_ago = chrono::Utc::now().timestamp() - 600;
-        let count = self
-            .conn
-            .execute(
+        let count = self.execute(
                 "UPDATE forge_outbox SET status = 'Pending', locked_at = NULL WHERE status = 'Sending' AND locked_at < ?",
                 libsql::params![ten_mins_ago],
             )
@@ -10023,9 +9979,7 @@ impl Database {
     }
 
     pub async fn release_embargoed_forge_outbox(&self, patchset_id: i64) -> Result<u64> {
-        let count = self
-            .conn
-            .execute(
+        let count = self.execute(
                 "UPDATE forge_outbox SET status = 'Pending' WHERE patchset_id = ? AND status = 'Embargoed'",
                 libsql::params![patchset_id],
             )
@@ -10067,8 +10021,7 @@ impl Database {
         let created_at = chrono::Utc::now().timestamp();
         let to_json = serde_json::to_string(&[to_address])
             .map_err(|e| libsql::Error::Misuse(e.to_string()))?;
-        self.conn
-            .execute(
+        self.execute(
                 "INSERT INTO email_outbox (patch_id, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, created_at)
                  VALUES (NULL, ?, ?, '[]', ?, ?, ?, ?, ?)",
                 libsql::params![
@@ -10107,8 +10060,7 @@ impl Database {
         let created_at = chrono::Utc::now().timestamp();
         let to_json = serde_json::to_string(&[to_address])
             .map_err(|e| libsql::Error::Misuse(e.to_string()))?;
-        self.conn
-            .execute(
+        self.execute(
                 "INSERT INTO email_outbox (patch_id, kind, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, created_at)
                  VALUES (NULL, ?, ?, ?, '[]', ?, '', '', ?, ?)",
                 libsql::params![
@@ -22123,14 +22075,13 @@ mod tests {
         db.migrate().await.unwrap();
 
         for i in 0..5 {
-            db.conn
-                .execute(
-                    "INSERT INTO email_outbox (kind, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, created_at)
-                     VALUES ('review_notification', 'Pending', '[\"user@example.com\"]', '[]', ?, ?, '', 'body', 1700000000)",
-                    libsql::params![format!("Subject {i}"), format!("<msg-{i}>")],
-                )
-                .await
-                .unwrap();
+            db.execute(
+                "INSERT INTO email_outbox (kind, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, created_at)
+                 VALUES ('review_notification', 'Pending', '[\"user@example.com\"]', '[]', ?, ?, '', 'body', 1700000000)",
+                libsql::params![format!("Subject {i}"), format!("<msg-{i}>")],
+            )
+            .await
+            .unwrap();
         }
 
         // Hold an active stepped read cursor open on `db.conn` across `.await`
@@ -22150,6 +22101,29 @@ mod tests {
             .expect("lock_pending_email must not fail while a read cursor is open on conn");
         assert!(claimed.is_some());
 
+        // After `tx_conn` commits a newer WAL frame while `cursor` still holds
+        // `conn` in `TRANS_READ` on an older WAL snapshot, autocommit writes and
+        // `RETURNING` writes must still succeed without `SQLITE_BUSY_SNAPSHOT`.
+        db.ensure_person(Some("Test Author"), "author@example.com")
+            .await
+            .expect("ensure_person must not hit SQLITE_BUSY_SNAPSHOT");
+        db.ensure_subsystem("USB", "linux-usb@vger.kernel.org")
+            .await
+            .expect("ensure_subsystem must not hit SQLITE_BUSY_SNAPSHOT");
+        let thread_id = db
+            .create_thread("<root@example.com>", "Subject", 1700000000)
+            .await
+            .expect("create_thread RETURNING must not hit SQLITE_BUSY_SNAPSHOT");
+        assert!(thread_id > 0);
+        let bug = db
+            .claim_pending_bug("worker-1", 60, 3)
+            .await
+            .expect("claim_pending_bug RETURNING must not hit SQLITE_BUSY_SNAPSHOT");
+        assert!(bug.is_none());
+        db.sweep_ghost_emails()
+            .await
+            .expect("sweep_ghost_emails must not hit SQLITE_BUSY_SNAPSHOT");
+
         let second = cursor.next().await.unwrap();
         assert!(second.is_some());
     }
@@ -22166,8 +22140,8 @@ mod tests {
         }
     }
 
-    /// Every explicit SQLite transaction must go through `Database::begin_transaction`
-    /// or `Database::begin_immediate_transaction` on `tx_conn` under `tx_lock`.
+    /// Every explicit SQLite transaction and production write must go through
+    /// `Database` methods on `tx_conn` under `tx_lock`.
     #[test]
     fn test_no_unserialized_database_transactions() {
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -22184,6 +22158,10 @@ mod tests {
             concat!(".execute(\"BEGIN", " IMMEDIATE"),
             concat!(".execute(\"BEGIN", " TRANSACTION"),
         ];
+        let forbidden_prod_writes = [
+            concat!(".conn", ".execute("),
+            concat!(".conn", ".execute_batch("),
+        ];
 
         let mut offenders = Vec::new();
         for path in files {
@@ -22193,13 +22171,30 @@ mod tests {
                     offenders.push(format!("{} (contains `{pattern}`)", path.display()));
                 }
             }
+            if path.starts_with(manifest_dir.join("src")) {
+                let prod_slice = content
+                    .split("#[cfg(test)]")
+                    .next()
+                    .unwrap_or(&content)
+                    .split("#[cfg(all(test,")
+                    .next()
+                    .unwrap_or(&content);
+                for pattern in forbidden_prod_writes {
+                    if prod_slice.contains(pattern) {
+                        offenders.push(format!(
+                            "{} production code (contains `{pattern}`)",
+                            path.display()
+                        ));
+                    }
+                }
+            }
         }
 
         assert!(
             offenders.is_empty(),
-            "Unserialized database transactions detected. Always use \
-             Database::begin_transaction or Database::begin_immediate_transaction \
-             instead of opening transactions on conn or running raw BEGIN statements. \
+            "Unserialized database transactions or writes on conn detected. Always use \
+             Database::execute, Database::execute_batch, Database::begin_transaction, or \
+             Database::begin_immediate_transaction instead of writing on conn directly. \
              Offenders: {}",
             offenders.join(", ")
         );

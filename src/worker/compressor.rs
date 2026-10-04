@@ -67,17 +67,20 @@ pub async fn run_compressor(db: Arc<Database>) {
 }
 
 async fn compress_messages(db: &Database, limit: i32) -> Result<usize> {
-    let mut rows = db.conn.query(
-        "SELECT id, body FROM messages WHERE typeof(body) = 'text' AND length(body) > 1024 LIMIT ?",
-        libsql::params![limit],
-    ).await?;
+    let to_update = {
+        let mut rows = db.conn.query(
+            "SELECT id, body FROM messages WHERE typeof(body) = 'text' AND length(body) > 1024 LIMIT ?",
+            libsql::params![limit],
+        ).await?;
 
-    let mut to_update = Vec::new();
-    while let Ok(Some(row)) = rows.next().await {
-        let id: i64 = row.get(0)?;
-        let body: String = row.get(1)?;
-        to_update.push((id, body));
-    }
+        let mut to_update = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let id: i64 = row.get(0)?;
+            let body: String = row.get(1)?;
+            to_update.push((id, body));
+        }
+        to_update
+    };
 
     let count = to_update.len();
     if count == 0 {
@@ -116,17 +119,20 @@ async fn compress_messages(db: &Database, limit: i32) -> Result<usize> {
 }
 
 async fn compress_patches(db: &Database, limit: i32) -> Result<usize> {
-    let mut rows = db.conn.query(
-        "SELECT id, diff FROM patches WHERE typeof(diff) = 'text' AND length(diff) > 1024 LIMIT ?",
-        libsql::params![limit],
-    ).await?;
+    let to_update = {
+        let mut rows = db.conn.query(
+            "SELECT id, diff FROM patches WHERE typeof(diff) = 'text' AND length(diff) > 1024 LIMIT ?",
+            libsql::params![limit],
+        ).await?;
 
-    let mut to_update = Vec::new();
-    while let Ok(Some(row)) = rows.next().await {
-        let id: i64 = row.get(0)?;
-        let diff: String = row.get(1)?;
-        to_update.push((id, diff));
-    }
+        let mut to_update = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let id: i64 = row.get(0)?;
+            let diff: String = row.get(1)?;
+            to_update.push((id, diff));
+        }
+        to_update
+    };
 
     let count = to_update.len();
     if count == 0 {
@@ -165,17 +171,20 @@ async fn compress_patches(db: &Database, limit: i32) -> Result<usize> {
 }
 
 async fn compress_patchsets(db: &Database, limit: i32) -> Result<usize> {
-    let mut rows = db.conn.query(
-        "SELECT id, baseline_logs FROM patchsets WHERE typeof(baseline_logs) = 'text' AND length(baseline_logs) > 1024 LIMIT ?",
-        libsql::params![limit],
-    ).await?;
+    let to_update = {
+        let mut rows = db.conn.query(
+            "SELECT id, baseline_logs FROM patchsets WHERE typeof(baseline_logs) = 'text' AND length(baseline_logs) > 1024 LIMIT ?",
+            libsql::params![limit],
+        ).await?;
 
-    let mut to_update = Vec::new();
-    while let Ok(Some(row)) = rows.next().await {
-        let id: i64 = row.get(0)?;
-        let logs: String = row.get(1)?;
-        to_update.push((id, logs));
-    }
+        let mut to_update = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let id: i64 = row.get(0)?;
+            let logs: String = row.get(1)?;
+            to_update.push((id, logs));
+        }
+        to_update
+    };
 
     let count = to_update.len();
     if count == 0 {
@@ -217,17 +226,20 @@ async fn compress_reviews(db: &Database, limit: i32) -> Result<usize> {
     let mut count = 0;
 
     // Logs
-    let mut rows = db.conn.query(
-        "SELECT id, logs FROM reviews WHERE typeof(logs) = 'text' AND length(logs) > 1024 LIMIT ?",
-        libsql::params![limit],
-    ).await?;
+    let to_update_logs = {
+        let mut rows = db.conn.query(
+            "SELECT id, logs FROM reviews WHERE typeof(logs) = 'text' AND length(logs) > 1024 LIMIT ?",
+            libsql::params![limit],
+        ).await?;
 
-    let mut to_update_logs = Vec::new();
-    while let Ok(Some(row)) = rows.next().await {
-        let id: i64 = row.get(0)?;
-        let logs: String = row.get(1)?;
-        to_update_logs.push((id, logs));
-    }
+        let mut to_update_logs = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let id: i64 = row.get(0)?;
+            let logs: String = row.get(1)?;
+            to_update_logs.push((id, logs));
+        }
+        to_update_logs
+    };
 
     if !to_update_logs.is_empty() {
         count += to_update_logs.len();
@@ -262,17 +274,20 @@ async fn compress_reviews(db: &Database, limit: i32) -> Result<usize> {
     }
 
     // Inline review
-    let mut rows = db.conn.query(
-        "SELECT id, inline_review FROM reviews WHERE typeof(inline_review) = 'text' AND length(inline_review) > 1024 LIMIT ?",
-        libsql::params![limit],
-    ).await?;
+    let to_update_inline = {
+        let mut rows = db.conn.query(
+            "SELECT id, inline_review FROM reviews WHERE typeof(inline_review) = 'text' AND length(inline_review) > 1024 LIMIT ?",
+            libsql::params![limit],
+        ).await?;
 
-    let mut to_update_inline = Vec::new();
-    while let Ok(Some(row)) = rows.next().await {
-        let id: i64 = row.get(0)?;
-        let inline: String = row.get(1)?;
-        to_update_inline.push((id, inline));
-    }
+        let mut to_update_inline = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let id: i64 = row.get(0)?;
+            let inline: String = row.get(1)?;
+            to_update_inline.push((id, inline));
+        }
+        to_update_inline
+    };
 
     if !to_update_inline.is_empty() {
         count += to_update_inline.len();
@@ -310,18 +325,21 @@ async fn compress_reviews(db: &Database, limit: i32) -> Result<usize> {
 }
 
 async fn compress_ai_interactions(db: &Database, limit: i32) -> Result<usize> {
-    let mut rows = db.conn.query(
-        "SELECT id, input_context, output_raw FROM ai_interactions WHERE (typeof(input_context) = 'text' AND length(input_context) > 1024) OR (typeof(output_raw) = 'text' AND length(output_raw) > 1024) LIMIT ?",
-        libsql::params![limit],
-    ).await?;
+    let to_update = {
+        let mut rows = db.conn.query(
+            "SELECT id, input_context, output_raw FROM ai_interactions WHERE (typeof(input_context) = 'text' AND length(input_context) > 1024) OR (typeof(output_raw) = 'text' AND length(output_raw) > 1024) LIMIT ?",
+            libsql::params![limit],
+        ).await?;
 
-    let mut to_update = Vec::new();
-    while let Ok(Some(row)) = rows.next().await {
-        let id: String = row.get(0)?;
-        let input_val: Value = row.get(1)?;
-        let output_val: Value = row.get(2)?;
-        to_update.push((id, input_val, output_val));
-    }
+        let mut to_update = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let id: String = row.get(0)?;
+            let input_val: Value = row.get(1)?;
+            let output_val: Value = row.get(2)?;
+            to_update.push((id, input_val, output_val));
+        }
+        to_update
+    };
 
     let count = to_update.len();
     if count == 0 {
