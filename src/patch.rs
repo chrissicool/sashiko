@@ -384,17 +384,25 @@ fn is_diff_payload(line: &str) -> bool {
 /// several files, whether the sender used git format-patch, git diff, cvs diff,
 /// or a bare unified diff.
 ///
+/// A diff ends only at prose that opens a paragraph, because mail mangles
+/// diffs: quoted-printable left undecoded puts `=20` on a line of its own, and
+/// a mailer wrapping a long context line drops the space that marks it. Either
+/// looks like prose in the middle of a hunk, but neither follows a blank line,
+/// and treating them as a boundary cuts one patch into several.
+///
 /// Quoted lines are skipped, so a reply discussing someone else's diff
 /// contributes no changeset of its own.
 #[cfg(feature = "server")]
 fn changeset_starts(body: &str) -> Vec<usize> {
     let mut starts = Vec::new();
     let mut in_diff = false;
+    let mut prev_blank = true;
     for (idx, line) in body.lines().enumerate() {
         // Only the quote test may ignore leading space: a context line is
         // identified by exactly that space, so trimming would make every line
         // of hunk body look like prose.
         if line.trim_start().starts_with('>') {
+            prev_blank = false;
             continue; // quoted reply context
         }
         if opens_diff_block(line) {
@@ -402,9 +410,10 @@ fn changeset_starts(body: &str) -> Vec<usize> {
                 starts.push(idx);
                 in_diff = true;
             }
-        } else if in_diff && !is_diff_payload(line) {
+        } else if in_diff && !is_diff_payload(line) && prev_blank {
             in_diff = false;
         }
+        prev_blank = line.trim().is_empty();
     }
     starts
 }
@@ -1280,6 +1289,46 @@ diff --git sys/dev/ic/qwz.c sys/dev/ic/qwz.c
     }
 
     /// Prose between two diffs makes them two changesets, whatever the format.
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_a_wrapped_context_line_does_not_split_a_patch() {
+        // A mailer broke one long context line across three, and only the
+        // first keeps the space that marks it as context.
+        let body = "Here is a fix:\n\n\
+            --- /usr/include/wchar.h.orig\tSat Oct  3 17:45:17 2026\n\
+            +++ /usr/include/wchar.h\tSat Oct  3 17:52:29 2026\n\
+            @@ -137,6 +137,7 @@\n\
+            \n \
+            #    if _LIBCPP_HAS_WIDE_CHARACTERS\n\
+            #      if defined(__cplusplus) &&\n\
+            !defined(_LIBCPP_WCHAR_H_HAS_CONST_OVERLOADS) &&\n\
+            defined(_LIBCPP_PREFERRED_OVERLOAD)\n\
+            +#if 0\n\
+            @@ -191,6 +192,7 @@\n\
+            +#endif\n";
+        assert_eq!(
+            split_changesets(body).len(),
+            1,
+            "a wrapped context line is not a patch boundary"
+        );
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_undecoded_quoted_printable_does_not_split_a_patch() {
+        // "=20" is a quoted-printable space left undecoded; it sits against
+        // hunk content, not after a blank line.
+        let body = "One patch, four files:\n\n\
+            diff --git a/a.c b/a.c\n--- a/a.c\n+++ b/a.c\n@@ -1,1 +1,1 @@\n-old\n+new\n\
+            =20\n\
+            diff --git a/b.c b/b.c\n--- a/b.c\n+++ b/b.c\n@@ -3,1 +3,1 @@\n-p\n+q\n";
+        assert_eq!(
+            split_changesets(body).len(),
+            1,
+            "a quoted-printable artefact is not a patch boundary"
+        );
+    }
+
     #[cfg(feature = "server")]
     #[test]
     fn test_prose_between_diffs_splits_them() {
