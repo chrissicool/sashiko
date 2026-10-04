@@ -147,7 +147,8 @@ validated findings into `state.findings` (patch defects) and `state.concerns`
 (pre-existing defects) via `record_verified_findings`:
 
 ```rust
-.reduce(|state, out: VerificationOutput| {
+.reduce_with_outcome(|state, mut out: VerificationOutput, outcome| {
+    enrich_verification_output(state, &mut out, outcome, analysis_stage_by_name);
     record_verified_findings(state, out.findings);
     state.hard_cases = out.hard_cases;
     state
@@ -172,8 +173,9 @@ state field rather than extending it. Ask *who else writes this field*. In
 `deduplicated_dismissed_concerns` are written by both `verification_stage` and
 each parallel `post_verification_stage_for_batch`, while `all_concerns` /
 `all_dismissed_concerns` have one writer per analysis stage via
-`append_stage_items` / `append_stage_dismissed_concerns`. A new writer of a
-multi-writer field needs a test in the shape of the ones above — call
+`append_stage_items_with_prompts` /
+`append_stage_dismissed_concerns_with_prompts`. A new writer of a multi-writer
+field needs a test in the shape of the ones above — call
 `(stage.reducer)(&mut state, out)` directly on a pre-populated state.
 
 `early_exit_if` (`graph.rs`, `WorkflowStep::EarlyExitIf`) evaluates its

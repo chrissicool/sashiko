@@ -670,12 +670,46 @@ fn format_inline_feedback(violation: &str) -> String {
     )
 }
 
-fn append_stage_items(
+pub fn push_unique_string(list: &mut Vec<String>, candidate: &str) {
+    let trimmed = candidate.trim();
+    if !trimmed.is_empty() && !list.iter().any(|existing| existing == trimmed) {
+        list.push(trimmed.to_string());
+    }
+}
+
+pub fn push_unique_prompt(prompts: &mut Vec<String>, candidate: &str) {
+    let trimmed = candidate.trim();
+    if crate::workflows::guard::sanitize_prompt_relpath(trimmed)
+        && !prompts.iter().any(|existing| existing == trimmed)
+    {
+        prompts.push(trimmed.to_string());
+    }
+}
+
+pub fn collect_stage_prompts(
+    selected_guides: &[String],
+    stage_guides: &[&str],
+    outcome: &crate::workflow::stage::StageOutcome,
+) -> Vec<String> {
+    let mut prompts = Vec::new();
+    for guide in selected_guides {
+        push_unique_prompt(&mut prompts, guide);
+    }
+    for guide in stage_guides {
+        push_unique_prompt(&mut prompts, guide);
+    }
+    for prompt in outcome.read_prompts() {
+        push_unique_prompt(&mut prompts, &prompt);
+    }
+    prompts
+}
+
+pub fn append_stage_items_with_prompts(
     dest: &mut Vec<Value>,
     src: &[Value],
     stage: &str,
     default_type: &str,
-    _key: &str,
+    prompts: &[String],
 ) {
     for item in src {
         let mut obj = item.clone();
@@ -690,18 +724,412 @@ fn append_stage_items(
                 map.insert("type".to_string(), json!(default_type));
             }
             map.insert("stage".to_string(), json!(stage));
+            map.insert("stages".to_string(), json!([stage]));
+            map.insert("prompts".to_string(), json!(prompts));
         }
         dest.push(obj);
     }
 }
 
-fn append_stage_dismissed_concerns(dest: &mut Vec<Value>, src: &[Value], stage: &str) {
+pub fn append_stage_dismissed_concerns_with_prompts(
+    dest: &mut Vec<Value>,
+    src: &[Value],
+    stage: &str,
+    prompts: &[String],
+) {
     for item in src {
         let mut obj = item.clone();
         if let Some(map) = obj.as_object_mut() {
             map.insert("stage".to_string(), json!(stage));
+            map.insert("stages".to_string(), json!([stage]));
+            map.insert("prompts".to_string(), json!(prompts));
         }
         dest.push(obj);
+    }
+}
+
+pub fn extract_item_stages_and_prompts(
+    item: &Value,
+    stage_lookup: fn(&str) -> Option<&'static AnalysisStage>,
+) -> (Vec<String>, Vec<String>) {
+    let mut stages = Vec::new();
+    let mut prompts = Vec::new();
+
+    if let Some(stage_str) = item.get("stage").and_then(Value::as_str)
+        && let Some(def) = stage_lookup(stage_str)
+    {
+        push_unique_string(&mut stages, def.name);
+    }
+    if let Some(arr) = item.get("stages").and_then(Value::as_array) {
+        for val in arr {
+            if let Some(stage_str) = val.as_str()
+                && let Some(def) = stage_lookup(stage_str)
+            {
+                push_unique_string(&mut stages, def.name);
+            }
+        }
+    }
+    if let Some(arr) = item.get("prompts").and_then(Value::as_array) {
+        for val in arr {
+            if let Some(p) = val.as_str() {
+                push_unique_prompt(&mut prompts, p);
+            }
+        }
+    }
+    for stage_name in &stages {
+        if let Some(def) = stage_lookup(stage_name) {
+            for guide in def.guides {
+                push_unique_prompt(&mut prompts, guide);
+            }
+        }
+    }
+
+    (stages, prompts)
+}
+
+pub fn extra_prompt_paths_for_items(
+    selected_guides: &[String],
+    items: &[Value],
+    stage_lookup: fn(&str) -> Option<&'static AnalysisStage>,
+) -> Vec<PathBuf> {
+    let mut prompt_names = Vec::new();
+    for item in items {
+        let (_stages, item_prompts) = extract_item_stages_and_prompts(item, stage_lookup);
+        for p in item_prompts {
+            push_unique_prompt(&mut prompt_names, &p);
+        }
+    }
+
+    let mut paths = Vec::new();
+    let mut push_path = |pb: PathBuf| {
+        if !paths.iter().any(|existing| existing == &pb) {
+            paths.push(pb);
+        }
+    };
+
+    for p in prompt_names {
+        if matches!(
+            p.as_str(),
+            "false-positive-guide.md" | "severity.md" | "review-core.md"
+        ) {
+            continue;
+        }
+        let basename = p.rsplit('/').next().unwrap_or(p.as_str());
+        if selected_guides
+            .iter()
+            .any(|g| g == &p || g.as_str() == basename)
+        {
+            continue;
+        }
+        if p.contains('/')
+            || matches!(
+                p.as_str(),
+                "callstack.md" | "technical-patterns.md" | "prompt-injection.md"
+            )
+        {
+            push_path(PathBuf::from(&p));
+        } else {
+            push_path(PathBuf::from(&p));
+            push_path(PathBuf::from("subsystem").join(&p));
+            push_path(PathBuf::from("patterns").join(&p));
+        }
+    }
+
+    paths
+}
+
+pub fn extra_prompt_paths_for_state(
+    state: &LinuxPatchReviewState,
+    stage_lookup: fn(&str) -> Option<&'static AnalysisStage>,
+) -> Vec<PathBuf> {
+    let mut combined =
+        Vec::with_capacity(state.all_concerns.len() + state.all_dismissed_concerns.len());
+    combined.extend_from_slice(&state.all_concerns);
+    combined.extend_from_slice(&state.all_dismissed_concerns);
+    extra_prompt_paths_for_items(&state.selected_guides, &combined, stage_lookup)
+}
+
+fn normalize_symbol_name(sym: &str) -> &str {
+    sym.trim().trim_end_matches("()").trim()
+}
+
+fn files_match(a: &str, b: &str) -> bool {
+    let a = a.trim().trim_start_matches("./");
+    let b = b.trim().trim_start_matches("./");
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    a == b || a.ends_with(&format!("/{b}")) || b.ends_with(&format!("/{a}"))
+}
+
+fn symbols_match(a: &str, b: &str) -> bool {
+    let a = normalize_symbol_name(a);
+    let b = normalize_symbol_name(b);
+    !a.is_empty() && !b.is_empty() && a.eq_ignore_ascii_case(b)
+}
+
+fn lines_match(a: Option<u64>, b: Option<u64>) -> bool {
+    match (a, b) {
+        (Some(la), Some(lb)) => la.abs_diff(lb) <= 5,
+        _ => false,
+    }
+}
+
+fn items_share_precise_location(item: &Value, src: &Value) -> bool {
+    let (Some(item_locs), Some(src_locs)) = (
+        item.get("locations").and_then(Value::as_array),
+        src.get("locations").and_then(Value::as_array),
+    ) else {
+        return false;
+    };
+    for iloc in item_locs {
+        let ifile = iloc.get("file").and_then(Value::as_str).unwrap_or("");
+        let isym = iloc
+            .get("function_or_symbol")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let iline = iloc.get("line").and_then(Value::as_u64);
+        for sloc in src_locs {
+            let sfile = sloc.get("file").and_then(Value::as_str).unwrap_or("");
+            let ssym = sloc
+                .get("function_or_symbol")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let sline = sloc.get("line").and_then(Value::as_u64);
+            if files_match(ifile, sfile) && (symbols_match(isym, ssym) || lines_match(iline, sline))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn items_share_file_location(item: &Value, src: &Value) -> bool {
+    let (Some(item_locs), Some(src_locs)) = (
+        item.get("locations").and_then(Value::as_array),
+        src.get("locations").and_then(Value::as_array),
+    ) else {
+        return false;
+    };
+    for iloc in item_locs {
+        let ifile = iloc.get("file").and_then(Value::as_str).unwrap_or("");
+        for sloc in src_locs {
+            let sfile = sloc.get("file").and_then(Value::as_str).unwrap_or("");
+            if files_match(ifile, sfile) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn items_share_text(item: &Value, src: &Value) -> bool {
+    let Some(src_desc) = src
+        .get("description")
+        .or_else(|| src.get("problem"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| s.len() >= 6)
+    else {
+        return false;
+    };
+    let src_lower = src_desc.to_ascii_lowercase();
+    for key in [
+        "description",
+        "problem",
+        "concern_arguments",
+        "dismissal_arguments",
+        "severity_explanation",
+        "reasoning",
+    ] {
+        if let Some(field) = item
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| s.len() >= 6)
+        {
+            let field_lower = field.to_ascii_lowercase();
+            if field_lower.contains(&src_lower) || src_lower.contains(&field_lower) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn enrich_item_provenance(
+    item: &mut Value,
+    primary_sources: &[Value],
+    secondary_sources: &[Value],
+    selected_guides: &[String],
+    stage_read_prompts: &[String],
+    stage_lookup: fn(&str) -> Option<&'static AnalysisStage>,
+) {
+    if !item.is_object() {
+        return;
+    }
+
+    let (mut stages, mut prompts) = extract_item_stages_and_prompts(item, stage_lookup);
+    let mut allowed_prompts = Vec::new();
+    for g in selected_guides {
+        push_unique_prompt(&mut allowed_prompts, g);
+    }
+    for src in primary_sources.iter().chain(secondary_sources.iter()) {
+        let (_s, src_prompts) = extract_item_stages_and_prompts(src, stage_lookup);
+        for p in src_prompts {
+            push_unique_prompt(&mut allowed_prompts, &p);
+        }
+    }
+    for p in stage_read_prompts {
+        push_unique_prompt(&mut allowed_prompts, p);
+    }
+    prompts.retain(|p| allowed_prompts.iter().any(|ap| ap == p));
+
+    let all_sources: Vec<&Value> = primary_sources
+        .iter()
+        .chain(secondary_sources.iter())
+        .collect();
+
+    let mut matched: Vec<&Value> = all_sources
+        .iter()
+        .copied()
+        .filter(|src| items_share_precise_location(item, src) || items_share_text(item, src))
+        .collect();
+
+    if matched.is_empty() {
+        matched = all_sources
+            .iter()
+            .copied()
+            .filter(|src| items_share_file_location(item, src))
+            .collect();
+    }
+
+    if matched.is_empty() && !stages.is_empty() {
+        matched = all_sources
+            .iter()
+            .copied()
+            .filter(|src| {
+                let (src_stages, _) = extract_item_stages_and_prompts(src, stage_lookup);
+                src_stages.iter().any(|ss| stages.iter().any(|s| s == ss))
+            })
+            .collect();
+    }
+    if matched.is_empty() && stages.is_empty() {
+        let fallback = if !primary_sources.is_empty() {
+            primary_sources
+        } else {
+            secondary_sources
+        };
+        matched = fallback.iter().collect();
+    }
+
+    for g in selected_guides {
+        push_unique_prompt(&mut prompts, g);
+    }
+    for src in matched {
+        let (src_stages, src_prompts) = extract_item_stages_and_prompts(src, stage_lookup);
+        for s in src_stages {
+            push_unique_string(&mut stages, &s);
+        }
+        for p in src_prompts {
+            push_unique_prompt(&mut prompts, &p);
+        }
+    }
+    for s in &stages {
+        if let Some(def) = stage_lookup(s) {
+            for g in def.guides {
+                push_unique_prompt(&mut prompts, g);
+            }
+        }
+        for src in &all_sources {
+            let (src_stages, src_prompts) = extract_item_stages_and_prompts(src, stage_lookup);
+            if src_stages.iter().any(|ss| ss == s) {
+                for p in src_prompts {
+                    push_unique_prompt(&mut prompts, &p);
+                }
+            }
+        }
+    }
+    for p in stage_read_prompts {
+        push_unique_prompt(&mut prompts, p);
+    }
+
+    if let Some(map) = item.as_object_mut() {
+        if !stages.is_empty() {
+            map.insert("stage".to_string(), json!(stages[0]));
+            map.insert("stages".to_string(), json!(stages));
+        }
+        map.insert("prompts".to_string(), json!(prompts));
+    }
+}
+
+pub fn enrich_verification_output(
+    state: &LinuxPatchReviewState,
+    out: &mut VerificationOutput,
+    outcome: &crate::workflow::stage::StageOutcome,
+    stage_lookup: fn(&str) -> Option<&'static AnalysisStage>,
+) {
+    let read_prompts = outcome.read_prompts();
+    for finding in &mut out.findings {
+        enrich_item_provenance(
+            finding,
+            &state.all_concerns,
+            &state.all_dismissed_concerns,
+            &state.selected_guides,
+            &read_prompts,
+            stage_lookup,
+        );
+    }
+    for hard_case in &mut out.hard_cases {
+        enrich_item_provenance(
+            hard_case,
+            &state.all_concerns,
+            &state.all_dismissed_concerns,
+            &state.selected_guides,
+            &read_prompts,
+            stage_lookup,
+        );
+    }
+    for dismissed in &mut out.dismissed_concerns {
+        enrich_item_provenance(
+            dismissed,
+            &state.all_dismissed_concerns,
+            &[],
+            &state.selected_guides,
+            &read_prompts,
+            stage_lookup,
+        );
+    }
+}
+
+pub fn enrich_post_verification_output(
+    selected_guides: &[String],
+    batch: &[Value],
+    out: &mut PostVerificationOutput,
+    outcome: &crate::workflow::stage::StageOutcome,
+    stage_lookup: fn(&str) -> Option<&'static AnalysisStage>,
+) {
+    let read_prompts = outcome.read_prompts();
+    for finding in &mut out.findings {
+        enrich_item_provenance(
+            finding,
+            batch,
+            &[],
+            selected_guides,
+            &read_prompts,
+            stage_lookup,
+        );
+    }
+    for dismissed in &mut out.dismissed_concerns {
+        enrich_item_provenance(
+            dismissed,
+            batch,
+            &[],
+            selected_guides,
+            &read_prompts,
+            stage_lookup,
+        );
     }
 }
 
@@ -1075,19 +1503,24 @@ fn analysis_stage(
                 temperature,
                 ..Default::default()
             })
-            .reduce(
-                move |state: &mut LinuxPatchReviewState, out: StageConcernsOutput| {
-                    append_stage_items(
+            .reduce_with_outcome(
+                move |state: &mut LinuxPatchReviewState,
+                      out: StageConcernsOutput,
+                      outcome: &crate::workflow::stage::StageOutcome| {
+                    let prompts =
+                        collect_stage_prompts(&state.selected_guides, def.guides, outcome);
+                    append_stage_items_with_prompts(
                         &mut state.all_concerns,
                         &out.concerns,
                         def.name,
                         "General",
-                        "description",
+                        &prompts,
                     );
-                    append_stage_dismissed_concerns(
+                    append_stage_dismissed_concerns_with_prompts(
                         &mut state.all_dismissed_concerns,
                         &out.dismissed_concerns,
                         def.name,
+                        &prompts,
                     );
                 },
             )
@@ -1196,7 +1629,7 @@ pub(crate) fn record_verified_findings(state: &mut LinuxPatchReviewState, findin
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         if is_preexisting {
-            let concern = json!({
+            let mut concern = json!({
                 "type": finding.get("problem").and_then(|v| v.as_str()).unwrap_or("Pre-existing Issue"),
                 "description": finding.get("problem").and_then(|v| v.as_str()).unwrap_or(""),
                 "reasoning": finding.get("severity_explanation").and_then(|v| v.as_str()).unwrap_or(""),
@@ -1204,6 +1637,17 @@ pub(crate) fn record_verified_findings(state: &mut LinuxPatchReviewState, findin
                 "preexisting": true,
                 "locations": finding.get("locations").cloned().unwrap_or(json!([])),
             });
+            if let Some(map) = concern.as_object_mut() {
+                if let Some(stage) = finding.get("stage").cloned() {
+                    map.insert("stage".to_string(), stage);
+                }
+                if let Some(stages) = finding.get("stages").cloned() {
+                    map.insert("stages".to_string(), stages);
+                }
+                if let Some(prompts) = finding.get("prompts").cloned() {
+                    map.insert("prompts".to_string(), prompts);
+                }
+            }
             state.concerns.push(concern);
             if state.report_preexisting {
                 state.findings.push(finding);
@@ -1229,7 +1673,7 @@ pub fn verification_stage(
 
 <severity_guidelines>
 @include("severity.md")
-</severity_guidelines>
+</severity_guidelines>@includes
 
 CRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must have concrete evidence in the code that proves the concern is invalid. Never drop a raised concern into 'dismissed_concerns' in this stage: every consolidated concern must be placed either in 'findings' (if well-justified with concrete code proof and no competing dismissal) or in 'hard_cases' (if contested, speculative, or requiring tool verification). Also inspect every standalone dismissed_concern: if it dismissed a plausible bug using an unverified assumption, promote it into 'hard_cases' with '"signal_reason": "speculative_dismissal"'.{series_context}
 
@@ -1240,9 +1684,9 @@ Aggregated Dismissed Concerns:
 {{{{aggregated_dismissed_concerns}}}}
 
 Return ONLY a JSON object with 'findings', 'hard_cases', and 'dismissed_concerns' arrays.
-- Each object in 'findings' (Category 1a: Well-Justified Concerns) MUST use the keys: "problem" (a short naming string under 80 characters, preferably starting with a subsystem prefix like 'mm:' or 'bpf:', NEVER using backquotes, using fn_name() format for functions, describing the root cause), "severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), and "locations" (array of location objects).
-- Each object in 'hard_cases' (Category 2: Speculative or Contested) MUST use the keys: "type", "description", "estimated_severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "signal_reason" ("mixed_signals", "speculative_concern", "speculative_dismissal", "series_interaction", or "other"), "concern_arguments" (consolidated arguments for why the bug can occur), "dismissal_arguments" (consolidated arguments/snippets from any competing or standalone dismissal, or "" if none), "verification_question" (the specific code question post-verification must answer with tools), "preexisting" (boolean), and "locations" (array of location objects).
-- Each object in 'dismissed_concerns' (Category 1b: Well-Justified Dismissals) MUST use the keys: "type", "description", "reasoning", and "locations".
+- Each object in 'findings' (Category 1a: Well-Justified Concerns) MUST use the keys: "problem" (a short naming string under 80 characters, preferably starting with a subsystem prefix like 'mm:' or 'bpf:', NEVER using backquotes, using fn_name() format for functions, describing the root cause), "severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), and "locations" (array of location objects), and may include "stages" (array of stage names that raised the merged concern) and "prompts" (array of prompt files from the merged concern).
+- Each object in 'hard_cases' (Category 2: Speculative or Contested) MUST use the keys: "type", "description", "estimated_severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "signal_reason" ("mixed_signals", "speculative_concern", "speculative_dismissal", "series_interaction", or "other"), "concern_arguments" (consolidated arguments for why the bug can occur), "dismissal_arguments" (consolidated arguments/snippets from any competing or standalone dismissal, or "" if none), "verification_question" (the specific code question post-verification must answer with tools), "preexisting" (boolean), and "locations" (array of location objects), and may include "stages" and "prompts".
+- Each object in 'dismissed_concerns' (Category 1b: Well-Justified Dismissals) MUST use the keys: "type", "description", "reasoning", and "locations", and may include "stages" and "prompts".
 
 Example Output:
 ```json
@@ -1290,7 +1734,10 @@ Example Output:
 ```"#
         ))
         .include_file("false-positive-guide.md")
-        .include_file("severity.md"),
+        .include_file("severity.md")
+        .include_files_from_state(|s: &LinuxPatchReviewState| {
+            extra_prompt_paths_for_state(s, analysis_stage_by_name)
+        }),
         VERIFICATION.wants_series_context,
     )
     .with_var("aggregated_concerns", |s: &LinuxPatchReviewState| {
@@ -1317,7 +1764,8 @@ Example Output:
             temperature,
             ..Default::default()
         })
-        .reduce(|state, out: VerificationOutput| {
+        .reduce_with_outcome(|state, mut out: VerificationOutput, outcome| {
+            enrich_verification_output(state, &mut out, outcome, analysis_stage_by_name);
             record_verified_findings(state, out.findings);
             state.hard_cases = out.hard_cases;
             state
@@ -1335,6 +1783,8 @@ pub fn post_verification_stage(
 ) -> Stage<LinuxPatchReviewState, PostVerificationOutput> {
     let expected_items = batch.len().max(1);
     let candidate_json = serde_json::to_string_pretty(&batch).unwrap_or_default();
+    let batch_for_prompts = batch.clone();
+    let batch_for_reduce = batch;
     let series_context = series_context_placeholder(POST_VERIFICATION.wants_series_context);
     let user_template = with_series_context(
         PromptTemplate::<LinuxPatchReviewState>::new(format!(
@@ -1346,7 +1796,7 @@ pub fn post_verification_stage(
 
 <severity_guidelines>
 @include("severity.md")
-</severity_guidelines>
+</severity_guidelines>@includes
 
 CRITICAL REVIEW DIRECTIVE: To dismiss a candidate issue as a false positive, you must find concrete evidence in the code that proves the issue is invalid (e.g., verifying with tools that the caller or callee prevents the exact failure mode) and quote that disproving code in `dismissed_concerns[].locations`. If you cannot find concrete proof of safety, you must validate and report the finding in `findings`.{series_context}
 
@@ -1396,7 +1846,10 @@ Example Output:
 ```"#
         ))
         .include_file("false-positive-guide.md")
-        .include_file("severity.md"),
+        .include_file("severity.md")
+        .include_files_from_state(move |s: &LinuxPatchReviewState| {
+            extra_prompt_paths_for_items(&s.selected_guides, &batch_for_prompts, analysis_stage_by_name)
+        }),
         POST_VERIFICATION.wants_series_context,
     )
     .with_var("candidate_hard_cases", move |_: &LinuxPatchReviewState| {
@@ -1419,7 +1872,14 @@ Example Output:
             temperature,
             ..Default::default()
         })
-        .reduce(|state, out: PostVerificationOutput| {
+        .reduce_with_outcome(move |state, mut out: PostVerificationOutput, outcome| {
+            enrich_post_verification_output(
+                &state.selected_guides,
+                &batch_for_reduce,
+                &mut out,
+                outcome,
+                analysis_stage_by_name,
+            );
             record_verified_findings(state, out.findings);
             state
                 .deduplicated_dismissed_concerns
@@ -2356,7 +2816,6 @@ mod tests {
         );
         assert_eq!(state.concerns[0]["severity"], "High");
     }
-
     #[test]
     fn test_post_verification_stage_preserves_existing_state() {
         let mut state = LinuxPatchReviewState {
@@ -2425,5 +2884,223 @@ mod tests {
             state.deduplicated_dismissed_concerns[2]["description"],
             "dismissed in batch 2"
         );
+    }
+
+    #[test]
+    fn test_collect_stage_prompts_and_provenance_enrichment() {
+        let outcome = crate::workflow::stage::StageOutcome {
+            tokens_in: 10,
+            tokens_out: 10,
+            tokens_cached: 0,
+            history: vec![
+                crate::ai::AiMessage {
+                    role: crate::ai::AiRole::Assistant,
+                    content: None,
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: Some(vec![
+                        // Use Gemini-style duplicate "read_prompt" IDs in a parallel turn
+                        // so a failed read_prompt call does not poison successful siblings.
+                        crate::ai::ToolCall {
+                            id: "read_prompt".to_string(),
+                            function_name: "read_prompt".to_string(),
+                            arguments: json!({"name": "patterns/BPF-001.md"}),
+                            thought_signature: None,
+                        },
+                        crate::ai::ToolCall {
+                            id: "read_prompt".to_string(),
+                            function_name: "read_prompt".to_string(),
+                            arguments: json!({"name": "patterns/missing.md"}),
+                            thought_signature: None,
+                        },
+                        crate::ai::ToolCall {
+                            id: "read_prompt".to_string(),
+                            function_name: "read_prompt".to_string(),
+                            arguments: json!({"name": "../secret.md"}),
+                            thought_signature: None,
+                        },
+                    ]),
+                    tool_call_id: None,
+                },
+                crate::ai::AiMessage {
+                    role: crate::ai::AiRole::Tool,
+                    content: Some(r#"{"content": "BPF pattern guide"}"#.to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: Some("read_prompt".to_string()),
+                },
+                crate::ai::AiMessage {
+                    role: crate::ai::AiRole::Tool,
+                    content: Some(r#"{"error": "File not found"}"#.to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: Some("read_prompt".to_string()),
+                },
+                crate::ai::AiMessage {
+                    role: crate::ai::AiRole::Tool,
+                    content: Some(
+                        r#"{"content": "should be rejected by sanitize_guide_path"}"#.to_string(),
+                    ),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: Some("read_prompt".to_string()),
+                },
+            ],
+        };
+
+        let selected = vec!["networking.md".to_string()];
+        let locking_def = analysis_stage_by_name("locking").unwrap();
+        let prompts = collect_stage_prompts(&selected, locking_def.guides, &outcome);
+        assert_eq!(
+            prompts,
+            vec![
+                "networking.md".to_string(),
+                "subsystem/locking.md".to_string(),
+                "patterns/BPF-001.md".to_string(),
+            ]
+        );
+
+        let mut state = LinuxPatchReviewState {
+            selected_guides: selected.clone(),
+            ..Default::default()
+        };
+        append_stage_items_with_prompts(
+            &mut state.all_concerns,
+            &[json!({
+                "type": "Locking",
+                "description": "Deadlock in foo_lock()",
+                "reasoning": "Takes spin_lock inside rcu",
+                "preexisting": false,
+                "locations": [{"file": "net/core/dev.c", "function_or_symbol": "foo_lock", "line": 42}]
+            })],
+            "locking",
+            "General",
+            &prompts,
+        );
+        let exec_def = analysis_stage_by_name("execution-flow").unwrap();
+        let exec_prompts = collect_stage_prompts(
+            &selected,
+            exec_def.guides,
+            &crate::workflow::stage::StageOutcome::default(),
+        );
+        append_stage_dismissed_concerns_with_prompts(
+            &mut state.all_dismissed_concerns,
+            &[json!({
+                "type": "Execution Flow",
+                "description": "Deadlock in foo_lock()",
+                "reasoning": "Claimed safe",
+                "locations": [{"file": "net/core/dev.c", "function_or_symbol": "foo_lock", "line": 44, "code_snippet": "spin_lock(&l);"}]
+            })],
+            "execution-flow",
+            &exec_prompts,
+        );
+
+        assert_eq!(state.all_concerns[0]["stage"], "locking");
+        assert_eq!(state.all_concerns[0]["stages"], json!(["locking"]));
+        assert_eq!(state.all_concerns[0]["prompts"], json!(prompts));
+
+        // Extra prompt paths for verification exclude networking.md (already in selected_guides)
+        // and include subsystem/locking.md, patterns/BPF-001.md, callstack.md, technical-patterns.md.
+        let extra_paths = extra_prompt_paths_for_state(&state, analysis_stage_by_name);
+        assert_eq!(
+            extra_paths,
+            vec![
+                PathBuf::from("subsystem/locking.md"),
+                PathBuf::from("patterns/BPF-001.md"),
+                PathBuf::from("callstack.md"),
+                PathBuf::from("technical-patterns.md"),
+            ]
+        );
+
+        // Verification stage user prompt log includes @subsystem/locking.md, @patterns/BPF-001.md, etc.
+        let ver_stage = verification_stage(20, 0.0);
+        let rendered_ver_log = ver_stage.user_prompt.render_for_log(&state);
+        assert!(rendered_ver_log.contains("@subsystem/locking.md"));
+        assert!(rendered_ver_log.contains("@patterns/BPF-001.md"));
+        assert!(rendered_ver_log.contains("@callstack.md"));
+        assert!(rendered_ver_log.contains("@technical-patterns.md"));
+
+        let mut ver_out = VerificationOutput {
+            findings: vec![],
+            hard_cases: vec![json!({
+                "type": "Locking",
+                "description": "Deadlock in foo_lock()",
+                "estimated_severity": "High",
+                "signal_reason": "mixed_signals",
+                "concern_arguments": "Takes spin_lock inside rcu",
+                "dismissal_arguments": "Claimed safe",
+                "verification_question": "Is foo_lock() called under RCU?",
+                "preexisting": false,
+                "locations": [{"file": "net/core/dev.c", "function_or_symbol": "foo_lock", "line": 42}]
+            })],
+            dismissed_concerns: vec![],
+        };
+        let outcome_ver = ver_stage.outcome_reducer.as_ref().unwrap();
+        outcome_ver(
+            &mut state,
+            ver_out.clone(),
+            &crate::workflow::stage::StageOutcome::default(),
+        );
+        assert_eq!(
+            state.hard_cases[0]["stages"],
+            json!(["locking", "execution-flow"])
+        );
+        assert_eq!(state.hard_cases[0]["stage"], "locking");
+        assert_eq!(
+            state.hard_cases[0]["prompts"],
+            json!([
+                "networking.md",
+                "subsystem/locking.md",
+                "patterns/BPF-001.md",
+                "callstack.md",
+                "technical-patterns.md"
+            ])
+        );
+
+        // Post-verification stage for this hard_case batch gets the exact same prompts
+        // and preserves stage, stages, and prompts on the resulting finding.
+        let batch = state.hard_cases.clone();
+        let pv_extra =
+            extra_prompt_paths_for_items(&state.selected_guides, &batch, analysis_stage_by_name);
+        assert_eq!(pv_extra, extra_paths);
+
+        let mut pv_out = PostVerificationOutput {
+            findings: vec![json!({
+                "problem": "net: deadlock in foo_lock() under RCU",
+                "severity": "High",
+                "severity_explanation": "Verified deadlock",
+                "preexisting": false,
+                "locations": [{"file": "net/core/dev.c", "function_or_symbol": "foo_lock", "line": 42}]
+            })],
+            dismissed_concerns: vec![],
+        };
+        enrich_post_verification_output(
+            &state.selected_guides,
+            &batch,
+            &mut pv_out,
+            &crate::workflow::stage::StageOutcome::default(),
+            analysis_stage_by_name,
+        );
+        record_verified_findings(&mut state, pv_out.findings);
+        assert_eq!(state.findings.len(), 1);
+        assert_eq!(state.findings[0]["stage"], "locking");
+        assert_eq!(
+            state.findings[0]["stages"],
+            json!(["locking", "execution-flow"])
+        );
+        assert_eq!(
+            state.findings[0]["prompts"],
+            json!([
+                "networking.md",
+                "subsystem/locking.md",
+                "patterns/BPF-001.md",
+                "callstack.md",
+                "technical-patterns.md"
+            ])
+        );
+        let _ = &mut ver_out;
     }
 }

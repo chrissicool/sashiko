@@ -29,10 +29,12 @@ use crate::workflows::guard::{normalize_stage_name, sanitize_guide_name};
 use crate::workflows::linux_patch_review::{
     AnalysisStage, ConsolidationStage, LinuxPatchReviewState, POST_VERIFICATION_STAGE_NAMES,
     PlanningOutput, PostVerificationOutput, PrescreenOutput, SERIES_CONTEXT_PLACEHOLDER,
-    StageConcernsOutput, VerificationOutput, batch_hard_cases_by_severity,
-    format_post_verification_feedback, format_verification_stage_feedback,
-    has_valid_proof_location, record_verified_findings, validate_post_verification_batch_output,
-    validate_verification_stage_output,
+    StageConcernsOutput, VerificationOutput, append_stage_dismissed_concerns_with_prompts,
+    append_stage_items_with_prompts, batch_hard_cases_by_severity, collect_stage_prompts,
+    enrich_post_verification_output, enrich_verification_output, extra_prompt_paths_for_items,
+    extra_prompt_paths_for_state, format_post_verification_feedback,
+    format_verification_stage_feedback, has_valid_proof_location, record_verified_findings,
+    validate_post_verification_batch_output, validate_verification_stage_output,
 };
 
 /// State container for a Sashiko patch review run.
@@ -699,35 +701,6 @@ fn format_summary_feedback(violation: &str) -> String {
     )
 }
 
-fn append_stage_items(dest: &mut Vec<Value>, src: &[Value], stage: &str, default_type: &str) {
-    for item in src {
-        let mut obj = item.clone();
-        if let Some(map) = obj.as_object_mut() {
-            if !map.contains_key("type")
-                || map
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .is_empty()
-            {
-                map.insert("type".to_string(), json!(default_type));
-            }
-            map.insert("stage".to_string(), json!(stage));
-        }
-        dest.push(obj);
-    }
-}
-
-fn append_stage_dismissed_concerns(dest: &mut Vec<Value>, src: &[Value], stage: &str) {
-    for item in src {
-        let mut obj = item.clone();
-        if let Some(map) = obj.as_object_mut() {
-            map.insert("stage".to_string(), json!(stage));
-        }
-        dest.push(obj);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Stage Builders
 // ---------------------------------------------------------------------------
@@ -861,13 +834,24 @@ fn analysis_stage(
                 temperature,
                 ..Default::default()
             })
-            .reduce(
-                move |state: &mut SashikoPatchReviewState, out: StageConcernsOutput| {
-                    append_stage_items(&mut state.all_concerns, &out.concerns, def.name, "General");
-                    append_stage_dismissed_concerns(
+            .reduce_with_outcome(
+                move |state: &mut SashikoPatchReviewState,
+                      out: StageConcernsOutput,
+                      outcome: &crate::workflow::stage::StageOutcome| {
+                    let prompts =
+                        collect_stage_prompts(&state.selected_guides, def.guides, outcome);
+                    append_stage_items_with_prompts(
+                        &mut state.all_concerns,
+                        &out.concerns,
+                        def.name,
+                        "General",
+                        &prompts,
+                    );
+                    append_stage_dismissed_concerns_with_prompts(
                         &mut state.all_dismissed_concerns,
                         &out.dismissed_concerns,
                         def.name,
+                        &prompts,
                     );
                 },
             )
@@ -913,7 +897,7 @@ pub fn verification_stage(
 
 <severity_guidelines>
 @include("severity.md")
-</severity_guidelines>
+</severity_guidelines>@includes
 
 CRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must have concrete evidence in the code that proves the concern is invalid. Never drop a raised concern into 'dismissed_concerns' in this stage: every consolidated concern must be placed either in 'findings' (if well-justified with concrete code proof and no competing dismissal) or in 'hard_cases' (if contested, speculative, or requiring tool verification). Also inspect every standalone dismissed_concern: if it dismissed a plausible bug using an unverified assumption, promote it into 'hard_cases' with '"signal_reason": "speculative_dismissal"'.{series_context}
 
@@ -924,12 +908,15 @@ Aggregated Dismissed Concerns:
 {{{{aggregated_dismissed_concerns}}}}
 
 Return ONLY a JSON object with 'findings', 'hard_cases', and 'dismissed_concerns' arrays.
-- Each object in 'findings' (Category 1a: Well-Justified Concerns) MUST use the keys: "problem" (a short naming string under 80 characters starting with a Sashiko component prefix like 'workflow:', 'db:', 'reviewer:', 'toolbox:', 'api:', 'cli:', NEVER using backquotes), "severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), and "locations" (array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters).
-- Each object in 'hard_cases' (Category 2: Speculative or Contested) MUST use the keys: "type", "description", "estimated_severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "signal_reason" ("mixed_signals", "speculative_concern", "speculative_dismissal", "series_interaction", or "other"), "concern_arguments" (consolidated arguments for why the bug can occur), "dismissal_arguments" (consolidated arguments/snippets from any competing or standalone dismissal, or "" if none), "verification_question" (the specific code question post-verification must answer with tools), "preexisting" (boolean), and "locations" (array of location objects).
-- Each object in 'dismissed_concerns' (Category 1b: Well-Justified Dismissals) MUST use the keys: "type", "description", "reasoning", and "locations"."#
+- Each object in 'findings' (Category 1a: Well-Justified Concerns) MUST use the keys: "problem" (a short naming string under 80 characters starting with a Sashiko component prefix like 'workflow:', 'db:', 'reviewer:', 'toolbox:', 'api:', 'cli:', NEVER using backquotes), "severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), and "locations" (array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters), and may include "stages" (array of stage names) and "prompts" (array of prompt files).
+- Each object in 'hard_cases' (Category 2: Speculative or Contested) MUST use the keys: "type", "description", "estimated_severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "signal_reason" ("mixed_signals", "speculative_concern", "speculative_dismissal", "series_interaction", or "other"), "concern_arguments" (consolidated arguments for why the bug can occur), "dismissal_arguments" (consolidated arguments/snippets from any competing or standalone dismissal, or "" if none), "verification_question" (the specific code question post-verification must answer with tools), "preexisting" (boolean), and "locations" (array of location objects), and may include "stages" and "prompts".
+- Each object in 'dismissed_concerns' (Category 1b: Well-Justified Dismissals) MUST use the keys: "type", "description", "reasoning", and "locations", and may include "stages" and "prompts"."#
         ))
         .include_file("false-positive-guide.md")
-        .include_file("severity.md"),
+        .include_file("severity.md")
+        .include_files_from_state(|s: &SashikoPatchReviewState| {
+            extra_prompt_paths_for_state(s, analysis_stage_by_name)
+        }),
         VERIFICATION.wants_series_context,
     )
     .with_var("aggregated_concerns", |s: &SashikoPatchReviewState| {
@@ -957,7 +944,8 @@ Return ONLY a JSON object with 'findings', 'hard_cases', and 'dismissed_concerns
             ..Default::default()
         })
         .skip_if(|s| s.all_concerns.is_empty() && s.all_dismissed_concerns.is_empty())
-        .reduce(|state, out: VerificationOutput| {
+        .reduce_with_outcome(|state, mut out: VerificationOutput, outcome| {
+            enrich_verification_output(state, &mut out, outcome, analysis_stage_by_name);
             record_verified_findings(state, out.findings);
             state.hard_cases = out.hard_cases;
             state
@@ -975,6 +963,8 @@ pub fn post_verification_stage(
 ) -> Stage<SashikoPatchReviewState, PostVerificationOutput> {
     let expected_items = batch.len().max(1);
     let candidate_json = serde_json::to_string_pretty(&batch).unwrap_or_default();
+    let batch_for_prompts = batch.clone();
+    let batch_for_reduce = batch;
     let series_context = series_context_placeholder(POST_VERIFICATION.wants_series_context);
     let user_template = with_series_context(
         PromptTemplate::<SashikoPatchReviewState>::new(format!(
@@ -986,7 +976,7 @@ pub fn post_verification_stage(
 
 <severity_guidelines>
 @include("severity.md")
-</severity_guidelines>
+</severity_guidelines>@includes
 
 CRITICAL REVIEW DIRECTIVE: To dismiss a code-behavior candidate issue as a false positive, you must find concrete evidence in the code that proves the issue is invalid and quote that disproving code in `dismissed_concerns[].locations` (for policy-excluded build/linter or out-of-scope meta-concerns under rules 1-2, carry forward the candidate's target location or commit message snippet in `locations`). If you cannot find concrete proof of safety, you must validate and report the finding in `findings`.{series_context}
 
@@ -998,7 +988,10 @@ Return ONLY a JSON object with 'findings' and 'dismissed_concerns' arrays. Every
 - Each object in 'dismissed_concerns' MUST use: "description" (the candidate issue that was disproved), "reasoning" (step-by-step explanation of how the inspected code or policy rule disproves the candidate), and "locations" (a non-empty array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters, quoting the verbatim disproving code or target snippet)."#
         ))
         .include_file("false-positive-guide.md")
-        .include_file("severity.md"),
+        .include_file("severity.md")
+        .include_files_from_state(move |s: &SashikoPatchReviewState| {
+            extra_prompt_paths_for_items(&s.selected_guides, &batch_for_prompts, analysis_stage_by_name)
+        }),
         POST_VERIFICATION.wants_series_context,
     )
     .with_var("candidate_hard_cases", move |_: &SashikoPatchReviewState| {
@@ -1023,7 +1016,14 @@ Return ONLY a JSON object with 'findings' and 'dismissed_concerns' arrays. Every
             temperature,
             ..Default::default()
         })
-        .reduce(|state, out: PostVerificationOutput| {
+        .reduce_with_outcome(move |state, mut out: PostVerificationOutput, outcome| {
+            enrich_post_verification_output(
+                &state.selected_guides,
+                &batch_for_reduce,
+                &mut out,
+                outcome,
+                analysis_stage_by_name,
+            );
             record_verified_findings(state, out.findings);
             state
                 .deduplicated_dismissed_concerns
@@ -1412,11 +1412,18 @@ mod tests {
         };
 
         let mut state = SashikoPatchReviewState {
-            all_concerns: vec![json!({"description": "candidate"})],
+            all_concerns: vec![json!({
+                "stage": "persistence",
+                "stages": ["persistence"],
+                "prompts": ["subsystem/db-migrations.md"],
+                "description": "candidate"
+            })],
             ..Default::default()
         };
 
         let stage = verification_stage(1, 0.0);
+        let rendered_ver_log = stage.user_prompt.render_for_log(&state);
+        assert!(rendered_ver_log.contains("@subsystem/db-migrations.md"));
         stage.execute(&env, &mut state, None).await.unwrap();
 
         assert_eq!(state.findings.len(), 1);
@@ -1424,12 +1431,24 @@ mod tests {
             state.findings[0]["problem"],
             "api: newly introduced panic on empty header"
         );
+        assert_eq!(state.findings[0]["stage"], "persistence");
+        assert_eq!(state.findings[0]["stages"], json!(["persistence"]));
+        assert_eq!(
+            state.findings[0]["prompts"],
+            json!(["subsystem/db-migrations.md"])
+        );
         assert_eq!(state.concerns.len(), 1);
         assert_eq!(
             state.concerns[0]["description"],
             "db: pre-existing missing index on patches table"
         );
         assert_eq!(state.concerns[0]["preexisting"], true);
+        assert_eq!(state.concerns[0]["stage"], "persistence");
+        assert_eq!(state.concerns[0]["stages"], json!(["persistence"]));
+        assert_eq!(
+            state.concerns[0]["prompts"],
+            json!(["subsystem/db-migrations.md"])
+        );
 
         // When report_preexisting is true, the verified pre-existing finding is also retained in findings,
         // and state.concerns appends without clearing earlier items.
@@ -1523,51 +1542,72 @@ mod tests {
 
     #[test]
     fn test_sashiko_post_verification_stage_preserves_existing_state() {
+        let batch = vec![json!({
+            "type": "Concurrency Hazard",
+            "description": "Candidate deadlock in foo()",
+            "estimated_severity": "High",
+        })];
+        let stage = post_verification_stage("post-verification-1", batch, 10, 0.0);
         let mut state = SashikoPatchReviewState {
-            findings: vec![json!({"problem": "workflow: existing finding", "preexisting": false})],
-            concerns: vec![json!({"description": "existing preexisting"})],
-            deduplicated_dismissed_concerns: vec![json!({"description": "existing dismissed"})],
+            findings: vec![json!({
+                "problem": "workflow: earlier finding",
+                "severity": "High",
+                "preexisting": false,
+            })],
+            concerns: vec![json!({
+                "type": "Pre-existing Issue",
+                "description": "Old issue",
+                "preexisting": true,
+            })],
+            deduplicated_dismissed_concerns: vec![json!({
+                "description": "Earlier dismissed concern",
+                "reasoning": "Already proved safe",
+            })],
             ..Default::default()
         };
 
-        let pv1 = post_verification_stage("post-verification-1", vec![], 20, 0.0);
-        (pv1.reducer)(
-            &mut state,
-            PostVerificationOutput {
-                findings: vec![
-                    json!({
-                        "problem": "db: new regression",
-                        "severity": "High",
-                        "severity_explanation": "Unchecked query",
-                        "preexisting": false,
-                        "locations": []
-                    }),
-                    json!({
-                        "problem": "api: old bug",
-                        "severity": "Medium",
-                        "severity_explanation": "Old issue",
-                        "preexisting": true,
-                        "locations": []
-                    }),
-                ],
-                dismissed_concerns: vec![json!({"description": "dismissed in batch 1"})],
-            },
-        );
+        let output = PostVerificationOutput {
+            findings: vec![
+                json!({
+                    "problem": "workflow: new post-verified finding",
+                    "severity": "High",
+                    "preexisting": false,
+                }),
+                json!({
+                    "problem": "db: post-verified pre-existing",
+                    "severity": "Medium",
+                    "severity_explanation": "Old missing index",
+                    "preexisting": true,
+                }),
+            ],
+            dismissed_concerns: vec![json!({
+                "description": "Disproved hard case",
+                "reasoning": "Caller holds lock",
+            })],
+        };
+
+        (stage.reducer)(&mut state, output);
 
         assert_eq!(state.findings.len(), 2);
-        assert_eq!(state.findings[0]["problem"], "workflow: existing finding");
-        assert_eq!(state.findings[1]["problem"], "db: new regression");
+        assert_eq!(state.findings[0]["problem"], "workflow: earlier finding");
+        assert_eq!(
+            state.findings[1]["problem"],
+            "workflow: new post-verified finding"
+        );
         assert_eq!(state.concerns.len(), 2);
-        assert_eq!(state.concerns[0]["description"], "existing preexisting");
-        assert_eq!(state.concerns[1]["description"], "api: old bug");
+        assert_eq!(state.concerns[0]["description"], "Old issue");
+        assert_eq!(
+            state.concerns[1]["description"],
+            "db: post-verified pre-existing"
+        );
         assert_eq!(state.deduplicated_dismissed_concerns.len(), 2);
         assert_eq!(
             state.deduplicated_dismissed_concerns[0]["description"],
-            "existing dismissed"
+            "Earlier dismissed concern"
         );
         assert_eq!(
             state.deduplicated_dismissed_concerns[1]["description"],
-            "dismissed in batch 1"
+            "Disproved hard case"
         );
     }
 }

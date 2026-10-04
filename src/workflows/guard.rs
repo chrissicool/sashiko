@@ -30,6 +30,27 @@ pub fn sanitize_guide_name(name: &str) -> bool {
     plain
 }
 
+/// Verifies that a relative prompt path (from `def.guides`, `selected_guides`,
+/// or `read_prompt`) is a safe `.md` path within the prompt bundle without
+/// parent-directory traversal or absolute components.
+pub fn sanitize_prompt_relpath(path: &str) -> bool {
+    let trimmed = path.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('/')
+        || trimmed.contains('\\')
+        || trimmed.contains("..")
+        || !trimmed.ends_with(".md")
+    {
+        return false;
+    }
+    let parts: Vec<&str> = trimmed.split('/').collect();
+    match parts.as_slice() {
+        [file] => !file.is_empty(),
+        [dir, file] => matches!(*dir, "subsystem" | "patterns") && !file.is_empty(),
+        _ => false,
+    }
+}
+
 /// Normalizes a stage name returned by an LLM planner or CLI flag to its
 /// canonical lowercase kebab-case identifier without leading `stage-` prefix.
 pub fn normalize_stage_name(name: &str) -> String {
@@ -59,6 +80,20 @@ mod tests {
         assert!(!sanitize_guide_name("subsystem/locking.md"));
         assert!(!sanitize_guide_name("subsystem\\locking.md"));
         assert!(!sanitize_guide_name(".."));
+    }
+
+    #[test]
+    fn test_sanitize_prompt_relpath() {
+        assert!(sanitize_prompt_relpath("technical-patterns.md"));
+        assert!(sanitize_prompt_relpath("callstack.md"));
+        assert!(sanitize_prompt_relpath("subsystem/locking.md"));
+        assert!(sanitize_prompt_relpath("patterns/rust-async.md"));
+        assert!(!sanitize_prompt_relpath(""));
+        assert!(!sanitize_prompt_relpath("../secret.md"));
+        assert!(!sanitize_prompt_relpath("/etc/passwd.md"));
+        assert!(!sanitize_prompt_relpath("other/file.md"));
+        assert!(!sanitize_prompt_relpath("subsystem/nested/file.md"));
+        assert!(!sanitize_prompt_relpath("locking.txt"));
     }
 
     #[test]

@@ -51,12 +51,15 @@ Know these before changing anything near them.
   `@include(...)` and the `@includes` marker from the *template*, never from
   substituted values. See `src/workflow/prompt.rs` and its tests.
 
-- **Pre-screen guide names** — the pre-screen stage lets the model choose which
-  guide files are inlined into every later stage's system prompt, and the model
-  is looking at the patch when it chooses. The reducer therefore rejects any
-  name containing `/`, `\` or `..` before it becomes a path. This is the one
-  place model output legitimately becomes a filename, and the sanitizer is what
-  makes that safe.
+- **Pre-screen and `read_prompt` guide names** — the pre-screen stage and
+  per-stage `read_prompt` tool calls let the model choose which guide files are
+  inlined into downstream prompts (`sanitize_guide_path` for top-level
+  pre-screen guides and `sanitize_prompt_relpath` for top-level, `subsystem/`,
+  or `patterns/` prompt guides in `src/workflows/guard.rs`). Both sanitizers
+  reject any path containing `..`, `\`, leading `/`, or subdirectories outside
+  `subsystem/` and `patterns/` before it becomes a path. These are the places
+  model output legitimately becomes a prompt filename, and the sanitizers in
+  `src/workflows/guard.rs` are what make that safe.
 
 - **Stage names** — the planner returns stage names, which are resolved against
   the stage table rather than used directly. An unrecognised name is dropped
@@ -97,9 +100,10 @@ control:
   only the diff and the commit message enter the model context for forge
   reviews. Widening that is a deliberate decision that needs its own fencing,
   not an incidental one.
-- Loosens the **pre-screen sanitizer**, or adds another place where model output
-  becomes a filename, an identifier, or a lookup key without going through a
-  table of known values.
+- Loosens the **prompt path sanitizers** (`sanitize_guide_path` /
+  `sanitize_prompt_relpath`), or adds another place where model output becomes a
+  filename, an identifier, or a lookup key without going through those prompt
+  sanitizers or a table of known values.
 - Logs, stores, or puts into a prompt a value that could contain a **secret**:
   `forge.api_token`, `webhook_secret`, the local operator token, the JWT signing
   key, SMTP credentials, or a URL with credentials embedded.
