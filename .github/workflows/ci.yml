@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags: ['v*']
+
+concurrency:
+  group: >-
+    ci-${{ github.workflow }}-${{
+    github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    name: Check & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check Developer Certificate of Origin (S-O-B)
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            RANGE="${{ github.sha }}~1..${{ github.sha }}"
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            TARGET_BRANCH=${GITHUB_BASE_REF:-main}
+            RANGE="origin/$TARGET_BRANCH..HEAD"
+          else
+            BEFORE="${{ github.event.before }}"
+            AFTER="${{ github.event.after }}"
+            ZERO="0000000000000000000000000000000000000000"
+            if [[ -z "$BEFORE" || "$BEFORE" == "$ZERO" ]]; then
+              RANGE="$AFTER~1..$AFTER"
+            else
+              RANGE="$BEFORE..$AFTER"
+            fi
+          fi
+          make sob RANGE="$RANGE"
+
+      - name: Install and Run yamllint
+        run: |
+          if ! command -v yamllint >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y yamllint
+          fi
+          yamllint .
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy (All Features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run Clippy (Local Profile)
+        run: make lint-local
+
+      - name: Run Clippy (Local Cache Profile)
+        run: make lint-local-cache
+
+      - name: Run Tests
+        run: make test
