@@ -288,6 +288,7 @@ pub struct OpenAiCompatClient {
     extra_body: serde_json::Map<String, Value>,
     temperature_unsupported: AtomicBool,
     send_empty_tool_call_content: bool,
+    api_timeout_secs: u64,
 }
 
 impl OpenAiCompatClient {
@@ -333,6 +334,7 @@ impl OpenAiCompatClient {
             extra_body: serde_json::Map::new(),
             temperature_unsupported: AtomicBool::new(false),
             send_empty_tool_call_content: false,
+            api_timeout_secs,
         })
     }
 
@@ -493,7 +495,7 @@ impl OpenAiCompatClient {
         let res = match request.send().await {
             Ok(res) => res,
             Err(e) => {
-                let err_str = redact_secret(&e.to_string());
+                let err_str = crate::ai::describe_transport_error(e, self.api_timeout_secs);
                 tracing::error!("OpenAI request failed (transport): {}", err_str);
                 return Err(OpenAiCompatError::TransientError(
                     Duration::from_secs(30),
@@ -504,7 +506,7 @@ impl OpenAiCompatClient {
 
         if res.status().is_success() {
             let body_text = res.text().await.map_err(|e| {
-                let err_str = redact_secret(&e.to_string());
+                let err_str = crate::ai::describe_transport_error(e, self.api_timeout_secs);
                 tracing::error!("Failed to read OpenAI response body: {}", err_str);
                 OpenAiCompatError::TransientError(Duration::from_secs(30), err_str)
             })?;
@@ -2265,6 +2267,60 @@ mod tests {
         assert_eq!(body["model"], "test-model");
         assert_eq!(body["extraData"]["clientName"], "sashiko");
         assert_eq!(body["extraData"]["sessionId"], "review-1");
+        server.abort();
+        Ok(())
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn a_timed_out_request_says_so() -> Result<()> {
+        use axum::{Router, routing::post};
+
+        // A flex-tier reply can outlast the budget. reqwest then reports
+        // "error decoding response body", which says nothing about waiting.
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                "never arrives"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base_url = format!("http://{}/v1", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let client = OpenAiCompatClient::new(
+            base_url,
+            OpenAiProviderType::OpenAiCompatible,
+            "test-model".to_string(),
+            8192,
+            128,
+            1,
+            None,
+        )?;
+        let request = AiRequest {
+            system: None,
+            messages: vec![],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+            reasoning_effort: None,
+        };
+
+        let err = client
+            .generate_content(request)
+            .await
+            .expect_err("the request must not succeed");
+        let text = err.to_string();
+        assert!(
+            text.contains("no reply within 1s"),
+            "the timeout must be named: {text}"
+        );
+        assert!(
+            text.contains("ai.api_timeout_secs"),
+            "the knob to raise must be named: {text}"
+        );
         server.abort();
         Ok(())
     }
