@@ -171,6 +171,7 @@ pub struct VllmClient {
     guided_json: bool,
     enable_tools: bool,
     client: Client,
+    api_timeout_secs: u64,
 }
 
 impl VllmClient {
@@ -215,6 +216,7 @@ impl VllmClient {
             guided_json,
             enable_tools,
             client,
+            api_timeout_secs,
         })
     }
 
@@ -261,7 +263,7 @@ impl VllmClient {
         let res = match self.client.post(&self.base_url).json(body).send().await {
             Ok(res) => res,
             Err(e) => {
-                let err_str = redact_secret(&e.to_string());
+                let err_str = crate::ai::describe_transport_error(e, self.api_timeout_secs);
                 tracing::error!("vLLM request failed (transport): {}", err_str);
                 return Err(VllmError::TransientError(Duration::from_secs(30), err_str));
             }
@@ -270,7 +272,7 @@ impl VllmClient {
         if res.status().is_success() {
             let status = res.status();
             let body_text = res.text().await.map_err(|e| {
-                let err_str = redact_secret(&e.to_string());
+                let err_str = crate::ai::describe_transport_error(e, self.api_timeout_secs);
                 tracing::error!("Failed to read vLLM response body: {}", err_str);
                 VllmError::TransientError(Duration::from_secs(30), err_str)
             })?;
