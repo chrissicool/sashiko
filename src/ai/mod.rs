@@ -259,6 +259,26 @@ impl ClassifyAiError for RemoteAiError {
     }
 }
 
+/// Renders a transport failure so the log says what went wrong.
+///
+/// reqwest describes a timeout that strikes while the response body is being
+/// read as "error decoding response body", which reads like the server sent
+/// something malformed. What it was waiting on is in the source chain rather
+/// than the message, and whether it timed out is a question only the error can
+/// answer.
+pub(crate) fn describe_transport_error(error: reqwest::Error, api_timeout_secs: u64) -> String {
+    // anyhow's alternate form walks the source chain. Ask about the timeout
+    // first, because the conversion consumes the error.
+    let timed_out = error.is_timeout();
+    let mut described = format!("{:#}", anyhow::Error::from(error));
+    if timed_out {
+        described.push_str(&format!(
+            " (no reply within {api_timeout_secs}s; ai.api_timeout_secs sets that)"
+        ));
+    }
+    crate::utils::redact_secret(&described)
+}
+
 pub(crate) fn classify_status_code(status: reqwest::StatusCode) -> Option<AiErrorClass> {
     match status {
         reqwest::StatusCode::TOO_MANY_REQUESTS => Some(AiErrorClass::RateLimit {

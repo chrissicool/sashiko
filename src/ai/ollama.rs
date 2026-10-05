@@ -130,6 +130,7 @@ pub struct OllamaClient {
     max_tokens: u32,
     think_mode: Option<String>,
     client: Client,
+    api_timeout_secs: u64,
 }
 
 impl OllamaClient {
@@ -155,6 +156,7 @@ impl OllamaClient {
             max_tokens,
             think_mode,
             client,
+            api_timeout_secs,
         })
     }
 
@@ -184,7 +186,7 @@ impl OllamaClient {
         let res = match self.client.post(&self.base_url).json(body).send().await {
             Ok(res) => res,
             Err(e) => {
-                let err_str = redact_secret(&e.to_string());
+                let err_str = crate::ai::describe_transport_error(e, self.api_timeout_secs);
                 tracing::error!("Ollama request failed (transport): {}", err_str);
                 return Err(OllamaError::TransientError(
                     Duration::from_secs(30),
@@ -195,7 +197,7 @@ impl OllamaClient {
 
         if res.status().is_success() {
             let body_text = res.text().await.map_err(|e| {
-                let err_str = redact_secret(&e.to_string());
+                let err_str = crate::ai::describe_transport_error(e, self.api_timeout_secs);
                 tracing::error!("Failed to read Ollama response body: {}", err_str);
                 OllamaError::TransientError(Duration::from_secs(0), err_str)
             })?;
