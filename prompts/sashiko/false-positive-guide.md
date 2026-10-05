@@ -97,13 +97,20 @@ Also check *where* it is. A panic in the worker subprocess is recovered by the
 reviewer and retried; a panic in the daemon's main loop is not. The same
 `unwrap` has different severity in different modules.
 
-### 5. Assuming a caller does not handle it
+### 5. Assuming a caller does not handle it (Symmetrical Proof Bar)
 
 This is the most common way a real analysis turns into a false positive in
 reverse. Do not dismiss a defect inside the changed code by assuming the
 surrounding system handles it, unless you can point at the specific code that
-makes the failure structurally impossible. "The API layer probably validates
-this" is not evidence. Go read the API layer.
+makes the failure structurally impossible across **all** callers and entry
+points (`git_grep` across CLI, daemon, worker, HTTP API, and webhook paths).
+"The API layer probably validates this" or "caller X checks it" is not
+evidence if caller Y does not. Likewise, never dismiss an unpaired
+lifecycle/state transition (such as claiming a worktree, task, or outbox row
+without a matching release/terminal status on error or cancellation), a
+swallowed error, or overwritten state by rationalizing the side effect as a
+"harmless no-op". Go read all callers and quote the disproving code in
+`locations`.
 
 ### 6. Missing error handling that cannot happen
 
@@ -121,12 +128,14 @@ misinterpretation it permits and what the model would do instead.
 
 ### 8. Pre-existing issues
 
-If the problem existed in the codebase before this commit/series was applied,
-you MUST mark `preexisting: true` so the workflow routes it exclusively to the
-bugs database rather than reporting it alongside new patch findings. Never mark
-an issue in unchanged code (or an existing defect merely exposed or moved by a
-refactor) as `preexisting: false`. Check the parent revision (`HEAD~1` or
-`Baseline SHA`) when in doubt, not just the `+` lines.
+Set `preexisting: false` whenever the patch introduces, modifies, triggers,
+exposes, or relies on the buggy code path, caller/callee interaction, or error
+path (even if the underlying helper or check already existed). Mark
+`preexisting: true` **only** if the problem is in untouched code whose
+reachability, inputs, and behavior are completely unaffected by this
+commit/series, so the workflow routes it exclusively to the bugs database
+rather than reporting it alongside new patch findings. Check the parent
+revision (`HEAD~1` or `Baseline SHA`) when in doubt, not just the `+` lines.
 
 ### 9. Test code
 
