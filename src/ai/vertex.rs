@@ -152,9 +152,11 @@ pub struct VertexClient {
     effort: Option<String>,
     context_window_size: usize,
     credentials: AccessTokenCredentials,
+    api_timeout_secs: u64,
 }
 
 impl VertexClient {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         model: String,
         project_id: String,
@@ -163,6 +165,7 @@ impl VertexClient {
         max_tokens: u32,
         thinking: Option<String>,
         effort: Option<String>,
+        api_timeout_secs: u64,
     ) -> Result<Self> {
         let model_family = detect_model_family(&model)?;
 
@@ -198,13 +201,17 @@ impl VertexClient {
             region,
             model,
             model_family,
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(api_timeout_secs))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
             enable_caching,
             max_tokens,
             thinking,
             effort,
             context_window_size,
             credentials,
+            api_timeout_secs,
         })
     }
 
@@ -225,7 +232,7 @@ impl VertexClient {
     async fn post_claude_request(&self, body: &VertexClaudeRequest) -> Result<ClaudeResponse> {
         let token = self.get_access_token().await?;
         let url = self.endpoint_url();
-        Self::send_claude_request(&self.client, &url, &token, body).await
+        Self::send_claude_request(&self.client, &url, &token, body, self.api_timeout_secs).await
     }
 
     async fn send_claude_request(
@@ -233,6 +240,7 @@ impl VertexClient {
         url: &str,
         token: &str,
         body: &VertexClaudeRequest,
+        api_timeout_secs: u64,
     ) -> Result<ClaudeResponse> {
         let res = client
             .post(url)
@@ -241,7 +249,7 @@ impl VertexClient {
             .json(body)
             .send()
             .await
-            .map_err(|e| claude::transport_error("Vertex AI", e))?;
+            .map_err(|e| claude::transport_error("Vertex AI", e, api_timeout_secs))?;
 
         let status = res.status();
 
@@ -249,7 +257,7 @@ impl VertexClient {
             let body_text = res
                 .text()
                 .await
-                .map_err(|e| claude::transport_error("Vertex AI", e))?;
+                .map_err(|e| claude::transport_error("Vertex AI", e, api_timeout_secs))?;
             let response: ClaudeResponse = serde_json::from_str(&body_text)
                 .context("Failed to parse Vertex AI Claude response")?;
 
@@ -305,7 +313,7 @@ impl VertexClient {
     ) -> Result<GenerateContentResponse> {
         let token = self.get_access_token().await?;
         let url = self.endpoint_url();
-        Self::send_gemini_request(&self.client, &url, &token, body).await
+        Self::send_gemini_request(&self.client, &url, &token, body, self.api_timeout_secs).await
     }
 
     async fn send_gemini_request(
@@ -313,6 +321,7 @@ impl VertexClient {
         url: &str,
         token: &str,
         body: &GenerateContentRequest,
+        api_timeout_secs: u64,
     ) -> Result<GenerateContentResponse> {
         let res = client
             .post(url)
@@ -321,9 +330,9 @@ impl VertexClient {
             .json(body)
             .send()
             .await
-            .map_err(|e| gemini::transport_error("Vertex AI", e))?;
+            .map_err(|e| gemini::transport_error("Vertex AI", e, api_timeout_secs))?;
 
-        gemini::read_generate_content_response(res).await
+        gemini::read_generate_content_response(res, api_timeout_secs).await
     }
 
     async fn generate_gemini(&self, request: AiRequest) -> Result<AiResponse> {
@@ -545,6 +554,7 @@ mod tests {
                 url,
                 "dummy-token",
                 &hello_request(),
+                300,
             ),
         )
         .await
@@ -645,6 +655,7 @@ mod tests {
                 url,
                 "dummy-token",
                 &request,
+                300,
             ),
         )
         .await

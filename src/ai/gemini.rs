@@ -302,9 +302,13 @@ fn valid_retry_after_secs(secs: f64) -> Option<Duration> {
 const TRANSPORT_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 /// Types a transport failure as transient unless retrying cannot fix it.
-pub(crate) fn transport_error(provider: &str, e: reqwest::Error) -> anyhow::Error {
+pub(crate) fn transport_error(
+    provider: &str,
+    e: reqwest::Error,
+    api_timeout_secs: u64,
+) -> anyhow::Error {
     let is_permanent = crate::ai::is_permanent_transport_error(&e);
-    let err_str = redact_secret(&format!("{:#}", anyhow::Error::from(e)));
+    let err_str = crate::ai::describe_transport_error(e, api_timeout_secs);
     if is_permanent {
         return anyhow::anyhow!("{provider} request failed: {err_str}");
     }
@@ -412,11 +416,15 @@ fn classify_generate_content_failure(
 
 pub(crate) async fn read_generate_content_response(
     res: reqwest::Response,
+    api_timeout_secs: u64,
 ) -> Result<GenerateContentResponse> {
     let status = res.status();
 
     if status.is_success() {
-        let body_text = res.text().await.map_err(|e| transport_error("Gemini", e))?;
+        let body_text = res
+            .text()
+            .await
+            .map_err(|e| transport_error("Gemini", e, api_timeout_secs))?;
         let response: GenerateContentResponse = match serde_json::from_str(&body_text) {
             Ok(response) => response,
             Err(e) => {
@@ -491,16 +499,18 @@ pub struct GeminiClient {
     proxy_url: tokio::sync::OnceCell<String>,
     proxy_guard: tokio::sync::Mutex<Option<std::sync::Arc<ProxyGuard>>>,
     client: RwLock<Client>,
+    api_timeout_secs: u64,
 }
 
 impl GeminiClient {
-    pub fn new(model: String) -> Self {
-        Self::new_with_settings(model, None)
+    pub fn new(model: String, api_timeout_secs: u64) -> Self {
+        Self::new_with_settings(model, None, api_timeout_secs)
     }
 
     pub fn new_with_settings(
         model: String,
         settings: Option<&crate::settings::GeminiSettings>,
+        api_timeout_secs: u64,
     ) -> Self {
         let api_key = std::env::var("GEMINI_API_KEY")
             .or_else(|_| std::env::var("LLM_API_KEY"))
@@ -532,7 +542,7 @@ impl GeminiClient {
             .and_then(|s| s.max_tokens)
             .unwrap_or_else(|| crate::settings::default_gemini_max_tokens_for_model(&model));
 
-        let client = Self::create_http_client(&api_key);
+        let client = Self::create_http_client(&api_key, api_timeout_secs);
 
         Self {
             model,
@@ -545,10 +555,11 @@ impl GeminiClient {
             proxy_url: tokio::sync::OnceCell::new(),
             proxy_guard: tokio::sync::Mutex::new(None),
             client: RwLock::new(client),
+            api_timeout_secs,
         }
     }
 
-    fn create_http_client(api_key: &str) -> Client {
+    fn create_http_client(api_key: &str, api_timeout_secs: u64) -> Client {
         let mut headers = reqwest::header::HeaderMap::new();
         if !api_key.is_empty()
             && let Ok(value) = reqwest::header::HeaderValue::from_str(api_key)
@@ -558,7 +569,7 @@ impl GeminiClient {
 
         reqwest::Client::builder()
             .default_headers(headers)
-            .timeout(Duration::from_secs(600))
+            .timeout(Duration::from_secs(api_timeout_secs))
             // Reliability Tuning: Prune stale connections proactively
             .tcp_keepalive(Duration::from_secs(60))
             .pool_idle_timeout(Duration::from_secs(90))
@@ -714,7 +725,7 @@ impl GeminiClient {
     /// This is used to recover from degraded connection pools without restarting the service.
     async fn refresh_client(&self) {
         tracing::warn!("Refreshing Gemini HTTP client due to transport errors...");
-        let new_client = Self::create_http_client(&self.api_key);
+        let new_client = Self::create_http_client(&self.api_key, self.api_timeout_secs);
         let mut guard = self.client.write().await;
         *guard = new_client;
     }
@@ -745,7 +756,7 @@ impl GeminiClient {
         let res = match req_builder.send().await {
             Ok(res) => res,
             Err(e) => {
-                let err = transport_error("Gemini", e);
+                let err = transport_error("Gemini", e, self.api_timeout_secs);
                 if err.downcast_ref::<GeminiError>().is_some() {
                     // Trigger self-healing: Refresh the client for the next attempt
                     self.refresh_client().await;
@@ -755,7 +766,7 @@ impl GeminiClient {
         };
 
         let status = res.status();
-        let result = read_generate_content_response(res).await;
+        let result = read_generate_content_response(res, self.api_timeout_secs).await;
         // A success body cut off mid-read is a transport failure too.
         if status.is_success()
             && let Err(e) = &result
@@ -1409,6 +1420,7 @@ mod tests {
             proxy_url: tokio::sync::OnceCell::new(),
             proxy_guard: tokio::sync::Mutex::new(None),
             client: RwLock::new(Client::new()),
+            api_timeout_secs: 300,
         };
         assert_ne!(
             client("https://generativelanguage.googleapis.com", None, 131_072).cache_identity(),
@@ -1447,6 +1459,7 @@ mod tests {
             proxy_url: tokio::sync::OnceCell::new(),
             proxy_guard: tokio::sync::Mutex::new(None),
             client: RwLock::new(Client::new()),
+            api_timeout_secs: 300,
         };
 
         let resolved = client.effective_base_url().await.unwrap();
@@ -1475,6 +1488,7 @@ mod tests {
             proxy_url: tokio::sync::OnceCell::new(),
             proxy_guard: tokio::sync::Mutex::new(None),
             client: RwLock::new(Client::new()),
+            api_timeout_secs: 300,
         };
 
         let token = client.resolve_bearer_token().unwrap();
@@ -1495,6 +1509,7 @@ mod tests {
             proxy_url: tokio::sync::OnceCell::new(),
             proxy_guard: tokio::sync::Mutex::new(None),
             client: RwLock::new(Client::new()),
+            api_timeout_secs: 300,
         };
         let req = AiRequest {
             system: None,
@@ -1698,6 +1713,7 @@ mod tests {
             proxy_url: tokio::sync::OnceCell::new(),
             proxy_guard: tokio::sync::Mutex::new(None),
             client: RwLock::new(test_http::test_client()),
+            api_timeout_secs: 300,
         }
     }
 
@@ -2613,15 +2629,16 @@ mod tests {
         );
 
         let pro_client =
-            GeminiClient::new_with_settings("gemini-3.1-pro-preview".to_string(), None);
+            GeminiClient::new_with_settings("gemini-3.1-pro-preview".to_string(), None, 300);
         assert_eq!(pro_client.max_tokens, 0);
         let pro_with_table = GeminiClient::new_with_settings(
             "gemini-3.1-pro-preview".to_string(),
             Some(&crate::settings::GeminiSettings::default()),
+            300,
         );
         assert_eq!(pro_with_table.max_tokens, 0);
 
-        let argon_client = GeminiClient::new_with_settings("gemini-4-argon".to_string(), None);
+        let argon_client = GeminiClient::new_with_settings("gemini-4-argon".to_string(), None, 300);
         assert_eq!(argon_client.max_tokens, 131_072);
 
         let explicit_settings = crate::settings::GeminiSettings {
@@ -2631,6 +2648,7 @@ mod tests {
         let explicit_client = GeminiClient::new_with_settings(
             "gemini-3.1-pro-preview".to_string(),
             Some(&explicit_settings),
+            300,
         );
         assert_eq!(explicit_client.max_tokens, 65_536);
 
