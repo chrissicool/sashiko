@@ -179,9 +179,13 @@ impl ClassifyAiError for ClaudeError {
 pub(crate) const TRANSPORT_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 /// Types a transport failure as transient unless retrying cannot fix it.
-pub(crate) fn transport_error(provider: &str, e: reqwest::Error) -> anyhow::Error {
+pub(crate) fn transport_error(
+    provider: &str,
+    e: reqwest::Error,
+    api_timeout_secs: u64,
+) -> anyhow::Error {
     let is_permanent = crate::ai::is_permanent_transport_error(&e);
-    let err_str = redact_secret(&format!("{:#}", anyhow::Error::from(e)));
+    let err_str = crate::ai::describe_transport_error(e, api_timeout_secs);
     if is_permanent {
         return anyhow::anyhow!("{provider} request failed: {err_str}");
     }
@@ -215,6 +219,7 @@ pub struct ClaudeClient {
     thinking: Option<String>,
     effort: Option<String>,
     extra_headers: std::collections::HashMap<String, String>,
+    api_timeout_secs: u64,
 }
 
 impl ClaudeClient {
@@ -225,6 +230,7 @@ impl ClaudeClient {
         base_url: String,
         thinking: Option<String>,
         effort: Option<String>,
+        api_timeout_secs: u64,
     ) -> Self {
         let api_key = std::env::var("ANTHROPIC_API_KEY")
             .or_else(|_| std::env::var("ANTHROPIC_AUTH_TOKEN"))
@@ -236,13 +242,19 @@ impl ClaudeClient {
         Self {
             api_key,
             model,
-            client: Client::new(),
+            // Without a timeout a stalled request waits for ever, and the
+            // review waits with it.
+            client: Client::builder()
+                .timeout(Duration::from_secs(api_timeout_secs))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
             enable_caching,
             max_tokens,
             base_url,
             thinking,
             effort,
             extra_headers,
+            api_timeout_secs,
         }
     }
 
@@ -305,13 +317,16 @@ impl ClaudeClient {
             .await
         {
             Ok(res) => res,
-            Err(e) => return Err(transport_error("Claude", e)),
+            Err(e) => return Err(transport_error("Claude", e, self.api_timeout_secs)),
         };
 
         let status = res.status();
 
         if status.is_success() {
-            let body_text = res.text().await.map_err(|e| transport_error("Claude", e))?;
+            let body_text = res
+                .text()
+                .await
+                .map_err(|e| transport_error("Claude", e, self.api_timeout_secs))?;
             let response: ClaudeResponse =
                 serde_json::from_str(&body_text).context("Failed to parse Claude API response")?;
 
@@ -766,6 +781,7 @@ mod tests {
                 base_url.to_string(),
                 None,
                 None,
+                300,
             )
         };
         let base = client(4096, "https://example.invalid/v1/messages");
@@ -877,6 +893,7 @@ mod tests {
             thinking: None,
             effort: None,
             extra_headers: std::collections::HashMap::new(),
+            api_timeout_secs: 300,
         }
     }
 
@@ -976,7 +993,7 @@ mod tests {
             .expect_err("connect should fail");
         let raw = e.to_string();
         assert!(raw.contains("hunter2"), "{raw}");
-        let err = transport_error("Claude", e);
+        let err = transport_error("Claude", e, 300);
         assert_eq!(
             crate::ai::classify_ai_error(&err),
             AiErrorClass::Transient {
