@@ -651,6 +651,7 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
             Ok(Arc::new(gemini::GeminiClient::new_with_settings(
                 model,
                 ai.gemini.as_ref(),
+                ai.api_timeout_secs,
             )))
         }
         "stdio-gemini" => Ok(Arc::new(gemini::StdioGeminiClient::new())),
@@ -673,6 +674,7 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 base_url,
                 thinking,
                 effort,
+                ai.api_timeout_secs,
             )))
         }
         "stdio-claude" => Ok(Arc::new(claude::StdioClaudeClient::new())),
@@ -884,6 +886,7 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 max_tokens,
                 thinking,
                 effort,
+                ai.api_timeout_secs,
             )?))
         }
         #[cfg(not(feature = "vertex"))]
