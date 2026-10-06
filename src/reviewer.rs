@@ -652,7 +652,7 @@ impl Reviewer {
             vec![BaselineResolution::Commit(commit)]
         } else {
             ctx.baseline_registry
-                .resolve_candidates(&all_files, &subject, body.as_deref())
+                .resolve_candidates(&all_files, &subject, body.as_deref(), patchset.date)
                 .await
         };
 
