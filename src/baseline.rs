@@ -363,11 +363,44 @@ impl BaselineRegistry {
         Ok(map)
     }
 
+    /// The tree as it stood when `sent_at` was sent, as a concrete commit.
+    ///
+    /// A diff is written against a tree the sender had, and is expected to
+    /// apply to a reasonably current one. Once it has been committed -- often
+    /// as several smaller commits after discussion -- it no longer applies to
+    /// the tip, because it is already there. The tree at the time it was sent
+    /// is the one it was written for.
+    ///
+    /// The conversion from CVS dates a commit by guessing when its CVS commit
+    /// finished, so this lands within a few hours of the truth rather than on
+    /// it.
+    pub async fn commit_as_of(&self, sent_at: i64) -> Option<BaselineResolution> {
+        let when = chrono::DateTime::from_timestamp(sent_at, 0)?.to_rfc3339();
+        // Walk the mainline remote, not HEAD: nothing advances the local
+        // checkout after a fetch, so asking it for the tree at a date never
+        // returns anything newer than wherever it was left standing.
+        let reference = match &self.mainline_remote {
+            Some((_, name)) => format!("{name}/master"),
+            None => "HEAD".to_string(),
+        };
+        let out = run_offline_git(
+            &self.repo_path,
+            &["rev-list", "-1", &format!("--before={when}"), &reference],
+        )
+        .await?;
+        if !out.status.success() {
+            return None;
+        }
+        let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        CommitId::parse(&sha).map(BaselineResolution::Commit)
+    }
+
     pub async fn resolve_candidates(
         &self,
         files: &[String],
         subject: &str,
         body: Option<&str>,
+        sent_at: Option<i64>,
     ) -> Vec<BaselineResolution> {
         let mut candidates = Vec::new();
 
@@ -461,6 +494,16 @@ impl BaselineRegistry {
             });
         } else {
             candidates.push(BaselineResolution::LocalRef("HEAD".to_string()));
+        }
+
+        // 6. The tree as it stood when the mail was sent. Last, so a diff that
+        // still applies to the tip is reviewed against it; a diff whose change
+        // has since been committed is reviewed against the tree it was written
+        // for instead of failing to apply.
+        if let Some(sent_at) = sent_at
+            && let Some(as_of) = self.commit_as_of(sent_at).await
+        {
+            candidates.push(as_of);
         }
 
         // Deduplicate
@@ -922,7 +965,7 @@ mod tests {
         let body = "Some text\nbase-commit: 1234567890123456789012345678901234567890\n";
 
         let candidates = registry
-            .resolve_candidates(&files, "Subject", Some(body))
+            .resolve_candidates(&files, "Subject", Some(body), None)
             .await;
 
         assert_eq!(candidates.len(), 4); // Base, Subsystem, Next, Head
@@ -945,7 +988,7 @@ mod tests {
         let registry = create_registry();
         let files = vec!["net/core.c".to_string()];
         let fallback = registry
-            .resolve_candidates(&files, "[PATCH] fix", None)
+            .resolve_candidates(&files, "[PATCH] fix", None, None)
             .await;
         let body = "base-commit: 1234567890123456789012345678901234567890\n";
 
@@ -989,7 +1032,9 @@ mod tests {
                 expected.extend(fallback.clone());
 
                 assert_eq!(
-                    registry.resolve_candidates(&files, subject, body).await,
+                    registry
+                        .resolve_candidates(&files, subject, body, None)
+                        .await,
                     expected,
                     "{subject}, body: {body:?}"
                 );
@@ -1042,7 +1087,7 @@ mod tests {
         let registry = create_registry();
         let files = vec!["net/core.c".to_string()];
         let fallback = registry
-            .resolve_candidates(&files, "[PATCH] fix", None)
+            .resolve_candidates(&files, "[PATCH] fix", None, None)
             .await;
         let body = "base-commit: 1234567890123456789012345678901234567890\n";
 
@@ -1071,7 +1116,9 @@ mod tests {
                 ]);
                 expected.extend(fallback.clone());
                 assert_eq!(
-                    registry.resolve_candidates(&files, subject, body).await,
+                    registry
+                        .resolve_candidates(&files, subject, body, None)
+                        .await,
                     expected,
                     "{subject}, body: {body:?}"
                 );
@@ -1084,7 +1131,7 @@ mod tests {
         let registry = create_registry();
         let files = vec!["net/core.c".to_string()];
         let fallback = registry
-            .resolve_candidates(&files, "[PATCH] fix", None)
+            .resolve_candidates(&files, "[PATCH] fix", None, None)
             .await;
 
         for (subject, version) in [
@@ -1123,7 +1170,9 @@ mod tests {
             let mut expected = vec![BaselineResolution::LocalRef(format!("v{version}"))];
             expected.extend(fallback.clone());
             assert_eq!(
-                registry.resolve_candidates(&files, subject, None).await,
+                registry
+                    .resolve_candidates(&files, subject, None, None)
+                    .await,
                 expected,
                 "{subject}"
             );
@@ -1148,7 +1197,9 @@ mod tests {
             )),
         };
 
-        let candidates = registry.resolve_candidates(&[], "Subject", None).await;
+        let candidates = registry
+            .resolve_candidates(&[], "Subject", None, None)
+            .await;
 
         // The mainline candidate should be a RemoteTarget for origin/master,
         // not a LocalRef("HEAD").
@@ -1180,7 +1231,9 @@ mod tests {
             mainline_remote: None,
         };
 
-        let candidates = registry.resolve_candidates(&[], "Subject", None).await;
+        let candidates = registry
+            .resolve_candidates(&[], "Subject", None, None)
+            .await;
 
         let has_head = candidates
             .iter()
@@ -1230,7 +1283,9 @@ F: patterns/
         };
 
         let files = vec!["mm/memory.c".to_string()];
-        let candidates = registry.resolve_candidates(&files, "Subject", None).await;
+        let candidates = registry
+            .resolve_candidates(&files, "Subject", None, None)
+            .await;
 
         // Expected order:
         // 1. mm-new (Subsystem Heuristic 1)
@@ -1298,7 +1353,9 @@ F: patterns/
             ("[PATCH iwl-net v2 1/3] ice: fix something", "net-queue"),
             ("[PATCH IWL-NEXT] ice: add something", "next-queue"),
         ] {
-            let candidates = registry.resolve_candidates(&files, subject, None).await;
+            let candidates = registry
+                .resolve_candidates(&files, subject, None, None)
+                .await;
 
             match &candidates[0] {
                 BaselineResolution::RemoteTarget { url, branch, .. } => {
@@ -1316,7 +1373,7 @@ F: patterns/
         let files = vec!["drivers/net/ethernet/intel/ice/ice_main.c".to_string()];
 
         let candidates = registry
-            .resolve_candidates(&files, "[PATCH net] ice: fix something", None)
+            .resolve_candidates(&files, "[PATCH net] ice: fix something", None, None)
             .await;
 
         let has_dev_queue = candidates.iter().any(|c| {
@@ -1356,7 +1413,9 @@ F: patterns/
         };
 
         let files = vec!["drivers/staging/foo/bar.c".to_string()];
-        let candidates = registry.resolve_candidates(&files, "Subject", None).await;
+        let candidates = registry
+            .resolve_candidates(&files, "Subject", None, None)
+            .await;
 
         assert!(candidates.len() >= 2);
 
@@ -1412,7 +1471,9 @@ F: patterns/
             "net/core/b.c".to_string(),
             "net/core/c.c".to_string(),
         ];
-        let candidates = registry.resolve_candidates(&files, "Subject", None).await;
+        let candidates = registry
+            .resolve_candidates(&files, "Subject", None, None)
+            .await;
 
         for candidate in &candidates {
             if let BaselineResolution::RemoteTarget { url, branch, .. } = candidate
@@ -1468,7 +1529,9 @@ F: patterns/
         };
 
         let files = vec!["tools/perf/builtin-report.c".to_string()];
-        let candidates = registry.resolve_candidates(&files, "Subject", None).await;
+        let candidates = registry
+            .resolve_candidates(&files, "Subject", None, None)
+            .await;
 
         // Current implementation likely only returns ONE of the trees (arbitrarily or first)
         // plus linux-next and HEAD.
@@ -1517,7 +1580,7 @@ F: patterns/
 
         // With "next" in subject
         let candidates_next = registry
-            .resolve_candidates(&files, "[PATCH net-next] something", None)
+            .resolve_candidates(&files, "[PATCH net-next] something", None, None)
             .await;
         let names_next: Vec<String> = candidates_next
             .iter()
@@ -1534,7 +1597,7 @@ F: patterns/
 
         // Without "next" in subject
         let candidates_nonext = registry
-            .resolve_candidates(&files, "[PATCH net] something", None)
+            .resolve_candidates(&files, "[PATCH net] something", None, None)
             .await;
         let names_nonext: Vec<String> = candidates_nonext
             .iter()
@@ -1573,7 +1636,9 @@ F: patterns/
             mainline_remote: None,
         };
 
-        let candidates = registry.resolve_candidates(&[], "Subject", None).await;
+        let candidates = registry
+            .resolve_candidates(&[], "Subject", None, None)
+            .await;
 
         let candidate_names: Vec<String> = candidates
             .iter()
@@ -1707,6 +1772,123 @@ F: patterns/
         )));
     }
     #[tokio::test]
+    async fn test_the_tree_as_of_the_mail_date_is_the_last_candidate() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path();
+
+        crate::git_cmd::in_dir(repo_path)
+            .arg("init")
+            .output()
+            .unwrap();
+        for (name, when) in [
+            ("old", "2026-01-01T00:00:00+00:00"),
+            ("new", "2026-06-01T00:00:00+00:00"),
+        ] {
+            crate::git_cmd::in_dir(repo_path)
+                .args(["-c", "user.email=t@example.com", "-c", "user.name=T"])
+                .args(["commit", "--allow-empty", "-m", name, "--date", when])
+                .env("GIT_COMMITTER_DATE", when)
+                .output()
+                .unwrap();
+        }
+
+        let registry = BaselineRegistry {
+            entries: Vec::new(),
+            remote_map: HashMap::new(),
+            custom_remotes: None,
+            repo_path: repo_path.to_path_buf(),
+            mainline_remote: None,
+        };
+
+        // A mail sent in March saw the January tree, not the June one.
+        let march = chrono::DateTime::parse_from_rfc3339("2026-03-01T00:00:00+00:00")
+            .unwrap()
+            .timestamp();
+        let as_of = registry
+            .commit_as_of(march)
+            .await
+            .expect("a commit precedes the mail");
+        let BaselineResolution::Commit(ref sha) = as_of else {
+            panic!("expected a concrete commit, got {as_of:?}");
+        };
+        let subject = crate::git_cmd::in_dir(repo_path)
+            .args(["log", "-1", "--format=%s", sha.as_str()])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&subject.stdout).trim(), "old");
+
+        // It comes last, so a diff that still applies to the tip is reviewed
+        // against the tip.
+        let candidates = registry
+            .resolve_candidates(&[], "Subject", None, Some(march))
+            .await;
+        assert_eq!(
+            candidates.last(),
+            Some(&as_of),
+            "the dated tree is the final fallback: {candidates:?}"
+        );
+        assert!(
+            candidates.contains(&BaselineResolution::LocalRef("HEAD".to_string())),
+            "HEAD still comes first: {candidates:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_the_dated_tree_follows_the_mainline_remote_not_head() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path();
+        let git = |args: &[&str]| {
+            crate::git_cmd::in_dir(repo_path)
+                .args(["-c", "user.email=t@example.com", "-c", "user.name=T"])
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init"]);
+        for (name, when) in [
+            ("tracked", "2026-01-01T00:00:00+00:00"),
+            ("local-only", "2026-06-01T00:00:00+00:00"),
+        ] {
+            crate::git_cmd::in_dir(repo_path)
+                .args(["-c", "user.email=t@example.com", "-c", "user.name=T"])
+                .args(["commit", "--allow-empty", "-m", name, "--date", when])
+                .env("GIT_COMMITTER_DATE", when)
+                .output()
+                .unwrap();
+        }
+        // The remote stops at the first commit; the checkout has moved past it,
+        // which is the state a fetch leaves behind.
+        let tracked = String::from_utf8_lossy(&git(&["rev-parse", "HEAD~1"]).stdout)
+            .trim()
+            .to_string();
+        git(&["update-ref", "refs/remotes/origin/master", &tracked]);
+
+        let registry = BaselineRegistry {
+            entries: Vec::new(),
+            remote_map: HashMap::new(),
+            custom_remotes: None,
+            repo_path: repo_path.to_path_buf(),
+            mainline_remote: Some((
+                "https://example.invalid/src.git".to_string(),
+                "origin".to_string(),
+            )),
+        };
+
+        let december = chrono::DateTime::parse_from_rfc3339("2026-12-01T00:00:00+00:00")
+            .unwrap()
+            .timestamp();
+        let as_of = registry.commit_as_of(december).await.expect("a commit");
+        let BaselineResolution::Commit(ref sha) = as_of else {
+            panic!("expected a concrete commit, got {as_of:?}");
+        };
+        assert_eq!(
+            sha.as_str(),
+            tracked,
+            "the dated tree must come from origin/master, not the local checkout"
+        );
+    }
+
+    #[tokio::test]
     async fn test_non_linux_mainline_skips_linux_next() {
         let temp_dir = tempfile::tempdir().unwrap();
         let repo_path = temp_dir.path();
@@ -1723,7 +1905,7 @@ F: patterns/
         };
 
         let candidates = registry
-            .resolve_candidates(&[], "[PATCH] tree-optimization: fix vrp", None)
+            .resolve_candidates(&[], "[PATCH] tree-optimization: fix vrp", None, None)
             .await;
         assert_eq!(
             candidates,
@@ -1746,7 +1928,7 @@ F: patterns/
         };
 
         let qemu_candidates = qemu_registry
-            .resolve_candidates(&[], "[PATCH] target/riscv: fix CSR write", None)
+            .resolve_candidates(&[], "[PATCH] target/riscv: fix CSR write", None, None)
             .await;
         assert_eq!(
             qemu_candidates,
@@ -1771,7 +1953,7 @@ F: patterns/
         };
 
         let openbsd_candidates = openbsd_registry
-            .resolve_candidates(&[], "[PATCH 7.8] uvm: fix", None)
+            .resolve_candidates(&[], "[PATCH 7.8] uvm: fix", None, None)
             .await;
         // The local tag the prefix names is still tried; it costs no fetch.
         assert_eq!(
@@ -1802,7 +1984,7 @@ F: patterns/
         };
 
         let candidates = registry
-            .resolve_candidates(&[], "[PATCH gcc-15] c++: backport fix", None)
+            .resolve_candidates(&[], "[PATCH gcc-15] c++: backport fix", None, None)
             .await;
         assert_eq!(
             candidates,
