@@ -613,8 +613,7 @@ impl GitWorktree {
         directory: Option<&str>,
     ) -> Result<std::process::Output> {
         let mut cmd = crate::git_cmd::in_dir_async(&self.path);
-        cmd.env("LC_ALL", "C")
-            .env("GIT_AUTHOR_NAME", "Sashiko Bot")
+        cmd.env("GIT_AUTHOR_NAME", "Sashiko Bot")
             .env("GIT_AUTHOR_EMAIL", "sashiko@localhost")
             .env("GIT_COMMITTER_NAME", "Sashiko Bot")
             .env("GIT_COMMITTER_EMAIL", "sashiko@localhost")
