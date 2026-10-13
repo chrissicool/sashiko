@@ -199,4 +199,5 @@ mail shows once in its thread.
 
 ## Status
 
-Proposed. Not implemented.
+Implemented: `mailing_lists.rich_mail`, the format-patch and rich readings,
+and every step of the rich pipeline.

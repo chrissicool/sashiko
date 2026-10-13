@@ -69,7 +69,7 @@ Optional. Controls forge (GitHub/GitLab) webhook integration.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `track` | string or list | -- | Mailing lists to monitor. Accepts a TOML array or a comma-separated string. |
-| `rich_mail` | bool | `false` | Read mail in any shape a sender and mail client produce: a fresh diff in a reply is a patch, and a batch of changesets in one mail is a series. Off, mail is read as `git format-patch` sends it. See [designs/DESIGN_RICH_MAIL_INGESTION.md](../designs/DESIGN_RICH_MAIL_INGESTION.md). |
+| `rich_mail` | bool | `false` | Read mail in any shape a sender and mail client produce: a fresh diff in a reply is a patch, a batch of changesets in one mail is a series, and MIME is unwrapped so that encoded and attached diffs are found. Off, mail is read as `git format-patch` sends it. See [designs/DESIGN_RICH_MAIL_INGESTION.md](../designs/DESIGN_RICH_MAIL_INGESTION.md). |
 
 ### `[nntp]`
 

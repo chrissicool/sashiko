@@ -15,7 +15,7 @@
 #[cfg(feature = "server")]
 use anyhow::{Result, anyhow};
 #[cfg(feature = "server")]
-use mail_parser::{HeaderValue, MessageParser};
+use mail_parser::{HeaderValue, Message, MessageParser, PartType};
 use regex::Regex;
 use std::sync::OnceLock;
 
@@ -26,7 +26,8 @@ pub enum MailReading {
     /// mail carries, and a reply carries none.
     FormatPatch,
     /// As a list without a style guide gets it: a fresh diff in a reply is a
-    /// patch, and a batch of changesets in one mail is a series.
+    /// patch, a batch of changesets in one mail is a series, and MIME is
+    /// unwrapped down to the text of every part, attachments included.
     Rich,
 }
 
@@ -128,12 +129,20 @@ pub fn parse_email(
 ) -> Result<(PatchsetMetadata, Vec<Patch>)> {
     let received_date = extract_received_date(raw_email);
 
-    let message = MessageParser::default()
+    let parser = MessageParser::default()
         .with_address_headers()
         .with_message_ids()
         .header_text(mail_parser::HeaderName::Subject)
         .header_date(mail_parser::HeaderName::Date)
-        .header_address("X-Original-From")
+        .header_address("X-Original-From");
+    // Naming any header to parse leaves every other one raw, the MIME headers
+    // included, and a message whose Content-Type is raw is one undecoded text
+    // part. Only the rich reading looks past that.
+    let parser = match reading {
+        MailReading::FormatPatch => parser,
+        MailReading::Rich => parser.with_mime_headers(),
+    };
+    let message = parser
         .parse(raw_email)
         .ok_or_else(|| anyhow!("Failed to parse email"))?;
 
@@ -291,7 +300,9 @@ pub fn parse_email(
             let is_forward = subject_clean.starts_with("fwd:")
                 || subject_clean.starts_with("forwarded:")
                 || subject_clean.starts_with("wg:"); // German 'Weitergeleitet' (forwarded)
-            let (has_diff, total, patches) = read_rich(&message_id, &body, index, total);
+            let attachments = diff_attachments(&message);
+            let (has_diff, total, patches) =
+                read_rich(&message_id, &body, &attachments, index, total);
             // A mail carries a diff only if a changeset was found in it, so a
             // diff that is quoted or indented to discuss it does not count. A
             // reply (but not a forward) carrying one is a patch, e.g. an
@@ -321,16 +332,30 @@ pub fn parse_email(
     Ok((metadata, patches))
 }
 
-/// The rich reading of a mail's body: a batch of changesets in one mail is a
-/// series. Returns whether the body carries a fresh diff, the mail's part
-/// count, and its patches.
+/// The rich reading of a mail's body and its diff-carrying attachments: a batch
+/// of changesets in one mail is a series. Returns whether the mail carries a
+/// fresh diff, its part count, and its patches.
 #[cfg(feature = "server")]
-fn read_rich(message_id: &str, body: &str, index: u32, total: u32) -> (bool, u32, Vec<Patch>) {
+fn read_rich(
+    message_id: &str,
+    body: &str,
+    attachments: &[String],
+    index: u32,
+    total: u32,
+) -> (bool, u32, Vec<Patch>) {
     // A body may carry more than one changeset: tech@ takes a batch of patches
     // in a single mail as readily as one per mail. Each becomes its own patch,
     // so each is reviewed on its own terms rather than fused into one diff.
     // Only a diff the sender wrote is a changeset, not ">"-quoted reply context.
-    let changesets = split_changesets(body);
+    let inline = split_changesets(body);
+    // Each attachment is split on its own, so a part boundary is a changeset
+    // boundary too. An attached diff is never quoted context, so it is fresh.
+    let attached: Vec<Changeset> = attachments
+        .iter()
+        .flat_map(|text| split_changesets(text))
+        .collect();
+    let has_attached_diff = !attached.is_empty();
+    let changesets = merge_changesets(inline, attached, body);
     let has_diff = !changesets.is_empty();
     let split_total = u32::try_from(changesets.len()).unwrap_or(u32::MAX);
     // A split body is a series that arrived in one message, so it is numbered
@@ -351,6 +376,19 @@ fn read_rich(message_id: &str, body: &str, index: u32, total: u32) -> (bool, u32
                 subject: changeset.subject,
             })
             .collect()
+    } else if has_attached_diff {
+        // The one changeset has an attached copy, which is the one that
+        // applies, so the diff is the attachment's rather than the body.
+        changesets
+            .into_iter()
+            .map(|changeset| Patch {
+                message_id: message_id.to_string(),
+                body: body.to_string(),
+                diff: changeset.diff,
+                part_index: index,
+                subject: None,
+            })
+            .collect()
     } else if has_diff {
         vec![Patch {
             message_id: message_id.to_string(),
@@ -364,6 +402,96 @@ fn read_rich(message_id: &str, body: &str, index: u32, total: u32) -> (bool, u32
     };
 
     (has_diff, total, patches)
+}
+
+/// The decoded text of every attachment that carries a diff, in MIME order.
+///
+/// Content decides, not type: a diff arrives as `text/x-patch` as readily as
+/// `application/octet-stream`. A part that is not text is read as UTF-8, and
+/// whatever that makes of an image or a signature carries no hunk.
+#[cfg(feature = "server")]
+fn diff_attachments(message: &Message) -> Vec<String> {
+    message
+        .attachments()
+        .filter_map(|part| match &part.body {
+            PartType::Text(text) => Some(text.to_string()),
+            PartType::Binary(bytes) | PartType::InlineBinary(bytes) => {
+                Some(String::from_utf8_lossy(bytes).into_owned())
+            }
+            PartType::Html(_) | PartType::Message(_) | PartType::Multipart(_) => None,
+        })
+        .filter(|text| carries_hunk(text))
+        .collect()
+}
+
+/// Whether `text` holds a hunk header together with a file header.
+#[cfg(feature = "server")]
+fn carries_hunk(text: &str) -> bool {
+    let mut hunk = false;
+    let mut file = false;
+    for line in text.lines() {
+        hunk |= line.starts_with("@@ -");
+        file |= line.starts_with("+++ ") || line.starts_with("diff ");
+    }
+    hunk && file
+}
+
+/// What identifies a changeset across an inline and an attached copy: the
+/// path of every `+++` header and the range of every hunk. A mail client
+/// wraps lines and turns tabs into spaces, but leaves these alone.
+#[cfg(feature = "server")]
+fn fingerprint(diff: &str) -> Vec<&str> {
+    diff.lines()
+        .filter_map(|line| {
+            if let Some(file) = line.strip_prefix("+++ ") {
+                file.split_whitespace().next()
+            } else if line.starts_with("@@ -") {
+                let end = line[2..].find("@@").map_or(line.len(), |at| at + 4);
+                Some(&line[..end])
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Folds the attached changesets into the inline ones.
+///
+/// A client damages the inline copy of a diff and leaves the attached one
+/// alone, so where both copies arrive the attachment supplies the diff, and
+/// the inline copy its place and, where it has them, its subject and message.
+/// Two inline or two attached changesets are never merged. An attached
+/// changeset with no message of its own is explained by the mail's body.
+#[cfg(feature = "server")]
+fn merge_changesets(
+    inline: Vec<Changeset>,
+    attached: Vec<Changeset>,
+    body: &str,
+) -> Vec<Changeset> {
+    let inline_count = inline.len();
+    let mut merged = inline;
+    let mut taken = vec![false; inline_count];
+    for mut copy in attached {
+        let print = fingerprint(&copy.diff);
+        let twin = (0..inline_count).find(|&n| !taken[n] && fingerprint(&merged[n].diff) == print);
+        if let Some(n) = twin {
+            taken[n] = true;
+            let inline = &mut merged[n];
+            inline.diff = copy.diff;
+            if inline.subject.is_none() {
+                inline.subject = copy.subject;
+            }
+            if inline.message.is_empty() {
+                inline.message = copy.message;
+            }
+        } else {
+            if copy.message.is_empty() {
+                copy.message = body.trim().to_string();
+            }
+            merged.push(copy);
+        }
+    }
+    merged
 }
 
 /// A line that only ever appears inside a diff, so it continues the block the
@@ -1014,6 +1142,181 @@ And the second one:\n\
         assert_eq!(ids, ["batch#1", "batch#2"]);
         assert!(patches[0].diff.contains("b/a.c") && !patches[0].diff.contains("b/b.c"));
         assert!(patches[1].diff.contains("b/b.c"));
+    }
+
+    /// Base64 as a mailer writes it: 76 columns, CRLF between lines.
+    #[cfg(feature = "server")]
+    fn base64(text: &str) -> String {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+        encoded
+            .as_bytes()
+            .chunks(76)
+            .map(|line| std::str::from_utf8(line).unwrap())
+            .collect::<Vec<_>>()
+            .join("\r\n")
+    }
+
+    #[cfg(feature = "server")]
+    const EM_RESET: &str = "From 1111 Mon Sep 17 00:00:00 2001\nFrom: A <a@example.com>\n\
+Subject: [PATCH 1/2] em: reset ring\n\nReset the ring on attach.\n---\n\n\
+diff --git a/sys/dev/em.c b/sys/dev/em.c\n--- a/sys/dev/em.c\n+++ b/sys/dev/em.c\n\
+@@ -1,2 +1,2 @@\n \tctx\n-\told\n+\tnew\n";
+
+    #[cfg(feature = "server")]
+    const EM_SCRATCH: &str = "From 2222 Mon Sep 17 00:00:00 2001\nFrom: A <a@example.com>\n\
+Subject: [PATCH 2/2] em: clear scratch\n\nClear the scratch buffer.\n---\n\n\
+diff --git a/sys/dev/em.c b/sys/dev/em.c\n--- a/sys/dev/em.c\n+++ b/sys/dev/em.c\n\
+@@ -9,2 +9,2 @@\n \tctx\n-\tx\n+\ty\n";
+
+    #[cfg(feature = "server")]
+    const PF_FIX: &str = "--- sys/net/pf.c\t1 Jan 2026\n+++ sys/net/pf.c\t2 Jan 2026\n\
+@@ -10,3 +10,3 @@ pf_test(void)\n \tint a;\n-\ta = 0;\n+\ta = 1;\n \treturn a;\n";
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_rich_reading_unwraps_a_signed_multipart() {
+        let cover = format!("Hi,\n\ntwo fixes for em(4).\n\n\n{EM_RESET}\n\n{EM_SCRATCH}");
+        let raw = format!(
+            "Message-ID: <smime>\r\nSubject: em: two fixes\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/signed; protocol=\"application/pkcs7-signature\"; boundary=\"S\"\r\n\r\n\
+--S\r\nContent-Type: multipart/mixed; boundary=\"M\"\r\n\r\n\
+--M\r\nContent-Type: text/plain; charset=\"utf-8\"\r\nContent-Transfer-Encoding: base64\r\n\r\n\
+{}\r\n\
+--M\r\nContent-Type: text/x-patch; name=\"0001.patch\"\r\n\
+Content-Disposition: attachment; filename=\"0001.patch\"\r\nContent-Transfer-Encoding: base64\r\n\r\n\
+{}\r\n\
+--M\r\nContent-Type: text/x-patch; name=\"0002.patch\"\r\n\
+Content-Disposition: attachment; filename=\"0002.patch\"\r\nContent-Transfer-Encoding: base64\r\n\r\n\
+{}\r\n\
+--M--\r\n\r\n\
+--S\r\nContent-Type: application/pkcs7-signature; name=\"smime.p7s\"\r\n\
+Content-Disposition: attachment; filename=\"smime.p7s\"\r\nContent-Transfer-Encoding: base64\r\n\r\n\
+MIAGCSqGSIb3DQEHAqCAMIACAQExDzANBglghkgBZQMEAgEFADCABgkqhkiG9w0BBwEAAKCC\r\n\
+--S--\r\n",
+            base64(&cover),
+            base64(EM_RESET),
+            base64(EM_SCRATCH)
+        );
+
+        let (meta, patches) = parse_email(raw.as_bytes(), MailReading::Rich).unwrap();
+        assert!(meta.is_patch_or_cover);
+        assert!(meta.body.starts_with("Hi,"), "{}", meta.body);
+        assert_eq!(meta.total, 2);
+        let ids: Vec<_> = patches.iter().map(|p| p.message_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["smime#1", "smime#2"],
+            "inline and attached copies merge"
+        );
+        assert_eq!(
+            patches[0].subject.as_deref(),
+            Some("[PATCH 1/2] em: reset ring")
+        );
+        assert_eq!(patches[0].body, "Reset the ring on attach.");
+        assert!(patches[0].diff.contains("+\tnew"), "{}", patches[0].diff);
+        assert!(patches[1].diff.contains("+\ty"), "{}", patches[1].diff);
+
+        // Read as format-patch, the body is MIME source, which holds no diff.
+        let (_, patches) = parse_email(raw.as_bytes(), MailReading::FormatPatch).unwrap();
+        assert!(patches.is_empty());
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_rich_reading_decodes_quoted_printable() {
+        let raw = b"Message-ID: <qp>\r\nSubject: [PATCH] fix compare\r\nMIME-Version: 1.0\r\n\
+Content-Type: text/plain; charset=\"utf-8\"\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n\
+--- a/x.c\r\n+++ b/x.c\r\n@@ -1,1 +1,1 @@\r\n\
+-\tif (a =3D b && a_long_condition_that_a_mailer_will_wrap_somewhere_along_th=\r\n\
+e_way)\r\n\
++\tif (a =3D=3D b && a_long_condition_that_a_mailer_will_wrap_somewhere_along_=\r\n\
+the_way)\r\n";
+        let (_, patches) = parse_email(raw, MailReading::Rich).unwrap();
+        assert_eq!(patches.len(), 1);
+        assert!(
+            patches[0].diff.contains(
+                "+\tif (a == b && a_long_condition_that_a_mailer_will_wrap_somewhere_along_the_way)"
+            ),
+            "{}",
+            patches[0].diff
+        );
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_rich_reading_takes_a_diff_that_is_only_attached() {
+        let mail = |subject: &str| {
+            format!(
+                "Message-ID: <att>\r\nSubject: {subject}\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"M\"\r\n\r\n\
+--M\r\nContent-Type: text/plain\r\n\r\nThis stops pf_test from returning zero.\r\n\
+--M\r\nContent-Type: application/octet-stream; name=\"pf.diff\"\r\n\
+Content-Disposition: attachment; filename=\"pf.diff\"\r\nContent-Transfer-Encoding: base64\r\n\r\n\
+{}\r\n\
+--M\r\nContent-Type: text/plain; name=\"dmesg.txt\"\r\n\
+Content-Disposition: attachment; filename=\"dmesg.txt\"\r\n\r\n\
+OpenBSD 7.8-current (GENERIC.MP)\r\n--- dmesg ends ---\r\n\
+--M\r\nContent-Type: image/png; name=\"panic.png\"\r\n\
+Content-Disposition: attachment; filename=\"panic.png\"\r\nContent-Transfer-Encoding: base64\r\n\r\n\
+iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==\r\n\
+--M--\r\n",
+                base64(PF_FIX)
+            )
+        };
+
+        for subject in ["pf: return one", "Re: pf: return one"] {
+            let raw = mail(subject);
+            let (meta, patches) = parse_email(raw.as_bytes(), MailReading::Rich).unwrap();
+            assert!(meta.is_patch_or_cover, "{subject}");
+            assert_eq!(meta.body, "This stops pf_test from returning zero.");
+            assert_eq!(
+                patches.len(),
+                1,
+                "{subject}: the dmesg and image are no diffs"
+            );
+            assert_eq!(patches[0].message_id, "att");
+            assert!(patches[0].diff.contains("+\ta = 1;"), "{}", patches[0].diff);
+            assert!(!patches[0].diff.contains("dmesg"), "{}", patches[0].diff);
+        }
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_the_attached_copy_of_a_damaged_inline_diff_wins() {
+        // The mailer turned tabs into spaces in the inline copy, including the
+        // one between the path and the date.
+        let damaged = PF_FIX.replace('\t', "        ");
+        let other = "--- sys/net/if.c\n+++ sys/net/if.c\n@@ -5,1 +5,1 @@\n-\tb = 0;\n+\tb = 2;\n";
+        let raw = format!(
+            "Message-ID: <twice>\r\nSubject: pf: return one\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"M\"\r\n\r\n\
+--M\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: 8bit\r\n\r\n\
+Inline for reading, attached for applying.\r\n\r\n{}\r\n\
+--M\r\nContent-Type: application/octet-stream; name=\"pf.diff\"\r\n\
+Content-Disposition: attachment; filename=\"pf.diff\"\r\nContent-Transfer-Encoding: base64\r\n\r\n\
+{}\r\n\
+--M\r\nContent-Type: text/x-diff; name=\"if.diff\"\r\n\
+Content-Disposition: attachment; filename=\"if.diff\"\r\n\r\n\
+{}\r\n\
+--M--\r\n",
+            damaged.replace('\n', "\r\n"),
+            base64(PF_FIX),
+            other.replace('\n', "\r\n")
+        );
+
+        let (meta, patches) = parse_email(raw.as_bytes(), MailReading::Rich).unwrap();
+        assert_eq!(meta.total, 2);
+        let ids: Vec<_> = patches.iter().map(|p| p.message_id.as_str()).collect();
+        assert_eq!(ids, ["twice#1", "twice#2"]);
+        assert!(patches[0].diff.contains("+\ta = 1;"), "{}", patches[0].diff);
+        assert!(patches[1].diff.contains("+\tb = 2;"), "{}", patches[1].diff);
+        // A bare attached diff is explained by the mail's body.
+        assert!(
+            patches[1].body.starts_with("Inline for reading"),
+            "{}",
+            patches[1].body
+        );
     }
 
     #[cfg(feature = "server")]
