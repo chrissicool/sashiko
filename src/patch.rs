@@ -19,6 +19,17 @@ use mail_parser::{HeaderValue, MessageParser};
 use regex::Regex;
 use std::sync::OnceLock;
 
+/// How `parse_email` reads a mail. See designs/DESIGN_RICH_MAIL_INGESTION.md.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MailReading {
+    /// As `git format-patch` sends it: the whole text body is the one patch a
+    /// mail carries, and a reply carries none.
+    FormatPatch,
+    /// As a list without a style guide gets it: a fresh diff in a reply is a
+    /// patch, and a batch of changesets in one mail is a series.
+    Rich,
+}
+
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct PatchsetMetadata {
@@ -93,7 +104,7 @@ pub fn extract_received_date(raw_email: &[u8]) -> Option<i64> {
 
 /// Whether a subject marks a reply or forward rather than a submission.
 #[cfg(feature = "server")]
-pub(crate) fn is_reply_subject(subject: &str) -> bool {
+fn is_reply_subject(subject: &str) -> bool {
     let subject_lower = subject.to_lowercase();
     let subject_clean = subject_lower.trim();
     subject_clean.starts_with("re:")
@@ -111,7 +122,10 @@ pub(crate) fn is_reply_subject(subject: &str) -> bool {
 }
 
 #[cfg(feature = "server")]
-pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Vec<Patch>)> {
+pub fn parse_email(
+    raw_email: &[u8],
+    reading: MailReading,
+) -> Result<(PatchsetMetadata, Vec<Patch>)> {
     let received_date = extract_received_date(raw_email);
 
     let message = MessageParser::default()
@@ -242,49 +256,82 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Vec<Patch>)> {
         }
     }
 
-    let diff = if body.contains("diff --git")
-        || (body.contains("--- ") && body.contains("+++ ") && body.contains("@@ -"))
-    {
-        body.clone()
-    } else {
-        String::new()
-    };
-
     // Detection logic
     let subject_lower = subject.to_lowercase();
     let subject_clean = subject_lower.trim();
     let is_reply = is_reply_subject(&subject);
-    // A forward relays someone else's content; the forwarder isn't submitting a
-    // patch, so a fresh diff inside a forward should not promote it to a patchset.
-    let is_forward = subject_clean.starts_with("fwd:")
-        || subject_clean.starts_with("forwarded:")
-        || subject_clean.starts_with("wg:"); // German 'Weitergeleitet' (forwarded)
     let has_patch_tag = subject_clean.contains("patch") || subject_clean.contains("rfc");
-    let has_diff = !diff.is_empty();
-    // A *fresh* diff is one on unquoted lines, not ">"-prefixed reply context.
-    // OpenBSD posts the actual diff as a reply in the discussion thread, so a
-    // reply carrying an unquoted diff is a real patch — whereas a reply that only
-    // quotes someone else's diff to comment on it is not.
-    let has_unquoted_diff = body_has_unquoted_diff(&body);
 
     // A message is part of a series if it's a cover letter (index 0) or has multiple parts (total > 1)
     let is_series_metadata = total > 1 || index == 0;
 
-    // It is a patch or cover letter if either:
-    // 1. It is NOT a reply (Re: ...) AND it has a [PATCH]/[RFC] tag, a diff, or is series metadata; or
-    // 2. It is a reply (but not a forward) carrying a fresh, unquoted diff — e.g.
-    //    an OpenBSD diff posted as a thread reply.
-    let is_patch_or_cover = (!is_reply && (has_patch_tag || has_diff || is_series_metadata))
-        || (has_unquoted_diff && !is_forward);
+    let (is_patch_or_cover, total, patches) = match reading {
+        MailReading::FormatPatch => {
+            let has_diff = body.contains("diff --git")
+                || (body.contains("--- ") && body.contains("+++ ") && body.contains("@@ -"));
+            let is_submission = !is_reply && (has_patch_tag || has_diff || is_series_metadata);
+            // The whole body is the one patch the mail carries. A reply
+            // carries none: whatever diff it holds is review discussion.
+            let patches = if has_diff && index != 0 && !is_reply {
+                vec![Patch {
+                    message_id: message_id.clone(),
+                    body: body.clone(),
+                    diff: body.clone(),
+                    part_index: index,
+                    subject: None,
+                }]
+            } else {
+                Vec::new()
+            };
+            (is_submission, total, patches)
+        }
+        MailReading::Rich => {
+            // A forward relays someone else's content; the forwarder isn't submitting a
+            // patch, so a fresh diff inside a forward should not promote it to a patchset.
+            let is_forward = subject_clean.starts_with("fwd:")
+                || subject_clean.starts_with("forwarded:")
+                || subject_clean.starts_with("wg:"); // German 'Weitergeleitet' (forwarded)
+            let (has_diff, total, patches) = read_rich(&message_id, &body, index, total);
+            // A mail carries a diff only if a changeset was found in it, so a
+            // diff that is quoted or indented to discuss it does not count. A
+            // reply (but not a forward) carrying one is a patch, e.g. an
+            // OpenBSD diff posted as a thread reply.
+            let is_submission = !is_reply && (has_patch_tag || has_diff || is_series_metadata);
+            (is_submission || (has_diff && !is_forward), total, patches)
+        }
+    };
 
+    let metadata = PatchsetMetadata {
+        message_id: message_id.clone(),
+        subject,
+        author,
+        date,
+        received_date,
+        in_reply_to,
+        references,
+        index,
+        total,
+        to,
+        cc,
+        is_patch_or_cover,
+        version,
+        body: body.clone(),
+    };
+
+    Ok((metadata, patches))
+}
+
+/// The rich reading of a mail's body: a batch of changesets in one mail is a
+/// series. Returns whether the body carries a fresh diff, the mail's part
+/// count, and its patches.
+#[cfg(feature = "server")]
+fn read_rich(message_id: &str, body: &str, index: u32, total: u32) -> (bool, u32, Vec<Patch>) {
     // A body may carry more than one changeset: tech@ takes a batch of patches
     // in a single mail as readily as one per mail. Each becomes its own patch,
     // so each is reviewed on its own terms rather than fused into one diff.
-    let changesets = if has_diff {
-        split_changesets(&body)
-    } else {
-        Vec::new()
-    };
+    // Only a diff the sender wrote is a changeset, not ">"-quoted reply context.
+    let changesets = split_changesets(body);
+    let has_diff = !changesets.is_empty();
     let split_total = u32::try_from(changesets.len()).unwrap_or(u32::MAX);
     // A split body is a series that arrived in one message, so it is numbered
     // like one. A single changeset leaves the subject's own numbering alone.
@@ -306,9 +353,9 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Vec<Patch>)> {
             .collect()
     } else if has_diff {
         vec![Patch {
-            message_id: message_id.clone(),
-            body: body.clone(),
-            diff,
+            message_id: message_id.to_string(),
+            body: body.to_string(),
+            diff: body.to_string(),
             part_index: index,
             subject: None,
         }]
@@ -316,24 +363,7 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Vec<Patch>)> {
         Vec::new()
     };
 
-    let metadata = PatchsetMetadata {
-        message_id: message_id.clone(),
-        subject,
-        author,
-        date,
-        received_date,
-        in_reply_to,
-        references,
-        index,
-        total,
-        to,
-        cc,
-        is_patch_or_cover,
-        version,
-        body: body.clone(),
-    };
-
-    Ok((metadata, patches))
+    (has_diff, total, patches)
 }
 
 /// A line that only ever appears inside a diff, so it continues the block the
@@ -497,13 +527,6 @@ fn split_changesets(body: &str) -> Vec<Changeset> {
         preamble = region[cut..].join("\n");
     }
     out
-}
-
-/// Returns true if `body` contains a diff on unquoted lines -- i.e. a fresh diff
-/// the sender wrote, not a ">"-quoted diff carried over from earlier in a thread.
-#[cfg(feature = "server")]
-fn body_has_unquoted_diff(body: &str) -> bool {
-    !split_changesets(body).is_empty()
 }
 
 /// Read the `M/N` part counter out of a patch subject, as `(index, total)`.
@@ -832,7 +855,7 @@ Body";
         let raw =
             b"Message-ID: <reply>\r\nSubject: \xE5\x9B\x9E\xE5\xA4\x8D: [PATCH] fix\r\n\r\nBody";
         // \xE5\x9B\x9E\xE5\xA4\x8D is "回复" in UTF-8.
-        let (meta, _) = parse_email(raw).unwrap();
+        let (meta, _) = parse_email(raw, MailReading::FormatPatch).unwrap();
         assert!(
             !meta.is_patch_or_cover,
             "Chinese reply should not be a patchset"
@@ -844,17 +867,17 @@ Body";
     fn test_author_parsing() {
         let raw =
             b"Message-ID: <123>\r\nFrom: Test User <test@example.com>\r\nSubject: Test\r\n\r\nBody";
-        let (meta, _) = parse_email(raw).unwrap();
+        let (meta, _) = parse_email(raw, MailReading::FormatPatch).unwrap();
         assert_eq!(meta.author, "\"Test User\" <test@example.com>");
 
         let raw_no_name =
             b"Message-ID: <456>\r\nFrom: test2@example.com\r\nSubject: Test\r\n\r\nBody";
-        let (meta2, _) = parse_email(raw_no_name).unwrap();
+        let (meta2, _) = parse_email(raw_no_name, MailReading::FormatPatch).unwrap();
         assert_eq!(meta2.author, "test2@example.com");
 
         let raw_malformed =
             b"Message-ID: <789>\r\nFrom: \"fqr\" <user.email>\r\nSubject: Test\r\n\r\nBody";
-        let (meta3, _) = parse_email(raw_malformed).unwrap();
+        let (meta3, _) = parse_email(raw_malformed, MailReading::FormatPatch).unwrap();
         assert_eq!(meta3.author, "\"fqr\" <unknown@localhost>");
     }
 
@@ -865,7 +888,7 @@ Body";
                     From: Real Author via B4 Relay <devnull+author.example.com@kernel.org>\r\n\
                     X-Original-From: Real Author <author@example.com>\r\n\
                     Subject: Test B4 Relay\r\n\r\nBody";
-        let (meta, _) = parse_email(raw).unwrap();
+        let (meta, _) = parse_email(raw, MailReading::FormatPatch).unwrap();
         assert_eq!(meta.author, "\"Real Author\" <author@example.com>");
     }
 
@@ -878,7 +901,7 @@ Body";
                              From: Real Author via B4 Relay <devnull+author.example.com@kernel.org>\r\n\
                              X-Original-From: Author Two <author2@example.com>\r\n\
                              Subject: Normal Patch\r\n\r\nBody";
-        let (meta_mismatch, _) = parse_email(raw_mismatch).unwrap();
+        let (meta_mismatch, _) = parse_email(raw_mismatch, MailReading::FormatPatch).unwrap();
         assert_eq!(
             meta_mismatch.author,
             "\"Real Author via B4 Relay\" <devnull+author.example.com@kernel.org>"
@@ -889,7 +912,7 @@ Body";
     #[test]
     fn test_recipient_parsing() {
         let raw = b"Message-ID: <1>\r\nFrom: a@b.com\r\nTo: \"Valid User\" <valid@example.com>, invalid_no_at, <another@test.com>\r\nCc: Bad <bad>, \"Good\" <good@example.com>\r\nSubject: Test\r\n\r\nBody";
-        let (meta, _) = parse_email(raw).unwrap();
+        let (meta, _) = parse_email(raw, MailReading::FormatPatch).unwrap();
         assert_eq!(
             meta.to,
             "\"Valid User\" <valid@example.com>, another@test.com"
@@ -903,7 +926,7 @@ Body";
         // A message that starts with Re: but contains diff --git
         // This simulates a reply quoting a patch or sending an inline fixup
         let raw = b"Message-ID: <123>\r\nSubject: Re: [PATCH] fix bug\r\n\r\n> diff --git a/file b/file\n> index...";
-        let (meta, _) = parse_email(raw).unwrap();
+        let (meta, _) = parse_email(raw, MailReading::FormatPatch).unwrap();
 
         // This fails with current logic because has_diff is true
         assert!(
@@ -929,7 +952,7 @@ Index: sys/kern/vfs_subr.c\n\
 @@ -1021,7 +1021,7 @@\n\
 -old\n\
 +new\n";
-        let (meta, patch) = parse_email(raw).unwrap();
+        let (meta, patch) = parse_email(raw, MailReading::Rich).unwrap();
         assert!(
             meta.is_patch_or_cover,
             "Reply carrying a fresh unquoted diff SHOULD be a patchset"
@@ -942,9 +965,81 @@ Index: sys/kern/vfs_subr.c\n\
 
     #[cfg(feature = "server")]
     #[test]
+    fn test_format_patch_reading_takes_no_patch_from_a_reply() {
+        let raw = b"Message-ID: <fp-reply>\r\nSubject: Re: [PATCH] fix bug\r\n\r\n\
+Try this instead:\n\
+\n\
+--- a/file.c\n\
++++ b/file.c\n\
+@@ -1,1 +1,1 @@\n\
+-old\n\
++new\n";
+        let (meta, patches) = parse_email(raw, MailReading::FormatPatch).unwrap();
+        assert!(!meta.is_patch_or_cover);
+        assert!(patches.is_empty());
+
+        let (meta, patches) = parse_email(raw, MailReading::Rich).unwrap();
+        assert!(meta.is_patch_or_cover);
+        assert_eq!(patches.len(), 1);
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_only_the_rich_reading_splits_a_batch() {
+        let raw = b"Message-ID: <batch>\r\nSubject: two fixes\r\n\r\n\
+The first one:\n\
+\n\
+--- a/a.c\n\
++++ b/a.c\n\
+@@ -1,1 +1,1 @@\n\
+-old\n\
++new\n\
+\n\
+And the second one:\n\
+\n\
+--- a/b.c\n\
++++ b/b.c\n\
+@@ -2,1 +2,1 @@\n\
+-x\n\
++y\n";
+        let (meta, patches) = parse_email(raw, MailReading::FormatPatch).unwrap();
+        assert_eq!(meta.total, 1);
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].message_id, "batch");
+        assert!(patches[0].diff.contains("b/a.c") && patches[0].diff.contains("b/b.c"));
+
+        let (meta, patches) = parse_email(raw, MailReading::Rich).unwrap();
+        assert_eq!(meta.total, 2);
+        let ids: Vec<_> = patches.iter().map(|p| p.message_id.as_str()).collect();
+        assert_eq!(ids, ["batch#1", "batch#2"]);
+        assert!(patches[0].diff.contains("b/a.c") && !patches[0].diff.contains("b/b.c"));
+        assert!(patches[1].diff.contains("b/b.c"));
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_an_indented_diff_in_a_report_is_no_patch() {
+        // A bug report showing the diff it applied locally, indented as prose.
+        let raw = b"Message-ID: <report>\r\nSubject: motd shows the wrong version\r\n\r\n\
+After the update motd shows the old version. I changed it like this:\n\
+\n\
+\x20 --- etc/motd\n\
+\x20 +++ etc/motd\n\
+\x20 @@ -1,4 +1,4 @@\n\
+\x20 -OpenBSD 7.8\n\
+\x20 +OpenBSD 7.9\n\
+\n\
+Is that expected?\n";
+        let (meta, patches) = parse_email(raw, MailReading::Rich).unwrap();
+        assert!(!meta.is_patch_or_cover);
+        assert!(patches.is_empty());
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
     fn test_diff_without_patch_tag_ignored() {
         let raw = b"Message-ID: <diffnopatch>\r\nSubject: Random fix\r\n\r\ndiff --git a/file b/file\nindex...";
-        let (meta, _) = parse_email(raw).unwrap();
+        let (meta, _) = parse_email(raw, MailReading::FormatPatch).unwrap();
         assert!(
             meta.is_patch_or_cover,
             "Diff without [PATCH] tag should still be parsed as patch"
@@ -955,7 +1050,7 @@ Index: sys/kern/vfs_subr.c\n\
     #[test]
     fn test_normal_patch() {
         let raw = b"Message-ID: <456>\r\nSubject: [PATCH] fix bug\r\n\r\ndiff --git a/file b/file\nindex...";
-        let (meta, _) = parse_email(raw).unwrap();
+        let (meta, _) = parse_email(raw, MailReading::FormatPatch).unwrap();
         assert!(meta.is_patch_or_cover);
     }
 
@@ -964,7 +1059,7 @@ Index: sys/kern/vfs_subr.c\n\
     fn test_single_patch_no_diff_ignored() {
         let raw =
             b"Message-ID: <nonpatch>\r\nSubject: [PATCH] discussion\r\n\r\nThis is not a patch";
-        let (meta, _) = parse_email(raw).unwrap();
+        let (meta, _) = parse_email(raw, MailReading::FormatPatch).unwrap();
         assert!(
             meta.is_patch_or_cover,
             "Single patch without diff should still be parsed due to [PATCH] tag"
@@ -975,7 +1070,7 @@ Index: sys/kern/vfs_subr.c\n\
     #[test]
     fn test_cover_letter() {
         let raw = b"Message-ID: <789>\r\nSubject: [PATCH 0/5] fix bug\r\n\r\nCover letter body";
-        let (meta, patch) = parse_email(raw).unwrap();
+        let (meta, patch) = parse_email(raw, MailReading::FormatPatch).unwrap();
         assert!(meta.is_patch_or_cover);
         assert!(patch.is_empty());
     }
@@ -984,7 +1079,7 @@ Index: sys/kern/vfs_subr.c\n\
     #[test]
     fn test_cover_letter_with_diff() {
         let raw = b"Message-ID: <cover_with_diff>\r\nSubject: [PATCH 0/5] fix bug\r\n\r\nExplanation:\ndiff --git a/file b/file\nindex...";
-        let (meta, patch) = parse_email(raw).unwrap();
+        let (meta, patch) = parse_email(raw, MailReading::FormatPatch).unwrap();
         assert!(meta.is_patch_or_cover);
         assert!(
             patch.is_empty(),
@@ -996,7 +1091,7 @@ Index: sys/kern/vfs_subr.c\n\
     #[test]
     fn test_pure_reply() {
         let raw = b"Message-ID: <abc>\r\nSubject: Re: [PATCH] fix bug\r\n\r\nLGTM";
-        let (meta, _) = parse_email(raw).unwrap();
+        let (meta, _) = parse_email(raw, MailReading::FormatPatch).unwrap();
         assert!(!meta.is_patch_or_cover);
     }
 
@@ -1058,7 +1153,7 @@ Index: sys/kern/vfs_subr.c\n\
         assert_eq!(total, 430);
 
         let raw = format!("Message-ID: <123>\r\nSubject: {}\r\n\r\nBody", subject);
-        let (meta, _) = parse_email(raw.as_bytes()).unwrap();
+        let (meta, _) = parse_email(raw.as_bytes(), MailReading::FormatPatch).unwrap();
         assert!(meta.is_patch_or_cover, "Should be detected as patch/cover");
     }
 
@@ -1075,7 +1170,7 @@ Index: sys/kern/vfs_subr.c\n\
             "Message-ID: <456>\r\nSubject: {}\r\n\r\nDiff:\n--- a\n+++ b\n@@ -1 +1 @@",
             subject
         );
-        let (meta, _) = parse_email(raw.as_bytes()).unwrap();
+        let (meta, _) = parse_email(raw.as_bytes(), MailReading::FormatPatch).unwrap();
 
         // Current logic might think this is a patch because it has diff and doesn't start with "Re:" (starts with "Forwarded:")
         // We want to ensure it is handled correctly (either as patch if it IS a patch, or ignored if it's just a reply).
@@ -1142,7 +1237,7 @@ Index: sys/kern/vfs_subr.c\n\
     #[test]
     fn test_parse_email_author_quoting() {
         let raw = b"From: Thomas Richard (TI) <thomas.richard@bootlin.com>\r\nMessage-ID: <123>\r\nSubject: Test\r\n\r\nDiff:\n--- a\n+++ b\n@@ -1 +1 @@";
-        let (meta, _) = parse_email(raw).unwrap();
+        let (meta, _) = parse_email(raw, MailReading::FormatPatch).unwrap();
         assert_eq!(
             meta.author,
             "\"Thomas Richard (TI)\" <thomas.richard@bootlin.com>"
@@ -1359,7 +1454,6 @@ diff --git sys/dev/ic/qwz.c sys/dev/ic/qwz.c
             > diff --git a/a.c b/a.c\n> --- a/a.c\n> +++ b/a.c\n> @@ -1,1 +1,1 @@\n> -old\n> +new\n\
             \nbecause it breaks the lock.\n";
         assert!(split_changesets(body).is_empty());
-        assert!(!body_has_unquoted_diff(body));
     }
 
     /// Prose that merely mentions a dashed separator is not a diff.

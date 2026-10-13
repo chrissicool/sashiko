@@ -1443,7 +1443,8 @@ async fn get_message(
                 // 2. Search for blob
                 for path in candidate_paths {
                     if let Ok(raw) = crate::git_ops::read_blob(&path, hash).await
-                        && let Ok((metadata, _)) = crate::patch::parse_email(&raw)
+                        && let Ok((metadata, _)) =
+                            crate::patch::parse_email(&raw, state.settings.mailing_lists.reading())
                     {
                         details.body = Some(metadata.body);
                         break;

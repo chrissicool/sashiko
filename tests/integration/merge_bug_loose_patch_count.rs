@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use sashiko::db::Database;
-use sashiko::patch::parse_email;
+use sashiko::patch::{MailReading, parse_email};
 use sashiko::settings::DatabaseSettings;
 use std::sync::Arc;
 
@@ -38,7 +38,7 @@ From: Author <author@example.com>
 Date: Mon, 1 Jan 2024 10:00:00 -0000
 
 Diff...";
-    let (meta1, _) = parse_email(raw_1).unwrap();
+    let (meta1, _) = parse_email(raw_1, MailReading::FormatPatch).unwrap();
 
     // Verify parsing logic works (Fix verification)
     assert_eq!(meta1.index, 1);
@@ -77,7 +77,7 @@ From: Author <author@example.com>
 Date: Mon, 1 Jan 2024 10:00:10 -0000
 
 Diff...";
-    let (meta2, _) = parse_email(raw_2).unwrap();
+    let (meta2, _) = parse_email(raw_2, MailReading::FormatPatch).unwrap();
 
     assert_eq!(meta2.index, 2);
     assert_eq!(meta2.total, 2);

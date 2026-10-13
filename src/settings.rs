@@ -16,6 +16,7 @@ use config::{Config, ConfigError, Environment, File};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+use crate::patch::MailReading;
 use crate::project::ProjectId;
 
 /// The name of the file holding the server's local operator token.
@@ -198,6 +199,20 @@ fn default_dry_run() -> bool {
 pub struct MailingListsSettings {
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub track: Vec<String>,
+    /// Read mail in any shape a sender and mail client produce, rather than as
+    /// `git format-patch` sends it. See designs/DESIGN_RICH_MAIL_INGESTION.md.
+    #[serde(default)]
+    pub rich_mail: bool,
+}
+
+impl MailingListsSettings {
+    pub fn reading(&self) -> MailReading {
+        if self.rich_mail {
+            MailReading::Rich
+        } else {
+            MailReading::FormatPatch
+        }
+    }
 }
 
 /// Reads a list written either as a TOML array or as one comma separated

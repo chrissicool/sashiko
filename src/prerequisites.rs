@@ -14,7 +14,7 @@
 
 use crate::db::{Database, StoredPrerequisiteSeries};
 use crate::mbox::{LoreMboxClient, split_mbox};
-use crate::patch::{Patch, PatchsetMetadata, authors_match, parse_email};
+use crate::patch::{MailReading, Patch, PatchsetMetadata, authors_match, parse_email};
 use crate::utils::redact_secret;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -316,17 +316,10 @@ async fn parse_mbox_messages(raw: Vec<u8>) -> Result<Vec<(PatchsetMetadata, Opti
         Ok::<_, anyhow::Error>(
             messages
                 .into_iter()
-                .filter_map(|message| parse_email(&message).ok())
-                // A lore, b4 or Patchew series is format-patch: one patch per
-                // mail, and none in a reply, whatever a reply's diff looks like.
-                .map(|(metadata, patches)| {
-                    let patch = if crate::patch::is_reply_subject(&metadata.subject) {
-                        None
-                    } else {
-                        patches.into_iter().next()
-                    };
-                    (metadata, patch)
-                })
+                // A lore, b4 or Patchew series is format-patch, whatever the
+                // deployment's own lists send.
+                .filter_map(|message| parse_email(&message, MailReading::FormatPatch).ok())
+                .map(|(metadata, patches)| (metadata, patches.into_iter().next()))
                 .collect::<Vec<_>>(),
         )
     })
