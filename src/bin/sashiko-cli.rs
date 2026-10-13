@@ -18,7 +18,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use reqwest::Client;
 use sashiko::api::{PatchsetsResponse, SubmitRequest, SubmitResponse};
 use sashiko::auth::LocalToken;
-use sashiko::patch::parse_email;
+use sashiko::patch::{MailReading, parse_email};
 use sashiko::project::ProjectId;
 use sashiko::settings::Settings;
 use sashiko::utils::utf8_prefix;
@@ -925,8 +925,10 @@ fn prepare_mbox_payload(raw_bytes: Vec<u8>) -> Result<String> {
             // Fast-path: whole mbox is valid UTF-8
             content.push_str(s);
         } else {
-            // Slow-path: Check each patch email is valid or not.
-            let (meta, _) = parse_email(msg)
+            // Slow-path: Check each patch email is valid or not. The daemon
+            // may read mail richly, where a reply can carry a patch, so judge
+            // the message the way that takes the most mail for a patch.
+            let (meta, _) = parse_email(msg, MailReading::Rich)
                 .map_err(|e| anyhow::anyhow!("Failed to parse mbox message: {}", e))?;
             if meta.is_patch_or_cover {
                 return Err(anyhow::anyhow!(

@@ -834,6 +834,7 @@ async fn run_daemon(
         }
     };
 
+    let reading = settings.mailing_lists.reading();
     let parser_handle = tokio::spawn(async move {
         info!("Parser Dispatcher started");
         while let Some(event) = raw_rx.recv().await {
@@ -986,7 +987,7 @@ async fn run_daemon(
 
                             // Offload parsing
                             let parse_result = tokio::task::spawn_blocking(move || {
-                                sashiko::patch::parse_email(&msg_raw)
+                                sashiko::patch::parse_email(&msg_raw, reading)
                             })
                             .await;
 
@@ -1047,7 +1048,7 @@ async fn run_daemon(
 
                         // Offload CPU parsing to blocking thread pool
                         let parse_result = tokio::task::spawn_blocking(move || {
-                            sashiko::patch::parse_email(&bytes)
+                            sashiko::patch::parse_email(&bytes, reading)
                         })
                         .await;
 
