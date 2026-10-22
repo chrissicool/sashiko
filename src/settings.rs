@@ -470,7 +470,8 @@ pub struct OpenAiCompatSettings {
     /// "medium" and "high". A level the model rejects comes back as a 400,
     /// which classifies fatal and ends the review. Leave unset for the model
     /// default; the field is then omitted entirely, which is what a
-    /// compatible endpoint that does not implement it needs.
+    /// compatible endpoint that does not implement it needs. A review stage
+    /// that names its own level, under `review.effort`, sends that instead.
     #[serde(default)]
     pub effort: Option<String>,
     #[serde(default)]

@@ -59,7 +59,8 @@ impl AiProvider for CodexCliProvider {
         // an enterprise-managed requirements layer, which overrides a
         // configured value whatever its origin and reports the substitution as
         // an error event.
-        if let Some(effort) = &self.effort {
+        let effort = request.effort_or(self.effort.as_deref());
+        if let Some(effort) = effort {
             args.push("-c".to_string());
             args.push(format!("model_reasoning_effort={effort}"));
         }
@@ -120,7 +121,7 @@ impl AiProvider for CodexCliProvider {
             }
             if let Ok(event) = serde_json::from_str::<Value>(trimmed) {
                 if let Some(message) = error_message(&event) {
-                    self.check_error_message(message)?;
+                    self.check_error_message(message, effort)?;
                 }
                 match event["type"].as_str() {
                     Some("item.completed") => {
@@ -173,12 +174,12 @@ impl CodexCliProvider {
     /// Handles an error event from a run that exited 0. A requirements layer
     /// that substitutes its own value for a setting reports the substitution
     /// this way and lets the run proceed.
-    fn check_error_message(&self, message: &str) -> Result<()> {
+    fn check_error_message(&self, message: &str, effort: Option<&str>) -> Result<()> {
         let message = redact_secret(message);
         if is_approval_policy_substitution(&message) {
             debug!("codex-cli: {}", message);
-        } else if self.effort.is_some() && is_effort_substitution(&message) {
-            // The response cache files the reply under the configured effort,
+        } else if effort.is_some() && is_effort_substitution(&message) {
+            // The response cache files the reply under the effort asked for,
             // so a reply produced at the substituted one must not be returned.
             anyhow::bail!("codex CLI did not run at the configured effort: {message}");
         } else {
@@ -257,7 +258,7 @@ mod tests {
             model: "gpt-5-codex".to_string(),
             effort: Some("xhigh".to_string()),
         };
-        assert!(raised.check_error_message(message).is_err());
+        assert!(raised.check_error_message(message, Some("xhigh")).is_err());
 
         // With no effort configured the identity carries none, so the
         // substituted run is recorded under the identity it ran at.
@@ -265,12 +266,13 @@ mod tests {
             model: "gpt-5-codex".to_string(),
             effort: None,
         };
-        assert!(plain.check_error_message(message).is_ok());
+        assert!(plain.check_error_message(message, None).is_ok());
         assert!(
             raised
                 .check_error_message(
                     "Configured value for `approval_policy` is disallowed by \
-                     requirements; falling back to required value OnRequest."
+                     requirements; falling back to required value OnRequest.",
+                    Some("xhigh"),
                 )
                 .is_ok()
         );
@@ -321,6 +323,7 @@ mod tests {
         let err = raised
             .check_error_message(
                 "Configured value for `model_reasoning_effort` rejected at https://user:pass@host key=sk-secret token=tok-123",
+                Some("xhigh"),
             )
             .unwrap_err()
             .to_string();

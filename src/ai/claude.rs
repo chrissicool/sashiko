@@ -511,7 +511,11 @@ pub fn translate_ai_request(
         },
         tools,
         thinking: thinking.map(|thinking_type| ThinkingConfig { thinking_type }),
-        output_config: effort.map(|effort| OutputConfig { effort }),
+        output_config: request
+            .effort_or(effort.as_deref())
+            .map(|effort| OutputConfig {
+                effort: effort.to_string(),
+            }),
     };
 
     // Apply cache control if enabled
@@ -1090,6 +1094,17 @@ mod tests {
             json["output_config"],
             serde_json::json!({"effort": "xhigh"})
         );
+
+        // A review stage's own level replaces the configured one.
+        let staged = AiRequest {
+            reasoning_effort: Some(crate::ai::ReasoningEffort::Medium),
+            ..req.clone()
+        };
+        let claude_req =
+            translate_ai_request(&staged, false, 4096, None, Some("xhigh".to_string())).unwrap();
+        assert_eq!(claude_req.output_config.unwrap().effort, "medium");
+        let claude_req = translate_ai_request(&staged, false, 4096, None, None).unwrap();
+        assert_eq!(claude_req.output_config.unwrap().effort, "medium");
     }
 
     // --- Request translation tests ---

@@ -517,7 +517,9 @@ points at `openrouter.ai`, it is sent as OpenRouter's nested
 `reasoning.effort` shape instead. It is omitted when unset, so a
 compatible endpoint that does not implement the field is unaffected
 until you set it; one that does not recognize it may reject the request
-outright rather than ignore it.
+outright rather than ignore it. On a model that supports review effort
+levels, `[review] effort` gives each review stage its own level, which
+is sent in place of this one.
 
 The valid levels belong to the model, not to the API. `"none"` is
 legal, and is what a gpt-5.6 chat completion carrying function tools
