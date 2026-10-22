@@ -390,6 +390,9 @@ impl OpenAiCompatClient {
     }
 
     fn prepare_request(&self, request: AiRequest) -> Result<OpenAiRequest> {
+        let effort = request
+            .effort_or(self.effort.as_deref())
+            .map(str::to_string);
         let mut openai_req = translate_ai_request(
             request,
             self.max_tokens,
@@ -403,13 +406,13 @@ impl OpenAiCompatClient {
         if self.temperature_unsupported.load(Ordering::Relaxed) {
             openai_req.temperature = None;
         }
-        // Omitted unless configured: some endpoints that do not implement
+        // Omitted unless set: some endpoints that do not implement
         // reasoning_effort reject the whole request over an unknown field.
         // OpenRouter takes the level as a nested reasoning object instead.
         if is_openrouter(&self.base_url) {
-            openai_req.reasoning = self.effort.clone().map(|effort| OpenAiReasoning { effort });
+            openai_req.reasoning = effort.map(|effort| OpenAiReasoning { effort });
         } else {
-            openai_req.reasoning_effort = self.effort.clone();
+            openai_req.reasoning_effort = effort;
         }
         Ok(openai_req)
     }
@@ -770,8 +773,8 @@ fn translate_ai_request(
         temperature: request.temperature,
         max_tokens: max_tokens_field,
         max_completion_tokens: max_completion_tokens_field,
-        // Set by the caller, which holds the configured level; the translation
-        // has no view of it.
+        // Set by the caller, which weighs the stage's level against the
+        // configured one; the translation has no view of the latter.
         reasoning_effort: None,
         reasoning: None,
         response_format,
@@ -2455,6 +2458,39 @@ mod tests {
         let unset = test_client("https://openrouter.ai/api/v1", 65536, None);
         let json = serde_json::to_value(unset.prepare_request(sample_request()).unwrap()).unwrap();
         assert!(json.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn stage_effort_wins_over_the_configured_one() {
+        let with_stage = |effort| AiRequest {
+            reasoning_effort: Some(effort),
+            ..sample_request()
+        };
+
+        // The stage's level replaces the configured default...
+        let configured = test_client("https://api.openai.com/v1", 65536, Some("high"));
+        let built = configured
+            .prepare_request(with_stage(crate::ai::ReasoningEffort::Low))
+            .unwrap();
+        assert_eq!(built.reasoning_effort.as_deref(), Some("low"));
+
+        // ...is sent where nothing is configured...
+        let unset = test_client("https://api.openai.com/v1", 65536, None);
+        let built = unset
+            .prepare_request(with_stage(crate::ai::ReasoningEffort::Medium))
+            .unwrap();
+        assert_eq!(built.reasoning_effort.as_deref(), Some("medium"));
+
+        // ...and takes OpenRouter's nested shape there.
+        let openrouter = test_client("https://openrouter.ai/api/v1", 65536, Some("low"));
+        let json = serde_json::to_value(
+            openrouter
+                .prepare_request(with_stage(crate::ai::ReasoningEffort::High))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(json.get("reasoning_effort").is_none());
+        assert_eq!(json["reasoning"]["effort"], "high");
     }
 
     #[test]

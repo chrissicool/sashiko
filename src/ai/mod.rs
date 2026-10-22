@@ -145,6 +145,16 @@ impl ReasoningEffort {
         }
     }
 
+    /// Returns the lowercase level name, as OpenAI's `reasoning_effort`,
+    /// Anthropic's `output_config.effort` and the Claude and Codex CLIs take it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+
     /// Parses a reasoning effort string case-insensitively (`"low"`, `"medium"`, `"mid"`, `"high"`).
     pub fn from_str_loose(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
@@ -267,6 +277,17 @@ pub struct AiRequest {
     /// Optional per-request reasoning / thinking effort override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+impl AiRequest {
+    /// The reasoning effort to send: the review stage's own level, or else the
+    /// level the provider is configured with. Gemini's thinking level follows
+    /// the same order.
+    pub fn effort_or<'a>(&self, configured: Option<&'a str>) -> Option<&'a str> {
+        self.reasoning_effort
+            .map(ReasoningEffort::as_str)
+            .or(configured)
+    }
 }
 
 tokio::task_local! {
@@ -1551,6 +1572,26 @@ mod tests {
         assert!(err.to_string().contains("retry_after_secs"));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_effort_or_prefers_the_stage_level() {
+        let stage = AiRequest {
+            reasoning_effort: Some(ReasoningEffort::Low),
+            ..Default::default()
+        };
+        let plain = AiRequest::default();
+        assert_eq!(stage.effort_or(Some("xhigh")), Some("low"));
+        assert_eq!(stage.effort_or(None), Some("low"));
+        assert_eq!(plain.effort_or(Some("xhigh")), Some("xhigh"));
+        assert_eq!(plain.effort_or(None), None);
+        for (effort, name) in [
+            (ReasoningEffort::Low, "low"),
+            (ReasoningEffort::Medium, "medium"),
+            (ReasoningEffort::High, "high"),
+        ] {
+            assert_eq!(effort.as_str(), name);
+        }
     }
 
     #[test]

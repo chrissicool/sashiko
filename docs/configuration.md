@@ -169,7 +169,7 @@ Settings specific to the Claude API provider (`provider = "claude"`).
 | `max_tokens` | integer | `32768` | Max output tokens per response, thinking included. |
 | `base_url` | string | -- | Full Messages endpoint URL, e.g. `https://proxy.example.com/v1/messages`, for proxies like Portkey. Defaults to `$ANTHROPIC_BASE_URL/v1/messages`, or the Anthropic API. |
 | `thinking` | string | -- | Thinking mode, sent as `thinking.type`: `"adaptive"` (Opus 4.6, Sonnet 4.6, and later), or `"disabled"` where the model allows it. |
-| `effort` | string | -- | Effort level, sent as `output_config.effort`: `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`. Which levels a model accepts, and its default, vary by model. |
+| `effort` | string | -- | Effort level, sent as `output_config.effort`: `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`. Which levels a model accepts, and its default, vary by model. A review stage that names its own level under `[review] effort` sends that level instead. |
 
 #### `[ai.claude_cli]`
 
@@ -177,7 +177,7 @@ Settings for the Claude Code CLI provider (`provider = "claude-cli"`).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `effort` | string | -- | Thinking effort: `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`. |
+| `effort` | string | -- | Thinking effort: `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`. A review stage that names its own level under `[review] effort` sends that level instead. |
 
 #### `[ai.codex_cli]`
 
@@ -185,7 +185,7 @@ Settings for the Codex CLI provider (`provider = "codex-cli"`).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `effort` | string | -- | Reasoning effort: `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`. Passed as `-c model_reasoning_effort=<effort>`, which outranks `~/.codex/config.toml` but not an enterprise-managed requirements layer. A run whose effort that layer substitutes fails. |
+| `effort` | string | -- | Reasoning effort: `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`. Passed as `-c model_reasoning_effort=<effort>`, which outranks `~/.codex/config.toml` but not an enterprise-managed requirements layer. A run whose effort that layer substitutes fails. A review stage that names its own level under `[review] effort` sends that level instead. |
 
 #### `[ai.gemini]`
 
@@ -208,7 +208,7 @@ Settings for the OpenAI providers (`provider = "openai"` or `provider = "openai-
 | `base_url` | string | model-derived | API endpoint URL. Derived from the model name, `https://api.openai.com/v1/chat/completions` for anything unrecognized. |
 | `context_window_size` | integer | model-derived | Context window size. `128000` for most models. |
 | `max_tokens` | integer | `4096` | Max output tokens per response. With `provider = "openai"` it is sent as `max_completion_tokens`, which bounds reasoning tokens as well as the reply. |
-| `effort` | string | -- | Reasoning effort, sent as the `reasoning_effort` request field (or, when `base_url` is an `openrouter.ai` endpoint, as OpenRouter's nested `reasoning.effort`) and omitted entirely when unset. The valid set belongs to the model rather than to the API: `"none"` is legal, and is what a gpt-5.6 chat completion carrying function tools requires, while gpt-5.4-pro takes only `"medium"` and `"high"`. A level the model rejects comes back as a 400, which is fatal. Applies to both `provider = "openai"` and `provider = "openai-compatible"`; a compatible endpoint that does not implement the field may reject the request, so leave it unset there. |
+| `effort` | string | -- | Reasoning effort, sent as the `reasoning_effort` request field (or, when `base_url` is an `openrouter.ai` endpoint, as OpenRouter's nested `reasoning.effort`) and omitted entirely when unset. A review stage that names its own level under `[review] effort` sends that level instead. The valid set belongs to the model rather than to the API: `"none"` is legal, and is what a gpt-5.6 chat completion carrying function tools requires, while gpt-5.4-pro takes only `"medium"` and `"high"`. A level the model rejects comes back as a 400, which is fatal. Applies to both `provider = "openai"` and `provider = "openai-compatible"`; a compatible endpoint that does not implement the field may reject the request, so leave it unset there. |
 | `send_reasoning_content` | bool | `false` | Send the chain of thought a reasoning model returned (as `reasoning_content` or `reasoning`) back as `reasoning_content` on later assistant turns. Thinking models such as DeepSeek and Kimi reject a tool-call follow-up without it; an endpoint that does not know the field may reject the request. |
 | `send_empty_tool_call_content` | bool | `false` | Send `content: ""` in messages that carry only tool calls instead of omitting the field. Enable it for endpoints that reject such messages or whose chat templates render the missing field as `None`. |
 | `extra_headers` | table | empty | HTTP headers added to every request, as `"Header-Name" = "ENV_VAR"` pairs: each value is read from the named environment variable, never from the settings file, since these can be extra authorization headers. A header named here replaces the one Sashiko would send, `Authorization` included. An unset or empty variable, an invalid name or value, or the same header named twice in different case fails at startup. Header names, never values, join the response cache identity, so a header must not change the reply. |

@@ -192,10 +192,12 @@ impl ClaudeCliProvider {
 
         debug!("claude-cli prompt length: {} chars", prompt.len());
 
+        let effort = request.effort_or(self.effort.as_deref());
+
         let working_directory = tempfile::tempdir().map_err(ClaudeCliError::WorkingDirectory)?;
         let mut command = Command::new(binary);
         command
-            .args(build_claude_args(&self.model, self.effort.as_deref()))
+            .args(build_claude_args(&self.model, effort))
             .current_dir(working_directory.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
