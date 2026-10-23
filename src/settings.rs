@@ -16,7 +16,7 @@ use config::{Config, ConfigError, Environment, File};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-pub use crate::ai::{EffortMode, model_supports_effort};
+pub use crate::ai::{EffortMode, model_supports_long_decode};
 use crate::project::ProjectId;
 
 /// The name of the file holding the server's local operator token.
@@ -376,12 +376,12 @@ pub(crate) fn default_gemini_max_tokens() -> u32 {
 /// `[ai.vertex]` nor `[ai.gemini]` sets `max_tokens`.
 ///
 /// Models with Long Decodes v2 continuation (matched via
-/// [`model_supports_effort`]) default to `131_072` so multi-hop continuation
+/// [`model_supports_long_decode`]) default to `131_072` so multi-hop continuation
 /// is enabled. All other Gemini models default to `0` (omitting
 /// `generationConfig.maxOutputTokens` so the backend uses the model's native
 /// output ceiling instead of rejecting a 128k value with 400 INVALID_ARGUMENT).
 pub(crate) fn default_gemini_max_tokens_for_model(model: &str) -> u32 {
-    if model_supports_effort(model) {
+    if model_supports_long_decode(model) {
         default_gemini_max_tokens()
     } else {
         0
@@ -991,29 +991,14 @@ pub struct ReviewSettings {
     /// Conservative default; set to 0 to disable.
     #[serde(default = "default_max_total_output_tokens")]
     pub max_total_output_tokens: usize,
-    /// Reasoning effort mode (`"mid"`, `"high"`, or `"dynamic"`) for models
-    /// that support configurable effort levels (currently Argon 4). Defaults
-    /// to `"mid"` when the model supports effort levels and is ignored
-    /// otherwise.
+    /// Reasoning effort mode (`"mid"`, `"high"`, or `"dynamic"`) for the
+    /// review stages, whatever the model. Each stage's level then replaces
+    /// the provider's configured effort for that stage's requests. Unset, the
+    /// stages carry no level and the provider's own setting applies.
     #[serde(default)]
     pub effort: Option<EffortMode>,
     #[serde(skip)]
     pub stages: Option<Vec<String>>,
-}
-
-impl ReviewSettings {
-    /// Resolves the effective reasoning effort mode for `model`.
-    ///
-    /// Returns `None` when `model` does not support configurable effort levels
-    /// (currently only Argon 4 supports it). When `model` supports effort
-    /// levels, returns the configured `effort` or defaults to
-    /// [`EffortMode::Mid`].
-    pub fn effective_effort(&self, model: &str) -> Option<EffortMode> {
-        if !model_supports_effort(model) {
-            return None;
-        }
-        Some(self.effort.unwrap_or(EffortMode::Mid))
-    }
 }
 
 fn default_max_total_tokens() -> usize {
@@ -1205,16 +1190,6 @@ impl Settings {
             self.review.stages = Some(stages);
         }
         changed
-    }
-
-    /// Resolves the effective reasoning effort mode for this configuration.
-    ///
-    /// Returns `None` when `self.ai.model` does not support configurable
-    /// effort levels (currently only Argon 4 supports it). When the model
-    /// supports effort levels, resolves `[review] effort` and defaults to
-    /// [`EffortMode::Mid`].
-    pub fn effective_effort(&self) -> Option<EffortMode> {
-        self.review.effective_effort(&self.ai.model)
     }
 
     /// Refuses a configuration that names no database, no repository, or no
@@ -2039,56 +2014,19 @@ mod tests {
     }
 
     #[test]
-    fn test_effort_mode_is_gated_on_model_and_defaults_to_mid_for_argon() {
-        let mut review: ReviewSettings = toml::from_str("concurrency = 1").unwrap();
+    fn test_effort_mode_is_unset_unless_configured() {
+        let review: ReviewSettings = toml::from_str("concurrency = 1").unwrap();
         assert_eq!(review.effort, None);
 
-        // Non-Argon models do not support configurable effort levels.
-        assert_eq!(review.effective_effort("gemini-3.1-pro-preview"), None);
-        assert_eq!(review.effective_effort("claude-sonnet-4-6"), None);
-
-        // Argon models default to EffortMode::Mid when effort is unset.
-        assert_eq!(
-            review.effective_effort("gemini-4-argon"),
-            Some(EffortMode::Mid)
-        );
-        assert_eq!(
-            review.effective_effort("Gemini-Argon-Preview"),
-            Some(EffortMode::Mid)
-        );
-
-        // Explicit "high" and "dynamic" are respected on Argon and ignored on non-Argon.
-        review.effort = Some(EffortMode::High);
-        assert_eq!(
-            review.effective_effort("gemini-4-argon"),
-            Some(EffortMode::High)
-        );
-        assert_eq!(review.effective_effort("gemini-3.1-pro-preview"), None);
-
-        let dynamic: ReviewSettings =
-            toml::from_str("concurrency = 1\neffort = \"dynamic\"").unwrap();
-        assert_eq!(
-            dynamic.effective_effort("gemini-4-argon"),
-            Some(EffortMode::Dynamic)
-        );
-
-        let mid_alias: ReviewSettings =
-            toml::from_str("concurrency = 1\neffort = \"medium\"").unwrap();
-        assert_eq!(mid_alias.effort, Some(EffortMode::Mid));
-
-        // Settings::effective_effort delegates to review.effective_effort(&ai.model).
-        let mut settings = Settings::new().unwrap();
-        settings.ai.model = "gemini-4-argon".to_string();
-        settings.review.effort = None;
-        assert_eq!(settings.effective_effort(), Some(EffortMode::Mid));
-
-        settings.review.effort = Some(EffortMode::Dynamic);
-        assert_eq!(settings.effective_effort(), Some(EffortMode::Dynamic));
-
-        settings.review.effort = Some(EffortMode::High);
-        assert_eq!(settings.effective_effort(), Some(EffortMode::High));
-
-        settings.ai.model = "gemini-3.1-pro-preview".to_string();
-        assert_eq!(settings.effective_effort(), None);
+        for (value, mode) in [
+            ("mid", EffortMode::Mid),
+            ("medium", EffortMode::Mid),
+            ("high", EffortMode::High),
+            ("dynamic", EffortMode::Dynamic),
+        ] {
+            let review: ReviewSettings =
+                toml::from_str(&format!("concurrency = 1\neffort = \"{value}\"")).unwrap();
+            assert_eq!(review.effort, Some(mode), "{value}");
+        }
     }
 }

@@ -606,7 +606,7 @@ pub async fn run_benchmark(
         project: options.project.as_str().to_string(),
         ai_provider: settings.ai.provider.clone(),
         model: settings.ai.model.clone(),
-        effort: settings.effective_effort().map(|e| e.as_str().to_string()),
+        effort: settings.review.effort.map(|e| e.as_str().to_string()),
         concurrency: settings.review.concurrency,
         report_preexisting,
         analyze_only: options.analyze_only,

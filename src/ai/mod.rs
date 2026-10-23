@@ -166,14 +166,11 @@ impl ReasoningEffort {
     }
 }
 
-/// Configurable reasoning effort mode for models that support effort levels
-/// (currently Argon 4).
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
+/// How a review spreads reasoning effort across its stages.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum EffortMode {
-    /// Uniform `Medium` reasoning effort across all review stages (default
-    /// when the model supports effort levels).
-    #[default]
+    /// Uniform `Medium` reasoning effort across all review stages.
     #[serde(alias = "medium")]
     Mid,
     /// Uniform `High` reasoning effort across all review stages.
@@ -230,10 +227,11 @@ impl std::fmt::Display for EffortMode {
     }
 }
 
-/// Returns whether `model` supports configurable reasoning effort levels.
+/// Returns whether `model` continues an answer past the per-request output
+/// limit (Gemini's long decode), which its default `max_tokens` has to allow.
 ///
-/// Currently only Argon 4 (`gemini-4-argon`) supports this setting.
-pub fn model_supports_effort(model: &str) -> bool {
+/// Currently only Argon 4 (`gemini-4-argon`) does.
+pub fn model_supports_long_decode(model: &str) -> bool {
     model.to_ascii_lowercase().contains("argon")
 }
 

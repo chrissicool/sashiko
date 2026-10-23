@@ -324,7 +324,7 @@ pass.
 | `email_policy_path` | string | `"projects/linux/mailing_lists.toml"` | Path to the per-project mailing list and email delivery policy file (`projects/<project>/mailing_lists.toml`). |
 | `max_total_tokens` | integer | `5000000` | Maximum cumulative uncached tokens (input + output) per review. Cached tokens are excluded. Set to 0 to disable. |
 | `max_total_output_tokens` | integer | `500000` | Maximum cumulative output tokens per review. Set to 0 to disable. |
-| `effort` | string | `"mid"` (Argon 4) | Reasoning effort mode for models that support configurable effort levels (currently Argon 4; ignored for other models). Options: `"mid"` (uniform `Medium` effort across all stages, default), `"high"` (uniform `High` effort across all stages), or `"dynamic"` (`Low` for screening/planning/reporting, planned `Medium` or `High` per analysis stage, `High` for verification stages). Can also be set via `--effort`. |
+| `effort` | string | -- | Reasoning effort mode for the review stages, whatever the model. Each stage's level replaces the provider's own effort setting (`[ai.claude]`, `[ai.claude_cli]`, `[ai.codex_cli]` or `[ai.openai_compat]` `effort`, or Gemini's `thinking_level`) for that stage's requests; providers without one ignore it. Unset, the stages carry no level and the provider's own setting applies. Options: `"mid"` (uniform `Medium` effort across all stages), `"high"` (uniform `High` effort across all stages), or `"dynamic"` (`Low` for screening/planning/reporting, planned `Medium` or `High` per analysis stage, `High` for verification stages). Can also be set via `--effort`. |
 
 ### `[linux_bug]`
 
