@@ -2,15 +2,24 @@ use anyhow::Result;
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 use super::{AiProvider, AiRequest, AiResponse, CacheStats, ProviderCapabilities, get_log_prefix};
 
+/// How often a running daemon sweeps the cache: dropping what has expired and
+/// giving the space back to the file system.
+const MAINTENANCE_INTERVAL_SECS: i64 = 86_400;
+
+/// Free space below this is not worth a rewrite of the file.
+const VACUUM_MIN_FREE_BYTES: i64 = 1 << 20;
+
 pub struct CachingAiProvider {
     inner: Arc<dyn AiProvider>,
     conn: libsql::Connection,
+    ttl_days: u64,
+    last_maintenance: AtomicI64,
     session_start: i64,
     hits_this: AtomicU64,
     hits_prev: AtomicU64,
@@ -47,26 +56,6 @@ impl CachingAiProvider {
         )
         .await?;
 
-        let cutoff = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64
-            - ttl_days as i64 * 86400;
-        let result = conn
-            .execute(
-                "DELETE FROM response_cache WHERE created_at < ?",
-                libsql::params![cutoff],
-            )
-            .await;
-        if let Ok(reaped) = result
-            && reaped > 0
-        {
-            info!(
-                "Response cache: reaped {} expired entries (>{} days old)",
-                reaped, ttl_days
-            );
-        }
-
         let session_start = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -74,15 +63,105 @@ impl CachingAiProvider {
 
         info!("Response cache enabled ({})", cache_path);
 
-        Ok(Self {
+        let provider = Self {
             inner,
             conn,
+            ttl_days,
+            last_maintenance: AtomicI64::new(session_start),
             session_start,
             hits_this: AtomicU64::new(0),
             hits_prev: AtomicU64::new(0),
             tokens_saved_this: AtomicU64::new(0),
             tokens_saved_prev: AtomicU64::new(0),
-        })
+        };
+        provider.maintain().await;
+        Ok(provider)
+    }
+
+    /// Drops the entries past their TTL, then compacts the file if enough of
+    /// it is free. A delete only puts pages on SQLite's free list; without the
+    /// vacuum the file keeps the size of the largest the cache ever was. Nothing
+    /// here is fatal: a cache that could not be tidied still answers.
+    async fn maintain(&self) {
+        // The cache is a file of its own, not the Database whose writes are
+        // serialized, so writing to its connection directly is right here.
+        let cache = &self.conn;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let cutoff = now - self.ttl_days as i64 * 86400;
+        match cache
+            .execute(
+                "DELETE FROM response_cache WHERE created_at < ?",
+                libsql::params![cutoff],
+            )
+            .await
+        {
+            Ok(reaped) if reaped > 0 => info!(
+                "Response cache: reaped {} expired entries (>{} days old)",
+                reaped, self.ttl_days
+            ),
+            Ok(_) => {}
+            Err(e) => warn!("Response cache: could not reap expired entries: {:#}", e),
+        }
+
+        match self.reclaimable_bytes().await {
+            Ok((free, total)) if free >= VACUUM_MIN_FREE_BYTES && free * 4 >= total => {
+                match cache.execute_batch("VACUUM;").await {
+                    Ok(_) => {
+                        // The rewrite lands in the write-ahead log first; fold it
+                        // into the file and shrink the log, or the space saved
+                        // sits in a different file.
+                        let _ = cache.query("PRAGMA wal_checkpoint(TRUNCATE);", ()).await;
+                        info!(
+                            "Response cache: vacuumed, {} of {} bytes were free",
+                            free, total
+                        );
+                    }
+                    Err(e) => warn!("Response cache: vacuum failed: {:#}", e),
+                }
+            }
+            Ok(_) => {}
+            Err(e) => warn!("Response cache: could not measure free space: {:#}", e),
+        }
+    }
+
+    /// Free and total bytes of the cache file, as SQLite counts its pages.
+    async fn reclaimable_bytes(&self) -> Result<(i64, i64)> {
+        let pragma = |name: &'static str| {
+            let conn = self.conn.clone();
+            async move {
+                let mut rows = conn.query(&format!("PRAGMA {name};"), ()).await?;
+                let row = rows
+                    .next()
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("PRAGMA {name} returned no row"))?;
+                Ok::<i64, anyhow::Error>(row.get::<i64>(0)?)
+            }
+        };
+        let page_size = pragma("page_size").await?;
+        let free = pragma("freelist_count").await? * page_size;
+        let total = pragma("page_count").await? * page_size;
+        Ok((free, total))
+    }
+
+    /// Runs `maintain` if a day has passed since the last time, for a daemon
+    /// that outlives the startup sweep. Only one caller wins the day.
+    async fn maintain_if_due(&self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let last = self.last_maintenance.load(Ordering::Relaxed);
+        if now - last >= MAINTENANCE_INTERVAL_SECS
+            && self
+                .last_maintenance
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.maintain().await;
+        }
     }
 
     fn compute_cache_key(&self, request: &AiRequest) -> String {
@@ -189,6 +268,7 @@ impl AiProvider for CachingAiProvider {
             )
             .await;
 
+        self.maintain_if_due().await;
         Ok(resp)
     }
 
@@ -268,6 +348,84 @@ mod tests {
                 context_window_size: 100_000,
             }
         }
+    }
+
+    /// Rows past the TTL are dropped and the space they held is returned, not
+    /// left on SQLite's free list for a file that never shrinks.
+    #[tokio::test]
+    async fn test_maintenance_reaps_expired_entries_and_shrinks_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("response_cache.db");
+        let inner = Arc::new(RejectedAnswers {
+            calls: Arc::new(AtomicU64::new(0)),
+        });
+        let cache = CachingAiProvider::new(inner, path.to_str().unwrap(), 7)
+            .await
+            .unwrap();
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let blob = "x".repeat(100_000);
+        for i in 0..80 {
+            // Forty entries long expired, forty fresh.
+            let created_at = if i < 40 { now - 30 * 86400 } else { now };
+            cache
+                .conn
+                .execute(
+                    "INSERT INTO response_cache (request_hash, provider, model, request_json, response_json, tokens_saved, created_at) VALUES (?, 'mock', 'mock', ?, ?, 0, ?)",
+                    libsql::params![format!("hash-{i}"), blob.clone(), blob.clone(), created_at],
+                )
+                .await
+                .unwrap();
+        }
+        let (_, before) = cache.reclaimable_bytes().await.unwrap();
+
+        cache.maintain().await;
+
+        let (free, after) = cache.reclaimable_bytes().await.unwrap();
+        assert_eq!(free, 0, "the free pages are given back");
+        assert!(
+            after < before * 3 / 4,
+            "{after} bytes after, {before} before"
+        );
+        let mut rows = cache
+            .conn
+            .query("SELECT COUNT(*) FROM response_cache", ())
+            .await
+            .unwrap();
+        let left: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(left, 40, "only the fresh entries stay");
+
+        // Nothing to give back, nothing to rewrite.
+        cache.maintain().await;
+        assert_eq!(cache.reclaimable_bytes().await.unwrap().1, after);
+    }
+
+    #[tokio::test]
+    async fn test_a_small_free_list_is_not_worth_a_vacuum() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("response_cache.db");
+        let inner = Arc::new(RejectedAnswers {
+            calls: Arc::new(AtomicU64::new(0)),
+        });
+        let cache = CachingAiProvider::new(inner, path.to_str().unwrap(), 7)
+            .await
+            .unwrap();
+        let blob = "x".repeat(50_000);
+        cache
+            .conn
+            .execute(
+                "INSERT INTO response_cache (request_hash, provider, model, request_json, response_json, tokens_saved, created_at) VALUES ('old', 'mock', 'mock', ?, ?, 0, 1)",
+                libsql::params![blob.clone(), blob],
+            )
+            .await
+            .unwrap();
+        cache.maintain().await;
+        // The entry is gone, but 100 KB of free pages stays below the floor.
+        let (free, _) = cache.reclaimable_bytes().await.unwrap();
+        assert!(free > 0 && free < VACUUM_MIN_FREE_BYTES, "{free}");
     }
 
     struct JsonSession;
