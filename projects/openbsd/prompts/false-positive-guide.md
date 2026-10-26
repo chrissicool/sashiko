@@ -42,6 +42,12 @@ to in the source.
   its man page. Do not infer what it accepts from its name: a lookup that takes
   an address may well accept any address inside a range rather than the exact
   base of one.
+- Do not report that an API lacks something its man page promises, such as
+  `strlcpy(9)` leaving the destination terminated whenever the size is nonzero,
+  unless you can quote the implementation that defeats the promise. A callee's
+  documented guarantee holds for every caller: finding a caller that does not
+  check for it is not evidence that the guarantee fails, and a missing
+  defensive check at the call site is not a bug.
 - A newly added `KASSERT(9)` or `panic(9)` that states an invariant every
   in-tree caller already satisfies is not a denial of service on its own. Report
   it only when you can name a caller that reaches it with untrusted, remote, or

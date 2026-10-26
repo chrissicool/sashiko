@@ -56,6 +56,19 @@ the actual code path before reporting.
   through `SMR_PTR_GET()` (or a write-side lock + `SMR_PTR_GET_LOCKED()`), not a
   bare dereference.
 
+## Claims and review feedback
+- When a commit message or comment says "all paths", "only once", "exclusively",
+  "never" or "always", verify it by enumerating every hit (`git_grep` the
+  symbol and account for each one), not by sampling the sites the diff touches.
+  Every hit it fails to account for is either a bug or a correction the message
+  needs.
+- Code changed in response to review feedback gets the same scrutiny as new
+  code. When the message or the thread shows that a reviewer suggested the exact
+  change, verify the suggestion's semantics independently. Suggestions are often
+  made by name ("there is a simpler helper for that") and silently change
+  locking, sleeping or error behaviour. A reviewer's endorsement is not proof
+  that the change is correct.
+
 ## Assertions
 - `KASSERT(9)` is compiled into shipped kernels: GENERIC carries
   `option DIAGNOSTIC`. An assertion that untrusted, remote, or unprivileged
