@@ -747,9 +747,10 @@ Aggregated Dismissed Concerns:
 {{{{aggregated_dismissed_concerns}}}}
 
 Return ONLY a JSON object with 'findings', 'hard_cases', and 'dismissed_concerns' arrays.
-- Each object in 'findings' (Category 1a: well-justified concerns) MUST use the keys: {FINDING_FIELDS}, and may include "stages" (array of stage names) and "prompts" (array of prompt files).
-- Each object in 'hard_cases' (Category 2: speculative or contested) MUST use the keys: "type", "description", "estimated_severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "signal_reason" ("mixed_signals", "speculative_concern", "speculative_dismissal", "series_interaction", or "other"), "concern_arguments" (consolidated arguments for why the bug can occur), "dismissal_arguments" (consolidated arguments and snippets from any competing or standalone dismissal, or "" if none), "verification_question" (the specific code question post-verification must answer with tools), "preexisting" (boolean), and "locations" (array of location objects), and may include "stages" and "prompts".
-- Each object in 'dismissed_concerns' (Category 1b: well-justified dismissals) MUST use the keys: "type", "description", "reasoning", and "locations", and may include "stages" and "prompts".
+- LINEAGE REQUIREMENT ('source_ids'): Every input item in Aggregated Concerns has an "id" ("C1", "C2", ...) and every input item in Aggregated Dismissed Concerns has an "id" ("D1", "D2", ...). Every output object across 'findings', 'hard_cases', and 'dismissed_concerns' MUST include a non-empty "source_ids" array listing the exact input "id" string(s) merged into that item (e.g. ["C1", "D2"]). Every input "id" (all C* and D* IDs) MUST appear in at least one output item's "source_ids". Category 1a 'findings' may ONLY reference C* IDs (any contested C* + D* or promoted D* must go to 'hard_cases'), and Category 1b 'dismissed_concerns' may ONLY reference D* IDs (never C* IDs).
+- Each object in 'findings' (Category 1a: well-justified concerns) MUST use the keys: "source_ids" (non-empty array of C* input IDs), {FINDING_FIELDS}, and may include "stages" (array of stage names) and "prompts" (array of prompt files).
+- Each object in 'hard_cases' (Category 2: speculative or contested) MUST use the keys: "source_ids" (non-empty array of input IDs), "type", "description", "estimated_severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "signal_reason" ("mixed_signals", "speculative_concern", "speculative_dismissal", "series_interaction", or "other"), "concern_arguments" (consolidated arguments for why the bug can occur), "dismissal_arguments" (consolidated arguments and snippets from any competing or standalone dismissal, or "" if none), "verification_question" (the specific code question post-verification must answer with tools), "preexisting" (boolean), and "locations" (array of location objects), and may include "stages" and "prompts".
+- Each object in 'dismissed_concerns' (Category 1b: well-justified dismissals) MUST use the keys: "source_ids" (non-empty array of D* input IDs), "type", "description", "reasoning", and "locations", and may include "stages" and "prompts".
 Do not invent line numbers; use null when exact values are unknown."#
         ))
         .include_file("stages/verification.md")
@@ -835,8 +836,9 @@ Candidate Hard Case(s) to Verify:
 {{{{candidate_hard_cases}}}}
 
 Return ONLY a JSON object with 'findings' and 'dismissed_concerns' arrays. Every candidate in this batch MUST be accounted for in either 'findings' (if validated) or 'dismissed_concerns' (if disproved by concrete code); never return both arrays empty.
-- Each object in 'findings' MUST use: {FINDING_FIELDS}.
-- Each object in 'dismissed_concerns' MUST use: "description" (the candidate issue that was disproved), "reasoning" (step-by-step explanation of how the inspected code disproves the candidate), and "locations" (a non-empty array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters, quoting the verbatim disproving code).
+- LINEAGE REQUIREMENT ('source_ids'): Each candidate hard case in this batch has an "id" (e.g. "H1"). Every object in 'findings' and 'dismissed_concerns' MUST include a non-empty "source_ids" array listing the candidate "id"(s) from this batch that it resolves (e.g. ["H1"]), and every candidate "id" in this batch must be accounted for.
+- Each object in 'findings' MUST use: "source_ids" (non-empty array of candidate H* IDs from this batch), {FINDING_FIELDS}.
+- Each object in 'dismissed_concerns' MUST use: "source_ids" (non-empty array of candidate H* IDs from this batch), "description" (the candidate issue that was disproved), "reasoning" (step-by-step explanation of how the inspected code disproves the candidate), and "locations" (a non-empty array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters, quoting the verbatim disproving code).
 Do not invent line numbers; use null when exact values are unknown."#
         ))
         .include_file("stages/post-verification.md")
@@ -1075,6 +1077,48 @@ mod tests {
             "tool-usage guidance is stated twice: it belongs to the harness and \
              lives in this template, so a prompt set must not restate it"
         );
+    }
+
+    /// The verification validators refuse an item without `source_ids` and an
+    /// input ID nobody accounts for, so a prompt that never asks for them has
+    /// every review rejected until the retry feedback names the field. The
+    /// requirement has to reach the model, in each collection it applies to.
+    #[tokio::test]
+    async fn test_verification_prompts_ask_for_source_ids() {
+        let base =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("projects/openbsd/prompts");
+        let state = OpenBsdPatchReviewState::default();
+
+        let verification = verification_stage(20, 0.0)
+            .user_prompt
+            .render_for_model(&state, &base)
+            .await
+            .expect("verification prompt renders");
+        assert!(
+            verification.contains("LINEAGE REQUIREMENT"),
+            "{verification}"
+        );
+        for collection in ["'findings'", "'hard_cases'", "'dismissed_concerns'"] {
+            let line = verification
+                .lines()
+                .find(|l| l.starts_with(&format!("- Each object in {collection}")))
+                .unwrap_or_else(|| panic!("no key list for {collection}"));
+            assert!(line.contains("\"source_ids\""), "{line}");
+        }
+
+        let post = post_verification_stage(POST_VERIFICATION_STAGE_NAMES[0], Vec::new(), 20, 0.0)
+            .user_prompt
+            .render_for_model(&state, &base)
+            .await
+            .expect("post-verification prompt renders");
+        assert!(post.contains("LINEAGE REQUIREMENT"), "{post}");
+        for collection in ["'findings'", "'dismissed_concerns'"] {
+            let line = post
+                .lines()
+                .find(|l| l.starts_with(&format!("- Each object in {collection}")))
+                .unwrap_or_else(|| panic!("no key list for {collection}"));
+            assert!(line.contains("\"source_ids\""), "{line}");
+        }
     }
 
     #[test]
