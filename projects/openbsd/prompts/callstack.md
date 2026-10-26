@@ -33,6 +33,14 @@ reporting a NULL dereference or a context (sleeping/spl/lock) violation.
   assignments and the callers.
 - For driver code, whether the hardware/softc state is initialised before the
   path runs (attach vs. interrupt vs. detach ordering).
+- For any suspected race, including a use-after-free where the other side is a
+  timeout, a task, an interrupt handler or an SMR callback:
+  - Load `subsystem/locking.md` if it is not already loaded, and follow its
+    method.
+  - For a suspected use-after-free, complete "Object lifetime and use-after-free",
+    including the reference budget, before reporting.
+  - Output: "subsystem/locking.md loaded: [ y / n ]", plus the `budget:` line for
+    a suspected use-after-free.
 
 ## How to look
 - Prefer following `funcA() -> funcB()` chains and reading the specific

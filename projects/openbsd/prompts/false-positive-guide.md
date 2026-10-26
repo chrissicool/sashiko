@@ -13,6 +13,12 @@ to in the source.
   run with `KERNEL_LOCK` held.
 - Only interrupt routines flagged as `IPL_MPSAFE` do not run with `KERNEL_LOCK`
   held. There are similar `*MPSAFE` flags for other subsystems.
+- Reference budget (MANDATORY). For any suspected use-after-free where the other
+  side is a `timeout(9)` or `task(9)` handler, an interrupt handler or an
+  `smr_call(9)` callback, apply "Object lifetime and use-after-free" in
+  `subsystem/locking.md`, loading it if it is not already loaded. Required
+  output: the `budget:` line defined there. If analysis already produced one,
+  check it against the code again rather than copying it.
 - Do not flag a `PR_WAITOK`/`M_WAITOK` allocation as "sleeping in atomic
   context" unless you have established the call actually runs at raised spl, in
   an interrupt handler, or while holding a mutex.
