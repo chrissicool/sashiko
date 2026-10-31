@@ -737,6 +737,7 @@ fn is_non_linux_project_url(url: &str) -> bool {
         || lower.contains("qemu-project/qemu")
         || lower.contains("qemu.org")
         || lower.contains("qemu/qemu")
+        || lower.contains("openbsd")
         || lower.contains("sashiko")
 }
 
@@ -1754,6 +1755,35 @@ F: patterns/
                 name: "origin".to_string(),
                 branch: Some("master".to_string()),
             }]
+        );
+
+        // A bare release prefix is how a Linux stable backport is marked, and
+        // also how an OpenBSD diff names the release it was made against.
+        let openbsd_registry = BaselineRegistry {
+            entries: Vec::new(),
+            remote_map: HashMap::new(),
+            custom_remotes: None,
+            repo_path: repo_path.to_path_buf(),
+            mainline_remote: Some((
+                "https://github.com/openbsd/src.git".to_string(),
+                "origin".to_string(),
+            )),
+        };
+
+        let openbsd_candidates = openbsd_registry
+            .resolve_candidates(&[], "[PATCH 7.8] uvm: fix", None)
+            .await;
+        // The local tag the prefix names is still tried; it costs no fetch.
+        assert_eq!(
+            openbsd_candidates,
+            vec![
+                BaselineResolution::LocalRef("v7.8".to_string()),
+                BaselineResolution::RemoteTarget {
+                    url: "https://github.com/openbsd/src.git".to_string(),
+                    name: "origin".to_string(),
+                    branch: Some("master".to_string()),
+                },
+            ]
         );
     }
 
