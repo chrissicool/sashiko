@@ -20,8 +20,31 @@ use crate::toolbox::utils::{format_git_grep_output, validate_path};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use std::sync::OnceLock;
 
 pub struct GitGrepTool;
+
+/// Whether this host's git can run `git grep -P`.
+///
+/// Perl-compatible regular expressions are an optional build feature of git,
+/// and a git built without them refuses `-P` outright. There the tool passes
+/// patterns as POSIX extended regular expressions and tells the model so. The
+/// answer cannot change while the process runs, so it is worked out once.
+fn git_has_pcre() -> bool {
+    static HAS_PCRE: OnceLock<bool> = OnceLock::new();
+    *HAS_PCRE.get_or_init(|| {
+        // git compiles the pattern before it looks at a file, so an empty
+        // directory is enough: a git with PCRE finds nothing and exits 1, one
+        // without it fails before searching.
+        let Ok(empty) = tempfile::tempdir() else {
+            return false;
+        };
+        crate::git_cmd::in_dir(empty.path())
+            .args(["grep", "--no-index", "-q", "-P", "-e", "x"])
+            .output()
+            .is_ok_and(|output| output.status.code() == Some(1))
+    })
+}
 
 #[async_trait]
 impl LlmTool<SashikoToolContext> for GitGrepTool {
@@ -34,15 +57,26 @@ impl LlmTool<SashikoToolContext> for GitGrepTool {
     }
 
     fn parameters(&self) -> Value {
+        let (pattern_description, is_literal_description) = if git_has_pcre() {
+            (
+                "Regex or literal pattern to search.",
+                "If true, treats pattern as literal fixed string rather than PCRE regex.",
+            )
+        } else {
+            (
+                "Pattern to search, or a literal string if is_literal is true. Only POSIX extended regular expressions (ERE) are supported.",
+                "If true, treats pattern as literal fixed string rather than POSIX extended regex.",
+            )
+        };
         json!({
             "type": "object",
             "properties": {
                 "revision": { "type": "string", "description": "Git commit SHA or reference to search at." },
-                "pattern": { "type": "string", "description": "Regex or literal pattern to search." },
+                "pattern": { "type": "string", "description": pattern_description },
                 "path": { "type": "string", "description": "Relative paths or pathspecs to restrict search (optional). Highly recommended to scope to the modified subsystem directory (e.g. 'net/mptcp/') to avoid extremely expensive tree-wide searches." },
                 "context_lines": { "type": "integer", "description": "Context lines to show. Default: 0." },
                 "count_only": { "type": "boolean", "description": "If true, returns file names and match counts only. Recommended for cheap broad searches." },
-                "is_literal": { "type": "boolean", "description": "If true, treats pattern as literal fixed string rather than PCRE regex." }
+                "is_literal": { "type": "boolean", "description": is_literal_description }
             },
             "required": ["revision", "pattern"]
         })
@@ -96,8 +130,10 @@ impl LlmTool<SashikoToolContext> for GitGrepTool {
 
         if is_literal {
             cmd.arg("-F");
-        } else {
+        } else if git_has_pcre() {
             cmd.arg("-P");
+        } else {
+            cmd.arg("-E");
         }
 
         cmd.arg("-e").arg(pattern).arg(revision);
