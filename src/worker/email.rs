@@ -201,9 +201,18 @@ impl EmailWorker {
             .port
             .ok_or_else(|| anyhow::anyhow!("smtp.port is not configured"))?;
 
-        let mut mailer_builder = AsyncSmtpTransport::<Tokio1Executor>::relay(server)?
-            .port(port)
-            .timeout(Some(SMTP_SOCKET_TIMEOUT));
+        #[cfg(not(native_tls))]
+        let mailer_builder = AsyncSmtpTransport::<Tokio1Executor>::relay(server)?;
+        // lettre prefers rustls when both are linked, so ask for the
+        // platform's library by name.
+        #[cfg(native_tls)]
+        let mailer_builder = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(server).tls(
+            lettre::transport::smtp::client::Tls::Wrapper(
+                lettre::transport::smtp::client::TlsParameters::builder(server.to_string())
+                    .build_native()?,
+            ),
+        );
+        let mut mailer_builder = mailer_builder.port(port).timeout(Some(SMTP_SOCKET_TIMEOUT));
 
         if let (Some(user), Some(pass)) = (&settings.username, &settings.password) {
             let creds = Credentials::new(user.to_string(), pass.to_string());

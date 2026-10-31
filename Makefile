@@ -1,6 +1,6 @@
 # Sashiko Development and CI Tasks
 
-.PHONY: help build fmt lint lint-local lint-local-cache test clean
+.PHONY: help build fmt lint lint-rustls lint-local lint-local-cache test clean
 .PHONY: check-pr check-all sob check-db-invariants repo
 
 # Default target
@@ -14,6 +14,7 @@ help:
 	@echo "    build               - Build release binary"
 	@echo "    fmt                 - Auto-format Rust code"
 	@echo "    lint                - Run all linters (clippy, fmt --check, yamllint)"
+	@echo "    lint-rustls         - Run clippy on the default feature set (rustls TLS)"
 	@echo "    lint-local          - Run clippy on local-review profile (no cache)"
 	@echo "    lint-local-cache    - Run clippy on local-review profile with cache"
 	@echo "    test                - Run unit and integration tests"
@@ -43,6 +44,11 @@ lint:
 	@cargo clippy --all-targets --all-features -- -D warnings
 	@cargo fmt --all -- --check
 	@yamllint .
+
+# Run clippy on the default feature set. --all-features turns on native-tls,
+# which compiles out the rustls code a default build uses.
+lint-rustls:
+	@cargo clippy --all-targets -- -D warnings
 
 # Run clippy on local-review feature profile (without cache)
 lint-local:
@@ -86,6 +92,7 @@ check-pr: sob
 		echo "Running Rust fmt, clippy, and tests..."; \
 		cargo fmt --all -- --check; \
 		cargo clippy --all-targets --all-features -- -D warnings; \
+		cargo clippy --all-targets -- -D warnings; \
 		cargo clippy --all-targets --no-default-features -- -D warnings; \
 		cargo clippy --all-targets --no-default-features --features cache -- -D warnings; \
 		cargo test --all-features; \
@@ -94,7 +101,7 @@ check-pr: sob
 	fi
 
 # Run the complete check suite unconditionally
-check-all: sob lint lint-local lint-local-cache test check-db-invariants
+check-all: sob lint lint-rustls lint-local lint-local-cache test check-db-invariants
 
 # Check Signed-off-by tags (default: HEAD~1..HEAD)
 sob:

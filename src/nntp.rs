@@ -18,19 +18,36 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
+#[cfg(native_tls)]
+use tokio_native_tls::{TlsConnector, TlsStream};
+#[cfg(not(native_tls))]
 use tokio_rustls::TlsConnector;
+#[cfg(not(native_tls))]
 use tokio_rustls::client::TlsStream;
+#[cfg(not(native_tls))]
 use tokio_rustls::rustls::crypto::CryptoProvider;
+#[cfg(not(native_tls))]
 use tokio_rustls::rustls::pki_types::ServerName;
+#[cfg(not(native_tls))]
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_util::either::Either;
-use tracing::{debug, info, warn};
+#[cfg(not(native_tls))]
+use tracing::warn;
+use tracing::{debug, info};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The command methods read and write through this, so plaintext and
 /// NNTPS differ only in how `connect` builds the stream.
 type NntpStream = Either<TcpStream, TlsStream<TcpStream>>;
+
+/// What an NNTPS handshake is made with: a rustls client config, or a
+/// native-tls connector where the platform's TLS library carries every TLS
+/// user.
+#[cfg(not(native_tls))]
+type TlsConfig = Arc<ClientConfig>;
+#[cfg(native_tls)]
+type TlsConfig = Arc<TlsConnector>;
 
 pub struct NntpClient {
     /// Taken during each timed read or write and only restored on
@@ -50,6 +67,7 @@ pub struct GroupInfo {
 }
 
 /// The crypto provider backing every NNTPS handshake.
+#[cfg(not(native_tls))]
 ///
 /// Optional features (such as `bedrock`) can link `ring` alongside
 /// `aws-lc-rs`. With two providers present rustls cannot pick a process
@@ -68,7 +86,8 @@ fn crypto_provider() -> Arc<CryptoProvider> {
 /// once and cached. A failure is not cached. The host trust store can
 /// be populated after this process starts, and a cached error would
 /// fail every later cycle until a restart.
-async fn native_tls_config() -> Result<Arc<ClientConfig>> {
+#[cfg(not(native_tls))]
+async fn native_tls_config() -> Result<TlsConfig> {
     static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
 
     if let Some(config) = CONFIG.get() {
@@ -101,12 +120,51 @@ async fn native_tls_config() -> Result<Arc<ClientConfig>> {
 
 /// The one builder chain for every client config, so the TLS test
 /// exercises the same protocol and provider choices as production.
+#[cfg(not(native_tls))]
 fn client_config(roots: RootCertStore) -> Result<ClientConfig> {
     Ok(ClientConfig::builder_with_provider(crypto_provider())
         .with_safe_default_protocol_versions()
         .map_err(|e| anyhow!("TLS protocol versions rejected: {}", e))?
         .with_root_certificates(roots)
         .with_no_client_auth())
+}
+
+/// Completes the client side of the handshake with `host` on `tcp`.
+#[cfg(not(native_tls))]
+async fn handshake(config: TlsConfig, host: &str, tcp: TcpStream) -> Result<TlsStream<TcpStream>> {
+    let server_name = ServerName::try_from(host.to_string())
+        .map_err(|_| anyhow!("Not a valid TLS server name: {}", host))?;
+    Ok(TlsConnector::from(config).connect(server_name, tcp).await?)
+}
+
+/// Trust anchors come from the host certificate store, which the platform's
+/// TLS library reads itself, so an internal CA is installed by the deployment
+/// rather than named in the config.
+///
+/// The ingestor reconnects every cycle, so a connector is built once and
+/// cached. A failure is not cached, so a later cycle tries again.
+#[cfg(native_tls)]
+async fn native_tls_config() -> Result<TlsConfig> {
+    static CONNECTOR: OnceLock<TlsConfig> = OnceLock::new();
+
+    if let Some(connector) = CONNECTOR.get() {
+        return Ok(connector.clone());
+    }
+
+    let connector = native_tls::TlsConnector::new()
+        .map_err(|e| anyhow!("TLS connector setup failed: {}", e))?;
+    Ok(CONNECTOR
+        .get_or_init(|| Arc::new(TlsConnector::from(connector)))
+        .clone())
+}
+
+/// Completes the client side of the handshake with `host` on `tcp`.
+#[cfg(native_tls)]
+async fn handshake(config: TlsConfig, host: &str, tcp: TcpStream) -> Result<TlsStream<TcpStream>> {
+    config
+        .connect(host, tcp)
+        .await
+        .map_err(|e| anyhow!("TLS handshake failed: {}", e))
 }
 
 impl NntpClient {
@@ -125,7 +183,7 @@ impl NntpClient {
     pub(crate) async fn connect_with_tls_config(
         host: &str,
         port: u16,
-        tls_config: Option<Arc<ClientConfig>>,
+        tls_config: Option<TlsConfig>,
     ) -> Result<Self> {
         let addr = format!("{}:{}", host, port);
         info!(
@@ -144,14 +202,9 @@ impl NntpClient {
 
         let stream = match tls_config {
             Some(config) => {
-                let server_name = ServerName::try_from(host.to_string())
-                    .map_err(|_| anyhow!("Not a valid TLS server name: {}", host))?;
-                let stream = timeout(
-                    DEFAULT_TIMEOUT,
-                    TlsConnector::from(config).connect(server_name, tcp),
-                )
-                .await
-                .map_err(|_| anyhow!("TLS handshake timed out"))??;
+                let stream = timeout(DEFAULT_TIMEOUT, handshake(config, host, tcp))
+                    .await
+                    .map_err(|_| anyhow!("TLS handshake timed out"))??;
                 Either::Right(stream)
             }
             None => Either::Left(tcp),
@@ -349,9 +402,62 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncRead, AsyncWrite};
     use tokio::net::TcpListener;
+    #[cfg(native_tls)]
+    use tokio_native_tls::TlsAcceptor;
+    #[cfg(not(native_tls))]
     use tokio_rustls::TlsAcceptor;
+    #[cfg(not(native_tls))]
     use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    #[cfg(not(native_tls))]
     use tokio_rustls::rustls::{RootCertStore, ServerConfig};
+
+    /// A server acceptor for a freshly minted certificate, and a client
+    /// config that trusts only that certificate, so the handshake exercises
+    /// real verification rather than skipping it.
+    #[cfg(not(native_tls))]
+    fn tls_pair() -> (TlsAcceptor, TlsConfig) {
+        let issued = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert = issued.cert.der().clone();
+        let key =
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(issued.signing_key.serialize_der()));
+
+        let server_config = ServerConfig::builder_with_provider(crypto_provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key)
+            .unwrap();
+
+        let mut roots = RootCertStore::empty();
+        roots.add(cert).unwrap();
+
+        (
+            TlsAcceptor::from(Arc::new(server_config)),
+            Arc::new(client_config(roots).unwrap()),
+        )
+    }
+
+    #[cfg(native_tls)]
+    fn tls_pair() -> (TlsAcceptor, TlsConfig) {
+        let issued = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert_pem = issued.cert.pem();
+        let key_pem = issued.signing_key.serialize_pem();
+
+        let identity = native_tls::Identity::from_pkcs8(cert_pem.as_bytes(), key_pem.as_bytes())
+            .expect("server identity");
+        let acceptor = native_tls::TlsAcceptor::new(identity).expect("TLS acceptor");
+
+        let root = native_tls::Certificate::from_pem(cert_pem.as_bytes()).unwrap();
+        let connector = native_tls::TlsConnector::builder()
+            .add_root_certificate(root)
+            .build()
+            .unwrap();
+
+        (
+            TlsAcceptor::from(acceptor),
+            Arc::new(TlsConnector::from(connector)),
+        )
+    }
 
     #[tokio::test]
     async fn article_preserves_payload_whitespace_and_framing() {
@@ -507,18 +613,7 @@ lf-only \t\n\
 
     #[tokio::test]
     async fn tls_article_round_trip() {
-        let issued = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
-        let cert = issued.cert.der().clone();
-        let key =
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(issued.signing_key.serialize_der()));
-
-        let server_config = ServerConfig::builder_with_provider(crypto_provider())
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert.clone()], key)
-            .unwrap();
-        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let (acceptor, tls_config) = tls_pair();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -529,15 +624,10 @@ lf-only \t\n\
             serve_one(stream).await.unwrap();
         });
 
-        // Trust only the certificate the test server just minted, so the
-        // handshake exercises real verification rather than skipping it.
-        let mut roots = RootCertStore::empty();
-        roots.add(cert).unwrap();
-
         let mut client = NntpClient::connect_with_tls_config(
             &addr.ip().to_string(),
             addr.port(),
-            Some(Arc::new(client_config(roots).unwrap())),
+            Some(tls_config),
         )
         .await
         .expect("TLS connect");

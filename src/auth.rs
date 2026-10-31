@@ -163,6 +163,22 @@ impl AuthUser {
     }
 }
 
+/// Names the backend jsonwebtoken signs and verifies with, before `main`.
+///
+/// Where the platform's TLS library carries every TLS user, jsonwebtoken
+/// links its pure-Rust backend beside aws-lc-rs. With two linked it cannot
+/// pick one by itself: the first key it is handed settles on a backend that
+/// panics, and no choice made after that takes effect. A constructor makes
+/// the choice before any binary or test can reach a key. It only fills a
+/// `OnceLock`, which needs nothing `main` sets up.
+#[cfg(all(feature = "server", native_tls))]
+#[ctor::ctor(unsafe)]
+fn select_jwt_crypto() {
+    let _ = jsonwebtoken::crypto::CryptoProvider::install_default(
+        &jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER,
+    );
+}
+
 #[cfg(feature = "server")]
 pub fn create_token(
     email: &str,

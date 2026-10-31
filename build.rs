@@ -29,6 +29,16 @@ fn main() {
 
     track_git_changes();
 
+    // The platform's TLS library carries every TLS user when the native-tls
+    // feature asks for it, and always on OpenBSD, where Cargo.toml adds it
+    // for the target.
+    println!("cargo:rustc-check-cfg=cfg(native_tls)");
+    if env::var_os("CARGO_FEATURE_NATIVE_TLS").is_some()
+        || env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("openbsd")
+    {
+        println!("cargo:rustc-cfg=native_tls");
+    }
+
     let git_hash = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .output()
