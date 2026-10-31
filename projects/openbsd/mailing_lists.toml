@@ -1,0 +1,12 @@
+# Per-mailing-list configuration for Sashiko (--project openbsd).
+# The lists to ingest are named by [mailing_lists] track in the settings file.
+# No review is mailed to tech@.
+
+[defaults]
+track = false
+embargo_hours = 0
+reply_to = []
+positive_review = "none"
+mute_all = true
+cc = []
+ignored_emails = []

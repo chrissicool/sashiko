@@ -29,6 +29,17 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+/// The OpenBSD project reports a pre-existing problem in the review it came
+/// from instead of recording it in the bug database, so it never reaches the
+/// bug pipeline. The daemon refuses to start with `linux_bug.enabled` set
+/// under that project, which is what keeps every call to this out of reach.
+///
+/// This lives here rather than beside the pipeline because the pipeline is
+/// gated behind the `server` feature and some of its callers are not.
+pub fn openbsd_bug_pipeline_unsupported() -> ! {
+    unreachable!("the OpenBSD project does not use the bug pipeline")
+}
+
 /// The codebase under review.
 ///
 /// Linux is the default so that an existing deployment, which names no project
@@ -41,6 +52,9 @@ pub enum ProjectId {
     Sashiko,
     Gcc,
     Qemu,
+    // clap would spell this "open-bsd"; serde and FromStr read "openbsd".
+    #[value(name = "openbsd")]
+    OpenBsd,
 }
 
 impl ProjectId {
@@ -52,6 +66,7 @@ impl ProjectId {
             ProjectId::Sashiko => "sashiko",
             ProjectId::Gcc => "gcc",
             ProjectId::Qemu => "qemu",
+            ProjectId::OpenBsd => "openbsd",
         }
     }
 
@@ -62,6 +77,7 @@ impl ProjectId {
             ProjectId::Sashiko => "Sashiko",
             ProjectId::Gcc => "GCC",
             ProjectId::Qemu => "QEMU",
+            ProjectId::OpenBsd => "OpenBSD",
         }
     }
 
@@ -80,6 +96,7 @@ impl ProjectId {
             ProjectId::Sashiko => "sashiko",
             ProjectId::Gcc => "gcc",
             ProjectId::Qemu => "qemu",
+            ProjectId::OpenBsd => "openbsd",
         }
     }
 
@@ -91,6 +108,12 @@ impl ProjectId {
         match self {
             ProjectId::Linux => true,
             ProjectId::Sashiko | ProjectId::Gcc | ProjectId::Qemu => false,
+            // OpenBSD has no MAINTAINERS file; the tree is maintained by
+            // developers reachable on tech@ rather than by a per-subsystem
+            // index, so there is nothing to parse and everything downstream
+            // of one -- section attribution, maintainer access -- does not
+            // apply. Access comes from the [server.acl] lists instead.
+            ProjectId::OpenBsd => false,
         }
     }
 
@@ -105,9 +128,22 @@ impl ProjectId {
             ProjectId::Linux => {
                 crate::authority::TrustedBots(&["lkp@intel.com", "*@syzkaller.appspotmail.com"])
             }
-            ProjectId::Sashiko | ProjectId::Gcc | ProjectId::Qemu => {
+            ProjectId::Sashiko | ProjectId::Gcc | ProjectId::Qemu | ProjectId::OpenBsd => {
                 crate::authority::TrustedBots(&[])
             }
+        }
+    }
+
+    /// Whether a pre-existing problem stays in the review it was found in,
+    /// whatever `report_preexisting` was asked for.
+    ///
+    /// OpenBSD has no bug database to hand such a problem to: tech@ is the only
+    /// place a reader will see it, so it goes into the reply, flagged as not the
+    /// submitter's doing.
+    pub fn reports_preexisting_in_review(self) -> bool {
+        match self {
+            ProjectId::Linux | ProjectId::Sashiko | ProjectId::Gcc | ProjectId::Qemu => false,
+            ProjectId::OpenBsd => true,
         }
     }
 
@@ -119,6 +155,7 @@ impl ProjectId {
             ProjectId::Sashiko => "projects/sashiko/mailing_lists.toml",
             ProjectId::Gcc => "projects/gcc/mailing_lists.toml",
             ProjectId::Qemu => "projects/qemu/mailing_lists.toml",
+            ProjectId::OpenBsd => "projects/openbsd/mailing_lists.toml",
         }
     }
 
@@ -128,7 +165,7 @@ impl ProjectId {
     pub fn upstream_maintainers_path(self) -> Option<&'static str> {
         match self {
             ProjectId::Linux => Some("projects/linux/upstream_maintainers.toml"),
-            ProjectId::Sashiko | ProjectId::Gcc | ProjectId::Qemu => None,
+            ProjectId::Sashiko | ProjectId::Gcc | ProjectId::Qemu | ProjectId::OpenBsd => None,
         }
     }
 
@@ -154,6 +191,10 @@ impl ProjectId {
             },
             ProjectId::Qemu => Upstream {
                 url: "https://gitlab.com/qemu-project/qemu.git",
+                seed: Seed::None,
+            },
+            ProjectId::OpenBsd => Upstream {
+                url: "https://github.com/openbsd/src.git",
                 seed: Seed::None,
             },
         }
@@ -201,6 +242,7 @@ impl FromStr for ProjectId {
             "sashiko" => Ok(ProjectId::Sashiko),
             "gcc" => Ok(ProjectId::Gcc),
             "qemu" => Ok(ProjectId::Qemu),
+            "openbsd" => Ok(ProjectId::OpenBsd),
             _ => Err(UnknownProject(s.to_string())),
         }
     }
@@ -239,6 +281,7 @@ impl ProjectId {
         ProjectId::Sashiko,
         ProjectId::Gcc,
         ProjectId::Qemu,
+        ProjectId::OpenBsd,
     ];
 }
 
@@ -270,10 +313,14 @@ mod tests {
         // checked against a match the compiler forces to stay exhaustive.
         for project in ProjectId::ALL {
             match project {
-                ProjectId::Linux | ProjectId::Sashiko | ProjectId::Gcc | ProjectId::Qemu => {}
+                ProjectId::Linux
+                | ProjectId::Sashiko
+                | ProjectId::Gcc
+                | ProjectId::Qemu
+                | ProjectId::OpenBsd => {}
             }
         }
-        assert_eq!(ProjectId::ALL.len(), 4);
+        assert_eq!(ProjectId::ALL.len(), 5);
     }
 
     #[test]
@@ -290,6 +337,7 @@ mod tests {
         assert_eq!(ProjectId::Sashiko.display_name(), "Sashiko");
         assert_eq!(ProjectId::Gcc.display_name(), "GCC");
         assert_eq!(ProjectId::Qemu.display_name(), "QEMU");
+        assert_eq!(ProjectId::OpenBsd.display_name(), "OpenBSD");
     }
 
     #[test]
@@ -347,6 +395,16 @@ mod tests {
         assert_eq!(ProjectId::Linux.prompt_dir(), "kernel");
         assert_eq!(ProjectId::Sashiko.prompt_dir(), "sashiko");
         assert_eq!(ProjectId::Qemu.prompt_dir(), "qemu");
+        assert_eq!(ProjectId::OpenBsd.prompt_dir(), "openbsd");
+    }
+
+    #[test]
+    fn test_reports_preexisting_in_review() {
+        assert!(!ProjectId::Linux.reports_preexisting_in_review());
+        assert!(!ProjectId::Sashiko.reports_preexisting_in_review());
+        assert!(!ProjectId::Gcc.reports_preexisting_in_review());
+        assert!(!ProjectId::Qemu.reports_preexisting_in_review());
+        assert!(ProjectId::OpenBsd.reports_preexisting_in_review());
     }
 
     #[test]

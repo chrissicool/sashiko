@@ -60,6 +60,9 @@ use crate::workflows::gcc_patch_review::{
 use crate::workflows::linux_patch_review::{
     LinuxPatchReviewState, build_linux_patch_review_workflow_with_effort, linux_system_prompt,
 };
+use crate::workflows::openbsd_patch_review::{
+    build_openbsd_patch_review_workflow_with_effort, openbsd_system_prompt,
+};
 use crate::workflows::qemu_patch_review::{
     build_qemu_patch_review_workflow_with_effort, qemu_system_prompt,
 };
@@ -263,7 +266,8 @@ impl Worker {
             stages: config.stages,
             custom_prompt: config.custom_prompt,
             skip_report: config.skip_report,
-            report_preexisting: config.report_preexisting,
+            report_preexisting: config.report_preexisting
+                || config.project.reports_preexisting_in_review(),
             effort: config.effort,
             use_code_notes: config.use_code_notes,
             code_notes_scope: config.code_notes_scope,
@@ -404,11 +408,13 @@ impl Worker {
         };
 
         let follow_up_series_context = match self.project {
-            ProjectId::Linux | ProjectId::Gcc | ProjectId::Qemu => build_follow_up_series_context(
-                self.series_range.as_deref(),
-                &patchset,
-                &target_commit_sha,
-            ),
+            ProjectId::Linux | ProjectId::Gcc | ProjectId::Qemu | ProjectId::OpenBsd => {
+                build_follow_up_series_context(
+                    self.series_range.as_deref(),
+                    &patchset,
+                    &target_commit_sha,
+                )
+            }
             ProjectId::Sashiko => build_sashiko_series_context(
                 self.series_range.as_deref(),
                 &patchset,
@@ -478,6 +484,7 @@ impl Worker {
                 ProjectId::Sashiko => sashiko_system_prompt(true),
                 ProjectId::Gcc => gcc_system_prompt(true),
                 ProjectId::Qemu => qemu_system_prompt(true),
+                ProjectId::OpenBsd => openbsd_system_prompt(true),
             };
             let rendered_sys = sys_template.render_for_log(&state);
             self.global_history.push(AiMessage {
@@ -507,6 +514,11 @@ impl Worker {
                 self.effort,
             ),
             ProjectId::Qemu => build_qemu_patch_review_workflow_with_effort(
+                self.max_interactions,
+                self.temperature,
+                self.effort,
+            ),
+            ProjectId::OpenBsd => build_openbsd_patch_review_workflow_with_effort(
                 self.max_interactions,
                 self.temperature,
                 self.effort,
@@ -937,6 +949,21 @@ mod tests {
                 "post-verification",
                 "report",
                 "summary"
+            ]
+        );
+        assert_eq!(
+            crate::workflows::planned_stages_from(
+                ProjectId::OpenBsd,
+                &["goal", "implementation", "locking"]
+            ),
+            [
+                "goal",
+                "implementation",
+                "locking",
+                "deduplication",
+                "verification",
+                "post-verification",
+                "report"
             ]
         );
         assert_eq!(

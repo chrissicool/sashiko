@@ -84,6 +84,7 @@ pub fn qemu_severity_guide() -> &'static str {
 /// Returns the compiled-in severity guide for `project`.
 pub fn severity_guide(project: ProjectId) -> &'static str {
     match project {
+        ProjectId::OpenBsd => crate::project::openbsd_bug_pipeline_unsupported(),
         ProjectId::Linux => kernel_severity_guide(),
         ProjectId::Sashiko => sashiko_severity_guide(),
         ProjectId::Gcc => gcc_severity_guide(),

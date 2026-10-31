@@ -22,6 +22,7 @@ pub mod linux_bug;
 pub mod linux_patch_review;
 pub mod notes_agenda;
 pub mod notes_corpus;
+pub mod openbsd_patch_review;
 pub mod prior_attribution;
 pub mod prior_feedback;
 pub mod qemu_patch_review;
@@ -36,6 +37,7 @@ pub fn stage_short_label(project: ProjectId, stage: &str) -> Option<&'static str
         ProjectId::Sashiko => sashiko_patch_review::stage_short_label(stage),
         ProjectId::Gcc => gcc_patch_review::stage_short_label(stage),
         ProjectId::Qemu => qemu_patch_review::stage_short_label(stage),
+        ProjectId::OpenBsd => openbsd_patch_review::stage_short_label(stage),
     }
 }
 
@@ -56,6 +58,10 @@ pub fn default_stage_count(project: ProjectId) -> usize {
         }
         ProjectId::Qemu => {
             qemu_patch_review::ANALYSIS_STAGES.len() + qemu_patch_review::CONSOLIDATION_STAGES.len()
+        }
+        ProjectId::OpenBsd => {
+            openbsd_patch_review::ANALYSIS_STAGES.len()
+                + openbsd_patch_review::CONSOLIDATION_STAGES.len()
         }
     }
 }
@@ -123,6 +129,24 @@ pub fn planned_stages_from(project: ProjectId, stage_names: &[&'static str]) -> 
             if !planned.is_empty() {
                 planned.extend(
                     gcc_patch_review::CONSOLIDATION_STAGES
+                        .iter()
+                        .map(|s| s.name.to_string()),
+                );
+            }
+            planned
+        }
+        ProjectId::OpenBsd => {
+            let mut planned: Vec<String> = stage_names
+                .iter()
+                .filter(|n| {
+                    openbsd_patch_review::analysis_stage_by_name(n).is_some()
+                        || prior_feedback::is_prior_feedback_stage_name(n)
+                })
+                .map(|n| n.to_string())
+                .collect();
+            if !planned.is_empty() {
+                planned.extend(
+                    openbsd_patch_review::CONSOLIDATION_STAGES
                         .iter()
                         .map(|s| s.name.to_string()),
                 );

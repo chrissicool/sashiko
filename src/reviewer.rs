@@ -2520,6 +2520,12 @@ impl Reviewer {
                                         let preexisting = f["preexisting"].as_bool();
                                         if preexisting == Some(true)
                                             && !ctx.settings.linux_bug.enabled
+                                            && !ctx
+                                                .settings
+                                                .project
+                                                .kind
+                                                .unwrap_or_default()
+                                                .reports_preexisting_in_review()
                                         {
                                             continue;
                                         }
@@ -2742,6 +2748,9 @@ impl Reviewer {
                                             }
                                             crate::project::ProjectId::Qemu => {
                                                 "sashiko:qemu_patch_review"
+                                            }
+                                            crate::project::ProjectId::OpenBsd => {
+                                                "sashiko:openbsd_patch_review"
                                             }
                                         };
                                         let discovery_db = ctx.db.with_bug_actor(
