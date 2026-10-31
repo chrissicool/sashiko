@@ -1941,9 +1941,11 @@ async fn ingest_raw_mbox_messages(
 
     let mut parsed_items = Vec::with_capacity(raw_messages.len());
     for msg_raw in raw_messages {
-        let parsed = tokio::task::spawn_blocking(move || crate::patch::parse_email(&msg_raw))
-            .await
-            .context("Mbox parser task panicked")??;
+        let parsed = tokio::task::spawn_blocking(move || {
+            crate::patch::parse_email(&msg_raw, crate::patch::MailReading::FormatPatch)
+        })
+        .await
+        .context("Mbox parser task panicked")??;
         parsed_items.push(parsed);
     }
 
@@ -6227,7 +6229,8 @@ mod tests {
         };
         let mut authors: HashMap<String, String> = HashMap::new();
         for raw_msg in crate::ingestor::split_mbox(mbox.as_bytes()) {
-            let (meta, _) = crate::patch::parse_email(&raw_msg)?;
+            let (meta, _) =
+                crate::patch::parse_email(&raw_msg, crate::patch::MailReading::FormatPatch)?;
             authors.insert(
                 normalize_message_id(&meta.message_id).to_string(),
                 meta.author,

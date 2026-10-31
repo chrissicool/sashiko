@@ -922,6 +922,7 @@ async fn run_daemon(
         }
     };
 
+    let reading = settings.mailing_lists.reading();
     let parser_handle = tokio::spawn(async move {
         info!("Parser Dispatcher started");
         while let Some(event) = raw_rx.recv().await {
@@ -994,6 +995,7 @@ async fn run_daemon(
                         to: "submitted".to_string(),
                         cc: "".to_string(),
                         is_patch_or_cover: true,
+                        is_reply_patch: false,
                         version: None,
                         body: message.clone(),
                     };
@@ -1084,7 +1086,7 @@ async fn run_daemon(
 
                             // Offload parsing
                             let parse_result = tokio::task::spawn_blocking(move || {
-                                sashiko::patch::parse_email(&msg_raw)
+                                sashiko::patch::parse_email(&msg_raw, reading)
                             })
                             .await;
 
@@ -1145,7 +1147,7 @@ async fn run_daemon(
 
                         // Offload CPU parsing to blocking thread pool
                         let parse_result = tokio::task::spawn_blocking(move || {
-                            sashiko::patch::parse_email(&bytes)
+                            sashiko::patch::parse_email(&bytes, reading)
                         })
                         .await;
 
@@ -3872,6 +3874,12 @@ async fn process_parsed_article(
                 return ProcessStatus::Error;
             }
         }
+    }
+
+    // The rich reading takes a diff a reply's sender wrote as a patch of its
+    // own, whoever sent it, when it is not the author's next version.
+    if !metadata.is_patch_or_cover && metadata.is_reply_patch && patch_opt.is_some() {
+        metadata.is_patch_or_cover = true;
     }
 
     let cover_letter_id: Option<String> = if group == "git-fetch" {
