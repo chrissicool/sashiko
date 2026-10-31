@@ -94,7 +94,7 @@ Optional. Controls forge (GitHub/GitLab) webhook integration, GitHub App comment
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `track` | string or list | `[]` | Optional override for mailing lists to monitor via NNTP. When empty (default), tracked lists are loaded from `projects/<project>/mailing_lists.toml` (all entries with `track = true`). Accepts a TOML array or a comma-separated string. |
-| `rich_mail` | bool | `false` | Read mail in any shape a sender and mail client produce: a diff its sender wrote is a patch even in a reply, and a batch of changesets in one mail is a series. Off, mail is read as `git format-patch` sends it. See [designs/DESIGN_RICH_MAIL_INGESTION.md](../designs/DESIGN_RICH_MAIL_INGESTION.md). |
+| `rich_mail` | bool | `false` | Read mail in any shape a sender and mail client produce: a diff its sender wrote is a patch even in a reply, a batch of changesets in one mail is a series, and every attachment that carries a diff is read on its own. Off, mail is read as `git format-patch` sends it. See [designs/DESIGN_RICH_MAIL_INGESTION.md](../designs/DESIGN_RICH_MAIL_INGESTION.md). |
 
 ### `[nntp]`
 
