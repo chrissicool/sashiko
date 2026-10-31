@@ -82,7 +82,7 @@ struct Cli {
     #[arg(long, hide = true, value_delimiter = ',')]
     stages: Option<Vec<String>>,
 
-    /// Reasoning effort mode override (low, mid, high, or dynamic) for supported models
+    /// Reasoning effort mode override (low, mid, high, or dynamic) for the review stages
     #[arg(long)]
     effort: Option<EffortMode>,
 
@@ -168,7 +168,7 @@ enum Commands {
         #[arg(short = 'm', long = "model", visible_alias = "ai-model")]
         model: Option<String>,
 
-        /// Reasoning effort mode override (low, mid, high, or dynamic) for supported models
+        /// Reasoning effort mode override (low, mid, high, or dynamic) for the review stages
         #[arg(long)]
         effort: Option<EffortMode>,
 
@@ -240,7 +240,7 @@ enum Commands {
         #[arg(short = 'm', long = "model", visible_alias = "ai-model")]
         model: Option<String>,
 
-        /// Reasoning effort mode override (low, mid, high, or dynamic) for supported models
+        /// Reasoning effort mode override (low, mid, high, or dynamic) for the review stages
         #[arg(long)]
         effort: Option<EffortMode>,
 
@@ -306,7 +306,7 @@ enum Commands {
         #[arg(long)]
         ai_provider: Option<String>,
 
-        /// Reasoning effort mode override (low, mid, high, or dynamic) for supported models
+        /// Reasoning effort mode override (low, mid, high, or dynamic) for the review stages
         #[arg(long)]
         effort: Option<EffortMode>,
 

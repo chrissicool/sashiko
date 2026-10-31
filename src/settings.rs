@@ -1095,9 +1095,12 @@ pub struct ReviewSettings {
     #[serde(default = "default_max_total_output_tokens")]
     pub max_total_output_tokens: usize,
     /// Reasoning effort mode (`"low"`, `"mid"` or its alias `"medium"`,
-    /// `"high"`, or `"dynamic"`) for models that support configurable effort
-    /// levels (currently Argon 4). Defaults to `"mid"` when the model
-    /// supports effort levels and is ignored otherwise.
+    /// `"high"`, or `"dynamic"`) for the review stages, whatever the model.
+    /// Each stage's level then replaces the provider's configured effort for
+    /// that stage's requests. Unset, it defaults to `"mid"` for models that
+    /// support configurable effort levels (currently Argon 4); on other
+    /// models the stages carry no level and the provider's own setting
+    /// applies.
     #[serde(default)]
     pub effort: Option<EffortMode>,
     #[serde(skip)]
@@ -1107,15 +1110,14 @@ pub struct ReviewSettings {
 impl ReviewSettings {
     /// Resolves the effective reasoning effort mode for `model`.
     ///
-    /// Returns `None` when `model` does not support configurable effort levels
-    /// (currently only Argon 4 supports it). When `model` supports effort
-    /// levels, returns the configured `effort` or defaults to
-    /// [`EffortMode::Mid`].
+    /// Returns the configured `effort` whatever the model. Unset, returns
+    /// [`EffortMode::Mid`] when `model` supports configurable effort levels
+    /// (currently only Argon 4 supports it) and `None` otherwise.
     pub fn effective_effort(&self, model: &str) -> Option<EffortMode> {
-        if !model_supports_effort(model) {
-            return None;
+        if self.effort.is_some() {
+            return self.effort;
         }
-        Some(self.effort.unwrap_or(EffortMode::Mid))
+        model_supports_effort(model).then_some(EffortMode::Mid)
     }
 }
 
@@ -1328,17 +1330,18 @@ impl Settings {
 
     /// Resolves the effective reasoning effort mode for this configuration.
     ///
-    /// Returns `None` when `self.ai.model` does not support configurable
-    /// effort levels (currently only Argon 4 supports it). When the model
-    /// supports effort levels, resolves `[review] effort`, falls back to
-    /// [`EffortMode::Low`] if the provider's global thinking level is set to
-    /// `"low"`, and otherwise defaults to [`EffortMode::Mid`].
+    /// Returns `[review] effort` whatever the model. Unset, returns `None`
+    /// when `self.ai.model` does not support configurable effort levels
+    /// (currently only Argon 4 supports it). When the model supports effort
+    /// levels, falls back to [`EffortMode::Low`] if the provider's global
+    /// thinking level is set to `"low"`, and otherwise defaults to
+    /// [`EffortMode::Mid`].
     pub fn effective_effort(&self) -> Option<EffortMode> {
-        if !model_supports_effort(&self.ai.model) {
-            return None;
-        }
         if let Some(effort) = self.review.effort {
             return Some(effort);
+        }
+        if !model_supports_effort(&self.ai.model) {
+            return None;
         }
         if self.has_global_low_thinking_level() {
             return Some(EffortMode::Low);
@@ -2345,11 +2348,11 @@ mod tests {
     }
 
     #[test]
-    fn test_effort_mode_is_gated_on_model_and_defaults_to_mid_for_argon() {
+    fn test_effort_mode_applies_to_every_model_and_defaults_to_mid_for_argon() {
         let mut review: ReviewSettings = toml::from_str("concurrency = 1").unwrap();
         assert_eq!(review.effort, None);
 
-        // Non-Argon models do not support configurable effort levels.
+        // Unset, non-Argon models carry no level.
         assert_eq!(review.effective_effort("gemini-3.1-pro-preview"), None);
         assert_eq!(review.effective_effort("claude-sonnet-4-6"), None);
 
@@ -2363,13 +2366,20 @@ mod tests {
             Some(EffortMode::Mid)
         );
 
-        // Explicit "high" and "dynamic" are respected on Argon and ignored on non-Argon.
+        // Explicit "high" and "dynamic" are respected whatever the model.
         review.effort = Some(EffortMode::High);
         assert_eq!(
             review.effective_effort("gemini-4-argon"),
             Some(EffortMode::High)
         );
-        assert_eq!(review.effective_effort("gemini-3.1-pro-preview"), None);
+        assert_eq!(
+            review.effective_effort("gemini-3.1-pro-preview"),
+            Some(EffortMode::High)
+        );
+        assert_eq!(
+            review.effective_effort("claude-sonnet-4-6"),
+            Some(EffortMode::High)
+        );
 
         let dynamic: ReviewSettings =
             toml::from_str("concurrency = 1\neffort = \"dynamic\"").unwrap();
@@ -2431,6 +2441,9 @@ mod tests {
 
         settings.ai.model = "gemini-3.1-pro-preview".to_string();
         assert_eq!(settings.effective_effort(), None);
+
+        settings.review.effort = Some(EffortMode::Dynamic);
+        assert_eq!(settings.effective_effort(), Some(EffortMode::Dynamic));
     }
 
     #[test]
