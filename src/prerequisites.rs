@@ -317,6 +317,7 @@ async fn parse_mbox_messages(raw: Vec<u8>) -> Result<Vec<(PatchsetMetadata, Opti
                 // A lore, b4 or Patchew series is format-patch, whatever the
                 // deployment's own lists send.
                 .filter_map(|message| parse_email(&message, MailReading::FormatPatch).ok())
+                .map(|(metadata, patches)| (metadata, patches.into_iter().next()))
                 .collect::<Vec<_>>(),
         )
     })

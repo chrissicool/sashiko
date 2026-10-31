@@ -24,7 +24,8 @@ pub enum MailReading {
     /// attaches, is the one patch a mail carries, and a reply is discussion.
     FormatPatch,
     /// As a list without a style guide gets it: a diff its sender wrote is a
-    /// patch even in a reply.
+    /// patch even in a reply, and a batch of changesets in one mail is a
+    /// series.
     Rich,
 }
 
@@ -57,6 +58,10 @@ pub struct Patch {
     pub body: String,
     pub diff: String,
     pub part_index: u32,
+    /// The `Subject:` the changeset carried, when it arrived as a
+    /// format-patch block inside a larger mail. `None` leaves the patch
+    /// named after the mail it came in.
+    pub subject: Option<String>,
 }
 
 pub fn extract_received_date(raw_email: &[u8]) -> Option<i64> {
@@ -305,7 +310,7 @@ pub fn promote_reply_patch_subject(subject: &str, version: u32) -> String {
 pub fn parse_email(
     raw_email: &[u8],
     reading: MailReading,
-) -> Result<(PatchsetMetadata, Option<Patch>)> {
+) -> Result<(PatchsetMetadata, Vec<Patch>)> {
     let received_date = extract_received_date(raw_email);
 
     let message = MessageParser::default()
@@ -447,7 +452,7 @@ pub fn parse_email(
         _ => vec![],
     };
 
-    let (index, total) = parse_subject_index(&subject);
+    let (index, mut total) = parse_subject_index(&subject);
     let version = parse_subject_version(&subject);
 
     let mut body = String::new();
@@ -497,6 +502,26 @@ pub fn parse_email(
     } else {
         String::new()
     };
+
+    // A body may carry more than one changeset: a list without a style guide
+    // takes a batch of patches in a single mail as readily as one per mail.
+    // In the rich reading a mail carries a diff only if a changeset is found
+    // in it, so a diff that is indented to discuss it does not count.
+    let changesets = match reading {
+        MailReading::FormatPatch => Vec::new(),
+        MailReading::Rich => split_changesets(&body),
+    };
+    let diff = match reading {
+        MailReading::FormatPatch => diff,
+        MailReading::Rich if changesets.is_empty() => String::new(),
+        MailReading::Rich => body.clone(),
+    };
+    // A split body is a series that arrived in one message, so it is numbered
+    // like one. A single changeset leaves the subject's own numbering alone.
+    let split_total = u32::try_from(changesets.len()).unwrap_or(u32::MAX);
+    if split_total > 1 {
+        total = split_total;
+    }
 
     // Detection logic
     let subject_lower = subject.to_lowercase();
@@ -553,18 +578,188 @@ pub fn parse_email(
         body: body.clone(),
     };
 
-    let patch = if has_diff && index != 0 {
-        Some(Patch {
+    let patches = if !has_diff || index == 0 {
+        Vec::new() // a cover letter carries no patch of its own
+    } else if split_total > 1 {
+        // Each changeset becomes its own patch, so each is reviewed on its
+        // own terms rather than fused into one diff.
+        changesets
+            .into_iter()
+            .enumerate()
+            .map(|(n, changeset)| Patch {
+                message_id: format!("{}#{}", message_id, n + 1),
+                body: changeset.message,
+                diff: changeset.diff,
+                part_index: u32::try_from(n + 1).unwrap_or(u32::MAX),
+                subject: changeset.subject,
+            })
+            .collect()
+    } else {
+        vec![Patch {
             message_id,
             body,
             diff,
             part_index: index,
-        })
-    } else {
-        None
+            subject: None,
+        }]
     };
 
-    Ok((metadata, patch))
+    Ok((metadata, patches))
+}
+
+/// A line that only ever appears inside a diff, so it continues the block the
+/// walk is already in rather than starting a new one. Covers git's extended
+/// headers and the `Index:`/`===`/`RCS file:` preamble cvs(1) writes per file.
+fn is_diff_metadata(line: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "===",
+        "RCS file:",
+        "retrieving revision",
+        "diff -",
+        "Index: ",
+        "index ",
+        "new file mode",
+        "deleted file mode",
+        "old mode",
+        "new mode",
+        "similarity index",
+        "dissimilarity index",
+        "rename from",
+        "rename to",
+        "copy from",
+        "copy to",
+        "Binary files",
+        "GIT binary patch",
+    ];
+    PREFIXES.iter().any(|p| line.starts_with(p))
+}
+
+/// A line that can begin a diff block: the first file of a changeset, or the
+/// next file of the one already being read. Which of the two it is depends on
+/// what preceded it, not on the line itself.
+fn opens_diff_block(line: &str) -> bool {
+    line.starts_with("diff --git ")
+        || line.starts_with("Index: ")
+        || line.starts_with("--- ")
+        || line.starts_with("@@ -")
+}
+
+/// A line that carries diff payload: hunk content, a hunk header, or a file
+/// header. An empty line counts, because mailers strip the single space from a
+/// blank context line.
+fn is_diff_payload(line: &str) -> bool {
+    line.is_empty() || line.starts_with([' ', '+', '-', '\\', '@']) || is_diff_metadata(line)
+}
+
+/// Where each changeset in `body` starts, as an index into its lines.
+///
+/// tech@ imposes no format, so this keys on structure rather than on any one
+/// tool's output. A diff block that follows prose begins a changeset; a diff
+/// block that follows hunk content is the next file of the changeset already
+/// open. That one rule separates a batch of patches from a single diff touching
+/// several files, whether the sender used git format-patch, git diff, cvs diff,
+/// or a bare unified diff.
+///
+/// A diff ends only at prose that opens a paragraph, because mail mangles
+/// diffs: quoted-printable left undecoded puts `=20` on a line of its own, and
+/// a mailer wrapping a long context line drops the space that marks it. Either
+/// looks like prose in the middle of a hunk, but neither follows a blank line,
+/// and treating them as a boundary cuts one patch into several.
+///
+/// Quoted lines are skipped, so a reply discussing someone else's diff
+/// contributes no changeset of its own.
+fn changeset_starts(body: &str) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut in_diff = false;
+    let mut prev_blank = true;
+    for (idx, line) in body.lines().enumerate() {
+        // Only the quote test may ignore leading space: a context line is
+        // identified by exactly that space, so trimming would make every line
+        // of hunk body look like prose.
+        if line.trim_start().starts_with('>') {
+            prev_blank = false;
+            continue; // quoted reply context
+        }
+        if opens_diff_block(line) {
+            if !in_diff {
+                starts.push(idx);
+                in_diff = true;
+            }
+        } else if in_diff && !is_diff_payload(line) && prev_blank {
+            in_diff = false;
+        }
+        prev_blank = line.trim().is_empty();
+    }
+    starts
+}
+
+/// One changeset of a batched mail: the diff, and the commit it describes.
+pub(crate) struct Changeset {
+    pub subject: Option<String>,
+    pub message: String,
+    pub diff: String,
+}
+
+/// The `Subject:` of a format-patch block, if its headers are there.
+fn preamble_subject(preamble: &str) -> Option<String> {
+    preamble
+        .lines()
+        .rev()
+        .find_map(|l| l.strip_prefix("Subject: "))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The commit message under that `Subject:`, up to the diffstat separator.
+fn preamble_message(preamble: &str) -> String {
+    let lines: Vec<&str> = preamble.lines().collect();
+    let Some(subject_at) = lines.iter().rposition(|l| l.starts_with("Subject: ")) else {
+        return String::new();
+    };
+    let body = lines[subject_at + 1..]
+        .iter()
+        .take_while(|l| l.trim_end() != "---")
+        .copied()
+        .collect::<Vec<_>>();
+    body.join("\n").trim().to_string()
+}
+
+/// Splits `body` into one changeset per commit, dropping any region that turns
+/// out to carry no diff after all.
+///
+/// A region is kept when it holds a hunk under a `+++` file header, or is a
+/// git diff, which may have none when its only change is to a mode or a name.
+/// A hunk quoted without the file it applies to cannot be applied, so it is
+/// discussion, not a changeset. The headers introducing a commit trail the
+/// diff before it, so each region hands its tail to the next.
+fn split_changesets(body: &str) -> Vec<Changeset> {
+    let lines: Vec<&str> = body.lines().collect();
+    let starts = changeset_starts(body);
+    let mut out = Vec::new();
+    // What precedes the first diff introduces it; what trails a diff
+    // introduces the next one, so each region hands its tail forward.
+    let mut preamble = lines[..starts.first().copied().unwrap_or(0)].join("\n");
+    for (n, &start) in starts.iter().enumerate() {
+        let end = starts.get(n + 1).copied().unwrap_or(lines.len());
+        let region = &lines[start..end];
+        let cut = region
+            .iter()
+            .rposition(|l| is_format_patch_mbox_from(l))
+            .unwrap_or(region.len());
+        let diff = region[..cut].join("\n");
+        let carries_diff = (diff.lines().any(|l| l.starts_with("+++ "))
+            && diff.lines().any(|l| l.starts_with("@@ -")))
+            || diff.lines().any(|l| l.starts_with("diff --git "));
+        if carries_diff {
+            out.push(Changeset {
+                subject: preamble_subject(&preamble),
+                message: preamble_message(&preamble),
+                diff,
+            });
+        }
+        preamble = region[cut..].join("\n");
+    }
+    out
 }
 
 /// Read the `M/N` part counter out of a patch subject, as `(index, total)`.
@@ -1460,7 +1655,7 @@ Body";
         let raw = b"Message-ID: <789>\r\nSubject: [PATCH 0/5] fix bug\r\n\r\nCover letter body";
         let (meta, patch) = parse_email(raw, MailReading::FormatPatch).unwrap();
         assert!(meta.is_patch_or_cover);
-        assert!(patch.is_none());
+        assert!(patch.is_empty());
     }
 
     #[test]
@@ -1469,7 +1664,7 @@ Body";
         let (meta, patch) = parse_email(raw, MailReading::FormatPatch).unwrap();
         assert!(meta.is_patch_or_cover);
         assert!(
-            patch.is_none(),
+            patch.is_empty(),
             "Cover letter (index 0) with diff should NOT be a patch"
         );
     }
@@ -1500,7 +1695,7 @@ Index: sys/kern/vfs_subr.c\n\
             "the author's next version decides first"
         );
         assert!(
-            patch.is_some(),
+            !patch.is_empty(),
             "A patch should be extracted from the reply"
         );
     }
@@ -2112,7 +2307,7 @@ index 7b74ee2bef7..8685c4f97e4 100644\r\n\
 
         let (meta, patch) = parse_email(raw, MailReading::FormatPatch).unwrap();
         assert!(meta.is_patch_or_cover);
-        let patch = patch.expect("expected decoded patch");
+        let patch = patch.into_iter().next().expect("expected decoded patch");
         assert!(patch.diff.contains("-  int x = 0;\n+  int x = 1;"));
         assert!(!patch.diff.contains("=3D"));
     }
@@ -2152,7 +2347,10 @@ index 1111111..2222222 100644\r\n\
 
         let (meta, patch) = parse_email(raw, MailReading::FormatPatch).unwrap();
         assert!(meta.is_patch_or_cover);
-        let patch = patch.expect("expected attached patch to be extracted");
+        let patch = patch
+            .into_iter()
+            .next()
+            .expect("expected attached patch to be extracted");
         assert!(patch.diff.contains("diff --git a/gcc/tree-vect-loop.cc"));
         assert!(
             !patch.diff.contains("From 0123456789abcdef"),
@@ -2176,7 +2374,7 @@ On Thu, Oct 22, Author wrote:\r\n\
 
         let (meta, patch) = parse_email(raw, MailReading::FormatPatch).unwrap();
         assert!(!meta.is_patch_or_cover);
-        assert!(patch.is_none());
+        assert!(patch.is_empty());
     }
 
     #[test]
@@ -2193,7 +2391,7 @@ On Thu, Oct 22, Author wrote:\r\n\
                 !meta.is_patch_or_cover,
                 "diffless ping '{subject}' should not be treated as a patchset"
             );
-            assert!(patch.is_none());
+            assert!(patch.is_empty());
         }
     }
 
@@ -2233,5 +2431,195 @@ On Thu, Oct 22, Author wrote:\r\n\
             ),
             "[PATCH v3] lra: Handle subregs in get_dependent_filter."
         );
+    }
+
+    #[test]
+    fn test_only_the_rich_reading_splits_a_batch() {
+        let raw = b"Message-ID: <batch>\r\nSubject: two fixes\r\n\r\n\
+The first one:\n\
+\n\
+--- a/a.c\n\
++++ b/a.c\n\
+@@ -1,1 +1,1 @@\n\
+-old\n\
++new\n\
+\n\
+And the second one:\n\
+\n\
+--- a/b.c\n\
++++ b/b.c\n\
+@@ -2,1 +2,1 @@\n\
+-x\n\
++y\n";
+        let (meta, patches) = parse_email(raw, MailReading::FormatPatch).unwrap();
+        assert_eq!(meta.total, 1);
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].message_id, "batch");
+        assert!(patches[0].diff.contains("b/a.c") && patches[0].diff.contains("b/b.c"));
+
+        let (meta, patches) = parse_email(raw, MailReading::Rich).unwrap();
+        assert_eq!(meta.total, 2);
+        let ids: Vec<_> = patches.iter().map(|p| p.message_id.as_str()).collect();
+        assert_eq!(ids, ["batch#1", "batch#2"]);
+        assert!(patches[0].diff.contains("b/a.c") && !patches[0].diff.contains("b/b.c"));
+        assert!(patches[1].diff.contains("b/b.c"));
+    }
+
+    #[test]
+    fn test_an_indented_diff_in_a_report_is_no_patch() {
+        // A bug report showing the diff it applied locally, indented as prose.
+        let raw = b"Message-ID: <report>\r\nSubject: motd shows the wrong version\r\n\r\n\
+After the update motd shows the old version. I changed it like this:\n\
+\n\
+\x20 --- etc/motd\n\
+\x20 +++ etc/motd\n\
+\x20 @@ -1,4 +1,4 @@\n\
+\x20 -OpenBSD 7.8\n\
+\x20 +OpenBSD 7.9\n\
+\n\
+Is that expected?\n";
+        let (meta, patches) = parse_email(raw, MailReading::Rich).unwrap();
+        assert!(!meta.is_patch_or_cover);
+        assert!(patches.is_empty());
+    }
+
+    #[test]
+    fn test_a_changeset_keeps_the_headers_that_introduce_it() {
+        let body = "\
+Here is the first batch.
+
+From 18503e2b4d5c6f7a8b9c0d1e2f3a4b5c6d7e8f90 Mon Sep 17 00:00:00 2001
+From: A <a@example.com>
+Subject: [PATCH 01/02] qwz: reject state changes while stopped
+
+Backport qwx.c,v 1.75.
+---
+ sys/dev/ic/qwz.c | 5 +++++
+
+diff --git sys/dev/ic/qwz.c sys/dev/ic/qwz.c
+@@ -859,6 +859,11 @@ qwz_newstate(void)
++\tfirst
+ 
+From 40ca1b2c3d4e5f60718293a4b5c6d7e8f9012345 Mon Sep 17 00:00:00 2001
+From: A <a@example.com>
+Subject: [PATCH 02/02] qwz: retain active key task arguments
+
+Recheck association state after waits.
+---
+ sys/dev/ic/qwz.c | 4 ++++
+
+diff --git sys/dev/ic/qwz.c sys/dev/ic/qwz.c
+@@ -743,6 +743,12 @@ qwz_add_sta_key(void)
++\tsecond
+";
+        let sets = split_changesets(body);
+        assert_eq!(sets.len(), 2, "two changesets");
+
+        assert_eq!(
+            sets[0].subject.as_deref(),
+            Some("[PATCH 01/02] qwz: reject state changes while stopped")
+        );
+        assert_eq!(sets[0].message, "Backport qwx.c,v 1.75.");
+        assert_eq!(
+            sets[1].subject.as_deref(),
+            Some("[PATCH 02/02] qwz: retain active key task arguments")
+        );
+        assert_eq!(sets[1].message, "Recheck association state after waits.");
+
+        // Each diff stops where the next commit is announced, so no part
+        // carries the headers of the one after it.
+        assert!(sets[0].diff.contains("first"), "{}", sets[0].diff);
+        assert!(
+            !sets[0].diff.contains("PATCH 02/02"),
+            "the next commit's headers leaked into this diff: {}",
+            sets[0].diff
+        );
+        assert!(sets[1].diff.contains("second"), "{}", sets[1].diff);
+    }
+
+    #[test]
+    fn test_a_multi_file_diff_is_one_changeset() {
+        let git = "Here is the fix.\n\n\
+            diff --git a/a.c b/a.c\n--- a/a.c\n+++ b/a.c\n@@ -1,2 +1,2 @@\n ctx\n-old\n+new\n\
+            diff --git a/b.h b/b.h\n--- a/b.h\n+++ b/b.h\n@@ -9,1 +9,1 @@\n-x\n+y\n";
+        assert_eq!(split_changesets(git).len(), 1);
+
+        let cvs = "It seems we can only assume this.\n\n\
+            Index: a.c\n===================================================================\n\
+            RCS file: /cvs/src/a.c,v\nretrieving revision 1.2\ndiff -u -p -r1.2 a.c\n\
+            --- a.c\n+++ a.c\n@@ -1,2 +1,2 @@\n ctx\n-old\n+new\n\
+            Index: b.c\n===================================================================\n\
+            RCS file: /cvs/src/b.c,v\nretrieving revision 1.1\ndiff -u -p -r1.1 b.c\n\
+            --- b.c\n+++ b.c\n@@ -3,1 +3,1 @@\n-p\n+q\n";
+        assert_eq!(split_changesets(cvs).len(), 1);
+    }
+
+    #[test]
+    fn test_a_wrapped_context_line_does_not_split_a_patch() {
+        // A mailer broke one long context line across three, and only the
+        // first keeps the space that marks it as context.
+        let body = "Here is a fix:\n\n\
+            --- /usr/include/wchar.h.orig\tSat Oct  3 17:45:17 2026\n\
+            +++ /usr/include/wchar.h\tSat Oct  3 17:52:29 2026\n\
+            @@ -137,6 +137,7 @@\n\
+            \n \
+            #    if _LIBCPP_HAS_WIDE_CHARACTERS\n\
+            #      if defined(__cplusplus) &&\n\
+            !defined(_LIBCPP_WCHAR_H_HAS_CONST_OVERLOADS) &&\n\
+            defined(_LIBCPP_PREFERRED_OVERLOAD)\n\
+            +#if 0\n\
+            @@ -191,6 +192,7 @@\n\
+            +#endif\n";
+        assert_eq!(
+            split_changesets(body).len(),
+            1,
+            "a wrapped context line is not a patch boundary"
+        );
+    }
+
+    #[test]
+    fn test_undecoded_quoted_printable_does_not_split_a_patch() {
+        // "=20" is a quoted-printable space left undecoded; it sits against
+        // hunk content, not after a blank line.
+        let body = "One patch, four files:\n\n\
+            diff --git a/a.c b/a.c\n--- a/a.c\n+++ b/a.c\n@@ -1,1 +1,1 @@\n-old\n+new\n\
+            =20\n\
+            diff --git a/b.c b/b.c\n--- a/b.c\n+++ b/b.c\n@@ -3,1 +3,1 @@\n-p\n+q\n";
+        assert_eq!(
+            split_changesets(body).len(),
+            1,
+            "a quoted-printable artefact is not a patch boundary"
+        );
+    }
+
+    #[test]
+    fn test_prose_between_diffs_splits_them() {
+        let body = "First fix:\n\n\
+            diff --git a/a.c b/a.c\n--- a/a.c\n+++ b/a.c\n@@ -1,1 +1,1 @@\n-old\n+new\n\
+            \nAnd the second, unrelated one:\n\n\
+            Index: b.c\n===================================================================\n\
+            --- b.c\n+++ b.c\n@@ -3,1 +3,1 @@\n-p\n+q\n";
+        assert_eq!(split_changesets(body).len(), 2);
+    }
+
+    #[test]
+    fn test_a_quoted_diff_is_not_a_changeset() {
+        let body = "I think this is wrong:\n\n\
+            > diff --git a/a.c b/a.c\n> --- a/a.c\n> +++ b/a.c\n> @@ -1,1 +1,1 @@\n> -old\n> +new\n\
+            \nbecause it breaks the lock.\n";
+        assert!(split_changesets(body).is_empty());
+    }
+
+    #[test]
+    fn test_prose_without_a_hunk_yields_no_changeset() {
+        let body = "See below.\n\n--- this is a separator, not a diff ---\n\nthanks\n";
+        assert!(split_changesets(body).is_empty());
+    }
+
+    #[test]
+    fn test_a_hunk_without_a_file_header_is_not_a_changeset() {
+        let body = "You can also drop the unused declaration above:\n\n\
+            @@ -532,3 +532,2 @@ struct if_sffpage {\n struct socket;\n-struct ifq_ops;\n struct ifnet;\n";
+        assert!(split_changesets(body).is_empty());
     }
 }

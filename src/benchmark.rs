@@ -1946,7 +1946,9 @@ async fn ingest_raw_mbox_messages(
         })
         .await
         .context("Mbox parser task panicked")??;
-        parsed_items.push(parsed);
+        // The format-patch reading yields at most one patch per mail.
+        let (metadata, patches) = parsed;
+        parsed_items.push((metadata, patches.into_iter().next()));
     }
 
     // Order cover letters first, then numbered patches in index order, then
