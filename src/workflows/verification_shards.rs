@@ -36,6 +36,9 @@ pub struct VerificationShardProfile {
     pub stage_name: &'static str,
     /// Classification rules shared with the legacy single verification stage.
     pub instruction: &'static str,
+    /// Prompt files `instruction` names with `@include`, registered so the
+    /// directive resolves in place.
+    pub instruction_files: &'static [&'static str],
     /// Description of the `"problem"` key of a finding (naming conventions).
     pub problem_rule: &'static str,
     /// Optional example output appended to the schema (may be empty).
@@ -97,19 +100,19 @@ pub fn verification_shard_stage(
     let stage_lookup = profile.stage_lookup;
 
     let mut user_template =
-        PromptTemplate::<LinuxPatchReviewState>::new(shard_user_template(profile))
-            .include_file("false-positive-guide.md")
-            .include_file("severity.md")
-            .include_files_from_state(move |s: &LinuxPatchReviewState| {
-                extra_prompt_paths_for_clusters(
-                    &s.selected_guides,
-                    &clusters_for_prompts,
-                    stage_lookup,
-                )
-            })
-            .with_var("candidate_clusters", move |_: &LinuxPatchReviewState| {
-                clusters_block.clone()
-            });
+        PromptTemplate::<LinuxPatchReviewState>::new(shard_user_template(profile));
+    for file in profile.instruction_files {
+        user_template = user_template.include_file(*file);
+    }
+    let mut user_template = user_template
+        .include_file("false-positive-guide.md")
+        .include_file("severity.md")
+        .include_files_from_state(move |s: &LinuxPatchReviewState| {
+            extra_prompt_paths_for_clusters(&s.selected_guides, &clusters_for_prompts, stage_lookup)
+        })
+        .with_var("candidate_clusters", move |_: &LinuxPatchReviewState| {
+            clusters_block.clone()
+        });
     if profile.wants_series_context {
         user_template =
             user_template.with_var("follow_up_series_section", |s: &LinuxPatchReviewState| {

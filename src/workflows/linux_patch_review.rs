@@ -3489,6 +3489,7 @@ pub static LINUX_VERIFICATION_PROFILE:
     crate::workflows::verification_shards::VerificationShardProfile {
         stage_name: "verification",
         instruction: STAGE_VERIFICATION_INSTRUCTION,
+        instruction_files: &[],
         problem_rule: "\"problem\" (short naming string under 80 characters, preferably starting with a subsystem prefix like 'mm:' or 'bpf:', NEVER using backquotes, using fn_name() format for functions, describing the root cause)",
         example_output: LINUX_VERIFICATION_EXAMPLE,
         wants_series_context: true,

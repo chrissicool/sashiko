@@ -925,6 +925,7 @@ pub static GCC_VERIFICATION_PROFILE:
     crate::workflows::verification_shards::VerificationShardProfile {
         stage_name: "verification",
         instruction: STAGE_VERIFICATION_INSTRUCTION,
+        instruction_files: &[],
         problem_rule: r#""problem" (a short naming string under 80 characters starting with a GCC component prefix like 'tree-optimization:', 'c++:', 'target:', 'middle-end:', 'rtl-optimization:', 'fortran:', 'ipa:', 'libstdc++:', 'c:', NEVER using backquotes, using fn_name() format for functions, describing the root cause)"#,
         example_output: "",
         wants_series_context: true,

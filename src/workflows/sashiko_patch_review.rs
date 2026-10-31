@@ -1020,6 +1020,7 @@ pub static SASHIKO_VERIFICATION_PROFILE:
     crate::workflows::verification_shards::VerificationShardProfile {
         stage_name: "verification",
         instruction: STAGE_VERIFICATION_INSTRUCTION,
+        instruction_files: &[],
         problem_rule: r#""problem" (a short naming string under 80 characters starting with a Sashiko component prefix like 'workflow:', 'db:', 'reviewer:', 'toolbox:', 'api:', 'cli:', NEVER using backquotes)"#,
         example_output: "",
         wants_series_context: true,
