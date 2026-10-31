@@ -328,6 +328,7 @@ pub async fn run_worker(
     let concurrency = settings.review.concurrency;
     let timeout_seconds = settings.review.timeout_seconds;
     let worktree_dir = settings.review.worktree_dir.as_deref().map(Path::new);
+    let resolve_patch_paths = settings.git.resolve_patch_paths;
 
     let patchset_id = input.id;
     let subject = input.subject;
@@ -418,6 +419,7 @@ pub async fn run_worker(
         settings,
         concurrency,
         timeout_seconds,
+        resolve_patch_paths,
         patchset_id,
         subject,
         patches,
@@ -899,6 +901,7 @@ async fn run_worker_in_worktree(
     settings: &Settings,
     concurrency: usize,
     timeout_seconds: u64,
+    resolve_patch_paths: bool,
     patchset_id: i64,
     subject: String,
     patches: Vec<PatchInput>,
@@ -978,6 +981,7 @@ async fn run_worker_in_worktree(
             let success = apply_single_patch(
                 worktree,
                 p,
+                resolve_patch_paths,
                 &mut patch_shas,
                 &mut patch_shows,
                 &mut patch_messages,
@@ -1478,6 +1482,7 @@ pub fn format_agent_review_output(result: &Value) -> Value {
 async fn apply_single_patch(
     worktree: &GitWorktree,
     p: &PatchInput,
+    resolve_patch_paths: bool,
     patch_shas: &mut HashMap<i64, String>,
     patch_shows: &mut HashMap<i64, String>,
     patch_messages: &mut HashMap<i64, String>,
@@ -1538,7 +1543,7 @@ async fn apply_single_patch(
             author, date_str, subject, p.diff
         );
 
-        match worktree.apply_patch(&mbox).await {
+        match worktree.apply_patch(&mbox, resolve_patch_paths).await {
             Ok(_) => {
                 if let Ok(sha) = get_commit_hash(&worktree.path, "HEAD").await {
                     patch_shas.insert(p.index, sha.clone());
@@ -2011,6 +2016,7 @@ mod tests {
         let success = apply_single_patch(
             &worktree,
             &patch,
+            false,
             &mut patch_shas,
             &mut patch_shows,
             &mut patch_messages,
@@ -2050,6 +2056,7 @@ mod tests {
         let success = apply_single_patch(
             &worktree,
             &patch,
+            false,
             &mut patch_shas,
             &mut patch_shows,
             &mut patch_messages,
@@ -2088,6 +2095,7 @@ mod tests {
         let success = apply_single_patch(
             &worktree,
             &patch,
+            false,
             &mut patch_shas,
             &mut patch_shows,
             &mut patch_messages,
